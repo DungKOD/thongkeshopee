@@ -1,66 +1,69 @@
-import type {
-  Day,
-  DayTotals,
-  OrderDetail,
-  Video,
-  VideoComputed,
-} from "./types";
+import type { DayTotals, UiDay, UiRow, VideoComputed } from "./types";
 import {
   netCommissionRatio,
   sumFiltered,
   type ProfitFees,
 } from "./hooks/useSettings";
 
-export interface OrderStats {
-  total: number;
-  cancelled: number;
-  zeroValue: number;
-  averageValue: number;
-  totalGmv: number;
-}
-
-/** Tính chi tiết đơn từ orderDetails. Null nếu không có dữ liệu chi tiết. */
-export function computeOrderStats(
-  details: OrderDetail[] | undefined,
-): OrderStats | null {
-  if (!details || details.length === 0) return null;
-  const total = details.length;
-  const cancelled = details.filter((d) => /hủy|cancel/i.test(d.status)).length;
-  const zeroValue = details.filter((d) => d.commission === 0).length;
-  const totalGmv = details.reduce((a, d) => a + d.grossValue, 0);
-  const averageValue = total === 0 ? 0 : totalGmv / total;
-  return { total, cancelled, zeroValue, averageValue, totalGmv };
-}
-
 const safeDiv = (a: number, b: number) => (b === 0 ? 0 : a / b);
 
-export function computeVideo(v: Video, fees: ProfitFees): VideoComputed {
-  // Ưu tiên đọc từ file (v.cpc), chỉ tính nếu không có
-  const cpc = v.cpc ?? safeDiv(v.totalSpend, v.clicks);
-  const conversionRate = safeDiv(v.orders, v.clicks) * 100;
-  const orderValue = safeDiv(v.commission, v.orders);
-  const netCommission = v.commission * netCommissionRatio(fees);
-  const profit = netCommission - v.totalSpend;
-  const profitMargin = safeDiv(profit, v.totalSpend) * 100;
+/** Row identity dạng string để dùng làm key trong Set/Map. */
+export function uiRowKey(dayDate: string, subIds: readonly string[]): string {
+  return `${dayDate}|${subIds.join("\x1f")}`;
+}
+
+/**
+ * Derived values cho 1 UiRow. Rule: **field nào có trong DB thì lấy thẳng,
+ * không có mới tính fallback**.
+ *
+ * - `cpc`: ưu tiên `row.cpc` (từ raw_fb_ad_groups.link_cpc weighted), fallback `spend/clicks`
+ * - `orderValue`: ưu tiên `orderValueTotal/ordersCount` (GMV/đơn)
+ * - `conversionRate`: **tính theo click Shopee** (gần với thực tế hơn FB click — user vào Shopee
+ *   mới có khả năng mua). Tham số `shopeeClicks` truyền từ caller (đã filter theo settings).
+ * - `netCommission`, `profit`, `profitMargin`: luôn tính (không có field DB sẵn)
+ */
+export function computeUiRow(
+  row: UiRow,
+  fees: ProfitFees,
+  shopeeClicks: number = 0,
+): VideoComputed {
+  const clicks = row.adsClicks ?? 0;
+  const spend = row.totalSpend ?? 0;
+  const cpc = row.cpc ?? safeDiv(spend, clicks);
+  const orders = row.ordersCount;
+  const commission = row.commissionTotal;
+  const conversionRate = safeDiv(orders, shopeeClicks) * 100;
+  const orderValue = safeDiv(row.orderValueTotal, orders);
+  const netCommission = commission * netCommissionRatio(fees);
+  const profit = netCommission - spend;
+  const profitMargin = safeDiv(profit, spend) * 100;
   return { cpc, conversionRate, orderValue, netCommission, profit, profitMargin };
 }
 
-export function computeDayTotals(
-  day: Day,
+export function computeUiDayTotals(
+  day: UiDay,
   clickSources: Record<string, boolean>,
   fees: ProfitFees,
 ): DayTotals {
   const ratio = netCommissionRatio(fees);
-  return day.videos.reduce<DayTotals>(
-    (acc, v) => {
-      acc.clicks += v.clicks;
-      acc.shopeeClicks += sumFiltered(v.shopeeClicksByReferrer, clickSources);
-      acc.totalSpend += v.totalSpend;
-      acc.commission += v.commission;
-      acc.profit += v.commission * ratio - v.totalSpend;
+  return day.rows.reduce<DayTotals>(
+    (acc, r) => {
+      acc.clicks += r.adsClicks ?? 0;
+      acc.shopeeClicks += sumFiltered(r.shopeeClicksByReferrer, clickSources);
+      acc.totalSpend += r.totalSpend ?? 0;
+      acc.orders += r.ordersCount;
+      acc.commission += r.commissionTotal;
+      acc.profit += r.commissionTotal * ratio - (r.totalSpend ?? 0);
       return acc;
     },
-    { clicks: 0, shopeeClicks: 0, totalSpend: 0, commission: 0, profit: 0 },
+    {
+      clicks: 0,
+      shopeeClicks: 0,
+      totalSpend: 0,
+      orders: 0,
+      commission: 0,
+      profit: 0,
+    },
   );
 }
 
@@ -86,16 +89,15 @@ export const fmtDate = (iso: string) => {
 };
 
 /**
- * Khoảng thời gian giữa 2 mốc (ISO datetime). Trả về chuỗi rút gọn.
- * `"2026-04-15 17:17:09"` → `"2026-04-17 23:49:26"` ≈ `"2 ngày 6g"`.
- * Trả về "" nếu thiếu 1 trong 2 hoặc parse lỗi.
+ * Khoảng cách giữa 2 mốc datetime (format ISO hoặc "YYYY-MM-DD HH:MM:SS").
+ * Trả chuỗi rút gọn, "" nếu thiếu hoặc parse lỗi.
  */
-export function fmtDuration(fromIso?: string, toIso?: string): string {
+export function fmtDuration(fromIso?: string | null, toIso?: string | null): string {
   if (!fromIso || !toIso) return "";
   const a = new Date(fromIso.replace(" ", "T")).getTime();
   const b = new Date(toIso.replace(" ", "T")).getTime();
   if (!Number.isFinite(a) || !Number.isFinite(b)) return "";
-  let ms = b - a;
+  const ms = b - a;
   if (ms < 0) return "";
   const sec = Math.floor(ms / 1000);
   const days = Math.floor(sec / 86400);

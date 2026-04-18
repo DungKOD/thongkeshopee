@@ -1,44 +1,73 @@
 import { useState } from "react";
-import type { Day, Video } from "../types";
-import { computeDayTotals, fmtDate, fmtInt, fmtVnd } from "../formulas";
+import type { UiDay, UiRow } from "../types";
+import { computeUiDayTotals, fmtDate, fmtInt, fmtVnd, uiRowKey } from "../formulas";
 import { useSettings } from "../hooks/useSettings";
 import { VideoRow } from "./VideoRow";
-import { ConfirmDialog } from "./ConfirmDialog";
 import { ProductDetailDialog } from "./ProductDetailDialog";
 
 interface DayBlockProps {
-  day: Day;
-  onRemoveDay: () => void;
-  onRemoveVideo: (videoId: string) => void;
-  onEditDay: () => void;
+  day: UiDay;
+  pendingDayDeletes: Set<string>;
+  pendingRowDeletes: Set<string>;
+  onToggleDayDelete: (date: string) => void;
+  onToggleRowDelete: (row: UiRow) => void;
+  onEditRow: (row: UiRow) => void;
+  onEditDay: (date: string) => void;
 }
 
-const HEADERS = [
-  "Sản phẩm",
-  "Click FB",
-  "Click Shopee",
-  "Đơn giá click",
-  "Tổng tiền chạy",
-  "Số lượng đơn",
-  "Tỷ lệ chuyển đổi",
-  "Giá trị đơn hàng",
-  "Hoa hồng",
-  "Lợi nhuận",
-  "Tỷ suất LN",
-  "",
+const ROI_TOOLTIP =
+  "ROI = (Hoa hồng sau phí − Tiền ads) / Tiền ads × 100%\n" +
+  "• 0% = hòa vốn\n" +
+  "• > 0% = có lãi\n" +
+  "• < 0% = đang lỗ\n" +
+  "VD: -50% nghĩa là lỗ một nửa số tiền đã chi.";
+
+const HEADERS: Array<{ label: string; tooltip?: string }> = [
+  { label: "Sản phẩm" },
+  { label: "Click ADS", tooltip: "Tổng click quảng cáo FB (link_clicks)" },
+  {
+    label: "Click Shopee",
+    tooltip: "Số click affiliate về Shopee (lọc theo nguồn trong Cài đặt)",
+  },
+  {
+    label: "Đơn giá click",
+    tooltip:
+      "CPC (Cost Per Click) = Tổng tiền chạy / Click ADS\n" +
+      "Đơn giá mỗi lần ai đó bấm vào quảng cáo.\n" +
+      "Ưu tiên lấy từ FB (weighted avg). Không có thì tính từ spend/click.",
+  },
+  { label: "Tổng tiền chạy", tooltip: "Spend FB (đã trừ ngân sách chưa tiêu)" },
+  { label: "Số lượng đơn", tooltip: "Số đơn hàng (COUNT DISTINCT order_id)" },
+  {
+    label: "Tỷ lệ chuyển đổi",
+    tooltip: "CR = Số đơn / Click Shopee × 100% (dùng click Shopee vì user vào Shopee mới có khả năng mua)",
+  },
+  {
+    label: "Giá trị đơn hàng",
+    tooltip: "GMV trung bình = Tổng GMV / Số đơn",
+  },
+  { label: "Hoa hồng", tooltip: "Tổng hoa hồng ròng (net commission)" },
+  {
+    label: "Lợi nhuận",
+    tooltip: "Lợi nhuận = Hoa hồng × (1 − thuế − dự phòng) − Tiền ads",
+  },
+  { label: "ROI", tooltip: ROI_TOOLTIP },
+  { label: "" },
 ];
 
 export function DayBlock({
   day,
-  onRemoveDay,
-  onRemoveVideo,
+  pendingDayDeletes,
+  pendingRowDeletes,
+  onToggleDayDelete,
+  onToggleRowDelete,
+  onEditRow,
   onEditDay,
 }: DayBlockProps) {
-  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
-  const [detailVideo, setDetailVideo] = useState<Video | null>(null);
-
+  const [detailRow, setDetailRow] = useState<UiRow | null>(null);
   const { settings } = useSettings();
-  const totals = computeDayTotals(
+
+  const totals = computeUiDayTotals(
     day,
     settings.clickSources,
     settings.profitFees,
@@ -50,22 +79,33 @@ export function DayBlock({
       ? "text-red-400"
       : "text-gray-300";
 
-  const handleDeleteDay = () => {
-    if (day.videos.length === 0) {
-      onRemoveDay();
-    } else {
-      setConfirmDeleteOpen(true);
-    }
-  };
+  const dayPending = pendingDayDeletes.has(day.date);
+  // "All rows pending" = user đã chọn xóa từng dòng cho đến hết → visual
+  // giống như xóa cả ngày (gạch toàn bộ text + mờ data, giữ nút Undo rõ).
+  const allRowsPending =
+    !dayPending &&
+    day.rows.length > 0 &&
+    day.rows.every((r) =>
+      pendingRowDeletes.has(uiRowKey(r.dayDate, r.subIds)),
+    );
+  const effectiveDayPending = dayPending || allRowsPending;
 
   return (
-    <section className="mb-6 overflow-hidden rounded-xl bg-surface-2 shadow-elev-2 transition-shadow hover:shadow-elev-4">
+    <section
+      className={`mb-6 overflow-hidden rounded-xl shadow-elev-2 transition-shadow hover:shadow-elev-4 ${
+        effectiveDayPending ? "bg-surface-2/60" : "bg-surface-2"
+      }`}
+    >
       <header className="flex items-center justify-between border-b border-surface-8 px-5 py-3">
         <div className="flex items-center gap-3">
           <span className="material-symbols-rounded text-shopee-400">
             event
           </span>
-          <div className="flex flex-col">
+          <div
+            className={`flex flex-col ${
+              effectiveDayPending ? "line-through" : ""
+            }`}
+          >
             <span className="text-[11px] font-medium uppercase tracking-wider text-white/50">
               Ngày
             </span>
@@ -73,81 +113,132 @@ export function DayBlock({
               {fmtDate(day.date)}
             </span>
           </div>
-          <div className="ml-4 inline-flex items-center gap-1 rounded-full bg-shopee-900/40 px-3 py-1 text-xs font-medium text-shopee-300">
+          <div
+            className={`ml-4 inline-flex items-center gap-1 rounded-full bg-shopee-900/40 px-3 py-1 text-xs font-medium text-shopee-300 ${
+              effectiveDayPending ? "line-through" : ""
+            }`}
+          >
             <span className="material-symbols-rounded text-sm">
               inventory_2
             </span>
-            {day.videos.length} sản phẩm
+            {day.rows.length} dòng
           </div>
+          {effectiveDayPending && (
+            <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-300">
+              {dayPending ? "Chờ xóa cả ngày" : "Chờ xóa toàn bộ dòng"}
+            </span>
+          )}
         </div>
         <button
-          onClick={handleDeleteDay}
-          className="btn-ripple flex h-9 w-9 items-center justify-center rounded-full text-white/60 hover:bg-red-500/10 hover:text-red-400"
-          title="Xóa ngày"
-          aria-label="Xóa ngày"
+          onClick={() => onToggleDayDelete(day.date)}
+          className={`btn-ripple flex h-9 w-9 items-center justify-center rounded-full ${
+            dayPending
+              ? "text-amber-400 hover:bg-amber-500/10"
+              : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
+          }`}
+          title={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
+          aria-label={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
         >
-          <span className="material-symbols-rounded">delete</span>
+          <span className="material-symbols-rounded">
+            {dayPending ? "undo" : "delete"}
+          </span>
         </button>
       </header>
 
       <div className="overflow-x-auto">
         <table className="w-full border-collapse text-sm">
           <thead>
-            <tr className="bg-surface-4 text-shopee-200">
-              {HEADERS.map((h, i) => (
-                <th
-                  key={i}
-                  className="border-b border-surface-8 px-3 py-3 text-center text-[11px] font-semibold uppercase tracking-wider whitespace-nowrap"
-                >
-                  {h}
-                </th>
-              ))}
+            <tr className="border-b-2 border-shopee-500/50 bg-gradient-to-b from-shopee-900/35 to-shopee-900/15 text-shopee-100">
+              {HEADERS.map((h, i) => {
+                const isProduct = i === 0;
+                return (
+                  <th
+                    key={i}
+                    title={h.tooltip}
+                    className={`py-3.5 text-xs font-bold uppercase tracking-wider whitespace-nowrap ${
+                      isProduct
+                        ? "min-w-[220px] px-4 text-left"
+                        : "px-3 text-center"
+                    } ${h.tooltip ? "cursor-help" : ""}`}
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      <span>{h.label}</span>
+                      {h.tooltip && (
+                        <span className="text-[11px] leading-none text-shopee-300/60">
+                          ⓘ
+                        </span>
+                      )}
+                    </span>
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>
-            {day.videos.length === 0 ? (
+            {day.rows.length === 0 ? (
               <tr>
                 <td
                   colSpan={HEADERS.length}
                   className="border border-gray-700 px-4 py-6 text-center text-sm text-gray-500"
                 >
-                  Chưa có sản phẩm — bấm "+ Thêm sản phẩm" bên dưới
+                  Chưa có dòng — bấm "+ Thêm dòng" hoặc import CSV
                 </td>
               </tr>
             ) : (
-              day.videos.map((v) => (
-                <VideoRow
-                  key={v.id}
-                  video={v}
-                  onEdit={onEditDay}
-                  onRemove={() => onRemoveVideo(v.id)}
-                  onViewDetail={() => setDetailVideo(v)}
-                />
-              ))
+              day.rows.map((r) => {
+                const key = uiRowKey(r.dayDate, r.subIds);
+                return (
+                  <VideoRow
+                    key={key}
+                    row={r}
+                    pending={effectiveDayPending || pendingRowDeletes.has(key)}
+                    onEdit={() => onEditRow(r)}
+                    onToggleDelete={() => {
+                      // Nếu day đang pending (xóa cả ngày) mà user undo 1 row:
+                      // convert sang per-row pending — bỏ day, add các row khác vào.
+                      if (dayPending) {
+                        onToggleDayDelete(day.date);
+                        for (const other of day.rows) {
+                          if (uiRowKey(other.dayDate, other.subIds) !== key) {
+                            onToggleRowDelete(other);
+                          }
+                        }
+                      } else {
+                        onToggleRowDelete(r);
+                      }
+                    }}
+                    onViewDetail={() => setDetailRow(r)}
+                  />
+                );
+              })
             )}
           </tbody>
-          {day.videos.length > 0 && (
+          {day.rows.length > 0 && (
             <tfoot>
-              <tr className="border-t-2 border-shopee-500 bg-surface-4 font-semibold text-white/90">
-                <td className="px-3 py-3 text-center">Tổng</td>
-                <td className="px-3 py-3 text-center tabular-nums">
+              <tr className="border-t-2 border-shopee-500 bg-shopee-900/25 text-base font-bold text-white">
+                <td className="px-4 py-4 text-left text-sm uppercase tracking-wider text-shopee-300">
+                  Tổng
+                </td>
+                <td className="px-3 py-4 text-center tabular-nums">
                   {fmtInt(totals.clicks)}
                 </td>
-                <td className="px-3 py-3 text-center tabular-nums">
+                <td className="px-3 py-4 text-center tabular-nums">
                   {fmtInt(totals.shopeeClicks)}
                 </td>
                 <td />
-                <td className="px-3 py-3 text-center tabular-nums">
+                <td className="px-3 py-4 text-center tabular-nums">
                   {fmtVnd(totals.totalSpend)}
+                </td>
+                <td className="px-3 py-4 text-center tabular-nums">
+                  {fmtInt(totals.orders)}
                 </td>
                 <td />
                 <td />
-                <td />
-                <td className="px-3 py-3 text-center tabular-nums">
+                <td className="px-3 py-4 text-center tabular-nums">
                   {fmtVnd(totals.commission)}
                 </td>
                 <td
-                  className={`px-3 py-3 text-center tabular-nums ${totalsProfitCls}`}
+                  className={`px-3 py-4 text-center tabular-nums ${totalsProfitCls}`}
                 >
                   {fmtVnd(totals.profit)}
                 </td>
@@ -161,31 +252,28 @@ export function DayBlock({
 
       <div className="border-t border-surface-8 bg-surface-1 px-5 py-2">
         <button
-          onClick={onEditDay}
-          className="btn-ripple flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-shopee-400 hover:bg-shopee-500/10 active:bg-shopee-500/20"
+          onClick={() => {
+            if (!effectiveDayPending) onEditDay(day.date);
+          }}
+          disabled={effectiveDayPending}
+          className={`btn-ripple flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
+            effectiveDayPending
+              ? "cursor-not-allowed text-white/20"
+              : "text-shopee-400 hover:bg-shopee-500/10 active:bg-shopee-500/20"
+          }`}
+          title={
+            effectiveDayPending ? "Ngày đã đánh dấu xóa — bỏ để thêm dòng" : ""
+          }
         >
           <span className="material-symbols-rounded text-base">add</span>
-          Thêm sản phẩm
+          Thêm dòng
         </button>
       </div>
 
-      <ConfirmDialog
-        isOpen={confirmDeleteOpen}
-        title="Xóa ngày"
-        message={`Ngày ${fmtDate(day.date)} đang có ${day.videos.length} sản phẩm. Xóa ngày sẽ mất toàn bộ dữ liệu. Bạn có chắc muốn xóa?`}
-        confirmLabel="Xóa"
-        danger
-        onConfirm={() => {
-          setConfirmDeleteOpen(false);
-          onRemoveDay();
-        }}
-        onClose={() => setConfirmDeleteOpen(false)}
-      />
-
       <ProductDetailDialog
-        isOpen={!!detailVideo}
-        video={detailVideo}
-        onClose={() => setDetailVideo(null)}
+        isOpen={!!detailRow}
+        row={detailRow}
+        onClose={() => setDetailRow(null)}
       />
     </section>
   );

@@ -69,6 +69,35 @@ html {
   user-select: none;
 }
 
+/* Shake animation dùng cho dialog cảnh báo xóa */
+@keyframes shake {
+  0%, 100% { transform: translate3d(0, 0, 0); }
+  10% { transform: translate3d(-12px, 0, 0); }
+  20% { transform: translate3d(12px, 0, 0); }
+  30% { transform: translate3d(-10px, 0, 0); }
+  40% { transform: translate3d(10px, 0, 0); }
+  50% { transform: translate3d(-8px, 0, 0); }
+  60% { transform: translate3d(8px, 0, 0); }
+  70% { transform: translate3d(-6px, 0, 0); }
+  80% { transform: translate3d(6px, 0, 0); }
+  90% { transform: translate3d(-3px, 0, 0); }
+}
+
+.animate-shake {
+  animation: shake 0.7s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+  will-change: transform;
+}
+
+/* Indeterminate progress bar — thanh chạy qua-lại khi không biết % */
+@keyframes progress-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+.animate-progress-indeterminate {
+  animation: progress-indeterminate 1.4s infinite cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform;
+}
+
 /* Ẩn mũi tên tăng/giảm mặc định của input[type=number] */
 input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button {

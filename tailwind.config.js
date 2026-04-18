@@ -61,6 +61,17 @@ export default {
         xl: "16px",
         "2xl": "24px",
       },
+      keyframes: {
+        shake: {
+          "0%, 100%": { transform: "translateX(0)" },
+          "10%, 30%, 50%, 70%": { transform: "translateX(-8px)" },
+          "20%, 40%, 60%, 80%": { transform: "translateX(8px)" },
+          "90%": { transform: "translateX(-4px)" },
+        },
+      },
+      animation: {
+        shake: "shake 0.6s cubic-bezier(0.36, 0.07, 0.19, 0.97) both",
+      },
     },
   },
   plugins: [],

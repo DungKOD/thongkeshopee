@@ -46,12 +46,12 @@ export function SettingsDialog({
       onMouseDown={handleBackdropMouseDown}
     >
       <div
-        className="w-full max-w-lg overflow-hidden rounded-2xl bg-surface-4 shadow-elev-24"
+        className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-surface-4 shadow-elev-24"
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-dialog-title"
       >
-        <header className="flex items-center gap-3 border-b border-surface-8 px-6 py-4">
+        <header className="flex shrink-0 items-center gap-3 border-b border-surface-8 px-6 py-4">
           <span className="material-symbols-rounded text-shopee-400">
             settings
           </span>
@@ -63,7 +63,7 @@ export function SettingsDialog({
           </h2>
         </header>
 
-        <div className="max-h-[70vh] space-y-6 overflow-y-auto px-6 py-5">
+        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-5">
           <section>
             <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
               <span className="material-symbols-rounded text-base">
@@ -174,9 +174,10 @@ export function SettingsDialog({
               </ul>
             )}
           </section>
+
         </div>
 
-        <footer className="flex justify-end border-t border-surface-8 bg-surface-1 px-6 py-3">
+        <footer className="flex shrink-0 justify-end border-t border-surface-8 bg-surface-1 px-6 py-3">
           <button
             type="button"
             onClick={onClose}
