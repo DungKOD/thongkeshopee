@@ -1,0 +1,55 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run tauri dev)",
+      "Bash(npm run tauri build)",
+      "Bash(npm run test*)",
+      "Bash(cd src-tauri && cargo *)"
+    ]
+  },
+
+  "env": {
+    "RUST_BACKTRACE": "1",
+    "RUST_LOG": "debug"
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file_path=$(echo $CLAUDE_TOOL_INPUT | jq -r '.file_path // empty'); if [[ \"$file_path\" == *Cargo.lock* ]]; then echo 'BLOCKED: Do not edit Cargo.lock directly' >&2; exit 2; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file_path=$(echo $CLAUDE_TOOL_INPUT | jq -r '.file_path // empty'); if [[ \"$file_path\" == *.rs ]]; then cd src-tauri && cargo fmt -- \"$file_path\" 2>/dev/null; fi"
+          },
+          {
+            "type": "command",
+            "command": "file_path=$(echo $CLAUDE_TOOL_INPUT | jq -r '.file_path // empty'); if [[ \"$file_path\" == *.rs ]]; then cd src-tauri && cargo check 2>&1 | tail -5; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✓ Claude finished. Remember: cargo test before commit!' >&2"
+          }
+        ]
+      }
+    ]
+  }
+}
