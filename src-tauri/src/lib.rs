@@ -32,6 +32,11 @@ pub fn run() {
             commands::batch::batch_commit_deletes,
             commands::video::get_video_info,
             commands::video::download_video,
+            commands::drive::drive_check_or_create,
+            commands::drive::drive_metadata,
+            commands::drive::drive_upload_db,
+            commands::drive::drive_download_db,
+            commands::drive::drive_apply_pending,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

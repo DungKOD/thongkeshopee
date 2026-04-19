@@ -14,6 +14,10 @@ import { commitCsvBatch, previewCsvBatch } from "./lib/dbImport";
 import type { PreviewBatch } from "./lib/dbImport";
 import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
+import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { usePremium } from "./hooks/usePremium";
+import { LoginScreen } from "./components/LoginScreen";
+import { PaywallScreen } from "./components/PaywallScreen";
 import "./App.css";
 
 // =========================================================
@@ -867,11 +871,42 @@ function TabButton({ active, onClick, icon, label }: TabButtonProps) {
   );
 }
 
-function App() {
+function AuthGate() {
+  const { user, loading: authLoading } = useAuth();
+  const { status, expiredAt } = usePremium();
+
+  if (authLoading) return <LoadingScreen />;
+  if (!user) return <LoginScreen />;
+  if (status === "loading") return <LoadingScreen />;
+  if (status === "inactive" || status === "expired") {
+    return <PaywallScreen expiredAt={expiredAt} reason={status} />;
+  }
+
   return (
     <SettingsProvider>
       <AppInner />
     </SettingsProvider>
+  );
+}
+
+function LoadingScreen() {
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-surface-0">
+      <div className="flex flex-col items-center gap-3 text-white/60">
+        <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">
+          progress_activity
+        </span>
+        <span className="text-sm">Đang tải...</span>
+      </div>
+    </main>
+  );
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <AuthGate />
+    </AuthProvider>
   );
 }
 

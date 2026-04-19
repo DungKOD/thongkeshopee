@@ -7,6 +7,7 @@
 //! - `batch`: xóa batch (days, manual_rows) trong 1 transaction.
 
 pub mod batch;
+pub mod drive;
 pub mod imports;
 pub mod manual;
 pub mod preview;
@@ -25,6 +26,8 @@ pub enum CmdError {
     Io(#[from] std::io::Error),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("http: {0}")]
+    Http(#[from] reqwest::Error),
     #[error("{0}")]
     Msg(String),
 }

@@ -12,6 +12,13 @@ dist
 dist-ssr
 *.local
 
+# Secrets — không commit
+secrets/
+service-account*.json
+*-credentials.json
+.env.local
+.env.*.local
+
 # Rust
 target/
 **/*.rs.bk
