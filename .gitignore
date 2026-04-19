@@ -23,6 +23,10 @@ service-account*.json
 target/
 **/*.rs.bk
 
+# Python
+__pycache__/
+*.pyc
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

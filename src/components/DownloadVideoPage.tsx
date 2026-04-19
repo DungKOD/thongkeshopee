@@ -111,14 +111,23 @@ export function DownloadVideoPage() {
     setProgress({ downloaded: 0, total: 0 });
     setError("");
     setSuccess("");
+    const sourceUrl = url.trim();
     try {
       const path = await invoke<string>("download_video", {
         downloadUrl: info.downloadUrl,
         savePath,
       });
       setSuccess(`Đã lưu: ${path}`);
+      void invoke("log_video_download", {
+        url: sourceUrl,
+        status: "success",
+      }).catch(() => {});
     } catch (e) {
       setError(String(e));
+      void invoke("log_video_download", {
+        url: sourceUrl,
+        status: "failed",
+      }).catch(() => {});
     } finally {
       setDownloading(false);
       setProgress(null);

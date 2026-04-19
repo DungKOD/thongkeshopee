@@ -27,6 +27,13 @@ export function useDbStats() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Counter bump mỗi khi DB được ghi thành công. Dùng cho auto-sync Drive.
+  // KHÔNG bump khi chỉ load (refetch) — chỉ bump sau mutation thực sự.
+  const [mutationVersion, setMutationVersion] = useState(0);
+  const markMutation = useCallback(() => {
+    setMutationVersion((v) => v + 1);
+  }, []);
+
   // In-memory pending state cho staged delete.
   const [pendingRowDeletes, setPendingRowDeletes] = useState<Set<string>>(
     () => new Set(),
@@ -59,9 +66,10 @@ export function useDbStats() {
   const saveManualEntry = useCallback(
     async (input: ManualEntryInput) => {
       await invoke<void>("save_manual_entry", { input });
+      markMutation();
       await refetch();
     },
-    [refetch],
+    [refetch, markMutation],
   );
 
   const toggleRowPending = useCallback(
@@ -114,9 +122,10 @@ export function useDbStats() {
         },
       },
     );
+    markMutation();
     clearPending();
     await refetch();
-  }, [days, pendingDayDeletes, pendingRowDeletes, clearPending, refetch]);
+  }, [days, pendingDayDeletes, pendingRowDeletes, clearPending, refetch, markMutation]);
 
   const pendingCount = pendingRowDeletes.size + pendingDayDeletes.size;
 
@@ -134,5 +143,7 @@ export function useDbStats() {
     clearPending,
     commitPending,
     pendingCount,
+    mutationVersion,
+    markMutation,
   };
 }

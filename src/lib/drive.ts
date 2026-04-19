@@ -5,6 +5,7 @@ export interface DriveCheckResult {
   file_id: string;
   size_bytes: number;
   last_modified_ms: number;
+  fingerprint: string | null;
 }
 
 export interface DriveMetadataResult {
@@ -12,12 +13,18 @@ export interface DriveMetadataResult {
   file_id?: string;
   size_bytes?: number;
   last_modified_ms?: number;
+  fingerprint?: string | null;
 }
 
 export interface DriveUploadResult {
   file_id: string;
   size_bytes: number;
   last_modified_ms: number;
+  fingerprint: string;
+}
+
+export function machineFingerprint(): Promise<string> {
+  return invoke<string>("machine_fingerprint");
 }
 
 export interface DriveDownloadResult {
@@ -62,4 +69,68 @@ export function driveDownloadDb(idToken: string): Promise<DriveDownloadResult> {
 
 export function driveApplyPending(): Promise<boolean> {
   return invoke<boolean>("drive_apply_pending");
+}
+
+export interface UserListFileMeta {
+  fileId: string;
+  sizeBytes: number;
+  lastModified: number;
+}
+
+export interface UserListEntry {
+  uid: string;
+  email: string | null;
+  localPart: string | null;
+  premium: boolean;
+  admin: boolean;
+  expiredAt: string | null;
+  createdAt: string | null;
+  file: UserListFileMeta | null;
+}
+
+export function driveListUsers(idToken: string): Promise<UserListEntry[]> {
+  return invoke<UserListEntry[]>("drive_list_users", {
+    appsScriptUrl: url(),
+    idToken,
+  });
+}
+
+export function adminDownloadUserDb(
+  idToken: string,
+  targetLocalPart: string,
+): Promise<string> {
+  return invoke<string>("admin_download_user_db", {
+    appsScriptUrl: url(),
+    idToken,
+    targetLocalPart,
+  });
+}
+
+export interface VideoDownloadLog {
+  id: number;
+  url: string;
+  downloaded_at_ms: number;
+  status: string;
+}
+
+export function listVideoDownloadsFromPath(
+  dbPath: string,
+  limit: number,
+  offset: number,
+): Promise<VideoDownloadLog[]> {
+  return invoke<VideoDownloadLog[]>("list_video_downloads_from_path", {
+    dbPath,
+    limit,
+    offset,
+  });
+}
+
+export function listVideoDownloads(
+  limit: number,
+  offset: number,
+): Promise<VideoDownloadLog[]> {
+  return invoke<VideoDownloadLog[]>("list_video_downloads", {
+    limit,
+    offset,
+  });
 }

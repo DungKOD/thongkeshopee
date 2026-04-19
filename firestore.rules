@@ -4,7 +4,16 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     match /users/{userId} {
-      allow read: if request.auth != null && request.auth.uid == userId;
+      // User tự đọc doc của mình HOẶC admin đọc mọi doc.
+      // get() cost: 1 extra read cho mỗi request (miễn phí trong free tier).
+      allow read: if request.auth != null
+                  && (
+                    request.auth.uid == userId
+                    || (
+                      exists(/databases/$(database)/documents/users/$(request.auth.uid))
+                      && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.admin == true
+                    )
+                  );
 
       allow create: if request.auth != null
                     && request.auth.uid == userId

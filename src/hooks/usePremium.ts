@@ -1,13 +1,4 @@
-import { useEffect, useState } from "react";
-import {
-  doc,
-  onSnapshot,
-  serverTimestamp,
-  setDoc,
-  Timestamp,
-} from "firebase/firestore";
-import { db } from "../lib/firebase";
-import { useAuth } from "../contexts/AuthContext";
+import { useUserProfile } from "./useUserProfile";
 
 export type PremiumStatus = "loading" | "inactive" | "active" | "expired";
 
@@ -18,61 +9,27 @@ interface UsePremiumResult {
 }
 
 export function usePremium(): UsePremiumResult {
-  const { user } = useAuth();
-  const [status, setStatus] = useState<PremiumStatus>("loading");
-  const [expiredAt, setExpiredAt] = useState<Date | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { profile, loading, error } = useUserProfile();
 
-  useEffect(() => {
-    if (!user) {
-      setStatus("loading");
-      setExpiredAt(null);
-      setError(null);
-      return;
-    }
+  if (loading || (!profile && !error)) {
+    return { status: "loading", expiredAt: null, error };
+  }
+  if (!profile) {
+    return { status: "inactive", expiredAt: null, error };
+  }
 
-    const ref = doc(db, "users", user.uid);
-    const unsub = onSnapshot(
-      ref,
-      async (snap) => {
-        if (!snap.exists()) {
-          try {
-            await setDoc(ref, {
-              email: user.email ?? "",
-              premium: false,
-              admin: false,
-              expiredAt: null,
-              createdAt: serverTimestamp(),
-            });
-          } catch (e) {
-            setError(`Không tạo được hồ sơ: ${(e as Error).message}`);
-          }
-          return;
-        }
+  const expiredAt = profile.expiredAt;
 
-        const data = snap.data();
-        const premium = data.premium === true;
-        const exp = data.expiredAt as Timestamp | null | undefined;
-        const expDate = exp?.toDate?.() ?? null;
-        setExpiredAt(expDate);
+  if (!profile.premium) {
+    return { status: "inactive", expiredAt, error };
+  }
+  if (expiredAt && expiredAt.getTime() < Date.now()) {
+    return { status: "expired", expiredAt, error };
+  }
+  return { status: "active", expiredAt, error };
+}
 
-        if (!premium) {
-          setStatus("inactive");
-        } else if (expDate && expDate.getTime() < Date.now()) {
-          setStatus("expired");
-        } else {
-          setStatus("active");
-        }
-        setError(null);
-      },
-      (err) => {
-        setError(err.message);
-        setStatus("inactive");
-      },
-    );
-
-    return () => unsub();
-  }, [user]);
-
-  return { status, expiredAt, error };
+export function useIsAdmin(): boolean {
+  const { profile } = useUserProfile();
+  return profile?.admin === true;
 }

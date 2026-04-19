@@ -15,9 +15,13 @@ import type { PreviewBatch } from "./lib/dbImport";
 import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
-import { usePremium } from "./hooks/usePremium";
+import { usePremium, useIsAdmin } from "./hooks/usePremium";
+import { useDriveSync } from "./hooks/useDriveSync";
 import { LoginScreen } from "./components/LoginScreen";
 import { PaywallScreen } from "./components/PaywallScreen";
+import { UserListDialog } from "./components/UserListDialog";
+import { UserMenu } from "./components/UserMenu";
+import { VideoLogsTab } from "./components/VideoLogsTab";
 import "./App.css";
 
 // =========================================================
@@ -111,7 +115,15 @@ function AppInner() {
     clearPending,
     commitPending,
     pendingCount,
+    mutationVersion,
+    markMutation,
   } = useDbStats();
+
+  // Sync chạy ngầm — không expose status ra UI trừ overlay restart.
+  const { status: syncStatus } = useDriveSync({
+    mutationVersion,
+    enabled: true,
+  });
 
   const { showToast } = useToast();
   const { settings, setClickSource, registerSources, setProfitFee } =
@@ -124,9 +136,13 @@ function AppInner() {
     if (referrers.length > 0) registerSources(referrers);
   }, [referrers, registerSources]);
 
+  const isAdmin = useIsAdmin();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<"stats" | "download">("stats");
+  const [userListOpen, setUserListOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<
+    "stats" | "download" | "video-logs"
+  >("stats");
   const [filterMode, setFilterMode] = useState<FilterMode>(() =>
     loadFilterMode(),
   );
@@ -168,6 +184,7 @@ function AppInner() {
     const totalNew = results.reduce((a, r) => a + r.inserted, 0);
     const totalReplace = results.reduce((a, r) => a + r.duplicated, 0);
     setPreviewBatch(null);
+    markMutation();
     await refetch();
     showToast({
       message: `Đã import ngày ${fmtDate(date)}: ${fmtInt(totalNew)} dòng mới${
@@ -175,7 +192,7 @@ function AppInner() {
       }`,
       duration: 5000,
     });
-  }, [previewBatch, refetch, showToast]);
+  }, [previewBatch, refetch, showToast, markMutation]);
 
   const handleSaveEntry = useCallback(
     async (input: Parameters<typeof saveManualEntry>[0]) => {
@@ -437,6 +454,19 @@ function AppInner() {
               </span>
               Quy tắc
             </button>
+            {isAdmin && (
+              <button
+                onClick={() => setUserListOpen(true)}
+                className="btn-ripple flex items-center gap-1.5 rounded-lg border border-white/40 px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
+                title="Danh sách user (admin)"
+                aria-label="Danh sách user"
+              >
+                <span className="material-symbols-rounded text-base">
+                  admin_panel_settings
+                </span>
+                User
+              </button>
+            )}
             <button
               onClick={() => setSettingsOpen(true)}
               className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
@@ -445,6 +475,7 @@ function AppInner() {
             >
               <span className="material-symbols-rounded">settings</span>
             </button>
+            <UserMenu />
             {activeTab === "stats" && (
               <>
                 <button
@@ -484,6 +515,14 @@ function AppInner() {
             icon="download"
             label="Download video"
           />
+          {isAdmin && (
+            <TabButton
+              active={activeTab === "video-logs"}
+              onClick={() => setActiveTab("video-logs")}
+              icon="admin_panel_settings"
+              label="Video Logs"
+            />
+          )}
         </nav>
       </header>
 
@@ -499,6 +538,8 @@ function AppInner() {
       <div className="p-6">
         {activeTab === "download" ? (
           <DownloadVideoPage />
+        ) : activeTab === "video-logs" && isAdmin ? (
+          <VideoLogsTab />
         ) : loading ? (
           <div className="mx-auto max-w-xl py-12 text-center text-white/60">
             Đang tải...
@@ -799,6 +840,15 @@ function AppInner() {
 
       <RulesDialog isOpen={rulesOpen} onClose={() => setRulesOpen(false)} />
 
+      {isAdmin && (
+        <UserListDialog
+          isOpen={userListOpen}
+          onClose={() => setUserListOpen(false)}
+        />
+      )}
+
+      {syncStatus === "restarting" && <RestartingOverlay />}
+
       {entryDialog && (
         <ManualEntryDialog
           isOpen={true}
@@ -899,6 +949,20 @@ function LoadingScreen() {
         <span className="text-sm">Đang tải...</span>
       </div>
     </main>
+  );
+}
+
+function RestartingOverlay() {
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-black/90 text-white">
+      <span className="material-symbols-rounded animate-spin text-5xl text-shopee-400">
+        cloud_sync
+      </span>
+      <div className="text-lg font-medium">Đang tải dữ liệu từ Drive...</div>
+      <div className="text-sm text-white/60">
+        Máy khác đã cập nhật DB. App sẽ tự restart khi xong.
+      </div>
+    </div>
   );
 }
 

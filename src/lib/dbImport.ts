@@ -405,6 +405,41 @@ export interface PreviewBatch {
 // Parse 1 file → ParsedFile
 // =========================================================
 
+/**
+ * Campaign/ad group "không giá trị" = spend 0 VÀ clicks 0.
+ * Skip lúc import để DB không phình bởi hàng trăm row inactive mỗi ngày.
+ * Clicks xét theo chain `link → all → result` (match normalize ở Rust).
+ */
+function isFbValuable(r: {
+  spend: number | null;
+  linkClicks: number | null;
+  allClicks: number | null;
+  resultCount: number | null;
+}): boolean {
+  const spend = r.spend ?? 0;
+  const clicks = r.linkClicks ?? r.allClicks ?? r.resultCount ?? 0;
+  return spend !== 0 || clicks !== 0;
+}
+
+/**
+ * Shopee export có duplicate `(checkout_id, item_id, model_id)` — 1 row có
+ * commission thật + N rows dummy (comm=0, khác tí `Hoa hồng Xtra trên sản phẩm`).
+ * Nếu gửi hết sang Rust → UPSERT `ON CONFLICT DO UPDATE` đè row thật bằng
+ * row dummy → mất commission. Dedup tại JS giữ row `netCommission` MAX.
+ */
+function dedupShopeeOrders(rows: ShopeeOrderRow[]): ShopeeOrderRow[] {
+  const byKey = new Map<string, ShopeeOrderRow>();
+  for (const r of rows) {
+    const key = `${r.checkoutId}|${r.itemId}|${r.modelId}`;
+    const ex = byKey.get(key);
+    const cur = r.netCommission ?? 0;
+    if (!ex || cur > (ex.netCommission ?? 0)) {
+      byKey.set(key, r);
+    }
+  }
+  return Array.from(byKey.values());
+}
+
 async function parseFile(file: File): Promise<ParsedFile> {
   const text = await file.text();
   const parsed = Papa.parse<Record<string, string>>(text, {
@@ -434,9 +469,10 @@ async function parseFile(file: File): Promise<ParsedFile> {
       };
     }
     case "shopee_commission": {
-      const rows = parsed.data
+      const parsedRows = parsed.data
         .map(toShopeeOrderRow)
         .filter((r): r is ShopeeOrderRow => r !== null);
+      const rows = dedupShopeeOrders(parsedRows);
       if (rows.length === 0)
         throw new Error(`File '${file.name}' không có đơn hàng hợp lệ`);
       return {
@@ -448,9 +484,11 @@ async function parseFile(file: File): Promise<ParsedFile> {
     case "fb_ad_group": {
       const rows = parsed.data
         .map(toFbAdGroupRow)
-        .filter((r): r is FbAdGroupRow => r !== null);
+        .filter((r): r is FbAdGroupRow => r !== null && isFbValuable(r));
       if (rows.length === 0)
-        throw new Error(`File '${file.name}' không có ad group hợp lệ`);
+        throw new Error(
+          `File '${file.name}' không có ad group nào chạy (spend 0, clicks 0)`,
+        );
       return {
         kind,
         file,
@@ -460,9 +498,11 @@ async function parseFile(file: File): Promise<ParsedFile> {
     case "fb_campaign": {
       const rows = parsed.data
         .map(toFbCampaignRow)
-        .filter((r): r is FbCampaignRow => r !== null);
+        .filter((r): r is FbCampaignRow => r !== null && isFbValuable(r));
       if (rows.length === 0)
-        throw new Error(`File '${file.name}' không có campaign hợp lệ`);
+        throw new Error(
+          `File '${file.name}' không có campaign nào chạy (spend 0, clicks 0)`,
+        );
       return {
         kind,
         file,

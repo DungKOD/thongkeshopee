@@ -9,7 +9,13 @@
 //!
 //! Không cần OAuth/API key — dùng API public + HTML scraping.
 
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use tauri::State;
+
+use crate::db::DbState;
+
+use super::{CmdError, CmdResult};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 const MOBILE_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
@@ -734,4 +740,101 @@ fn urlencoding(s: &str) -> String {
             _ => format!("%{:02X}", c as u32),
         })
         .collect()
+}
+
+// ============================================================
+// Video download logging (admin-only audit)
+// ============================================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoDownloadLog {
+    pub id: i64,
+    pub url: String,
+    pub downloaded_at_ms: i64,
+    pub status: String,
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Log 1 lần download video. Frontend gọi sau khi download_video thành công hoặc fail.
+/// URL phải đúng cấu trúc (đã pass get_video_info) — caller chịu trách nhiệm filter.
+#[tauri::command]
+pub async fn log_video_download(
+    db: State<'_, DbState>,
+    url: String,
+    status: String,
+) -> CmdResult<()> {
+    if status != "success" && status != "failed" {
+        return Err(CmdError::msg(format!(
+            "Invalid status: {status} (must be success/failed)"
+        )));
+    }
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    conn.execute(
+        "INSERT INTO video_downloads (url, downloaded_at_ms, status) VALUES (?1, ?2, ?3)",
+        params![url, now_ms(), status],
+    )?;
+    Ok(())
+}
+
+/// Query video_downloads từ DB hiện tại (dùng cho admin xem DB của chính mình).
+#[tauri::command]
+pub async fn list_video_downloads(
+    db: State<'_, DbState>,
+    limit: i64,
+    offset: i64,
+) -> CmdResult<Vec<VideoDownloadLog>> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, url, downloaded_at_ms, status
+         FROM video_downloads
+         ORDER BY downloaded_at_ms DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![limit, offset], |r| {
+        Ok(VideoDownloadLog {
+            id: r.get(0)?,
+            url: r.get(1)?,
+            downloaded_at_ms: r.get(2)?,
+            status: r.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(CmdError::from)
+}
+
+/// Query video_downloads từ DB file bất kỳ (admin xem DB của user khác sau khi download về).
+/// Mở read-only connection, không ảnh hưởng DB live.
+#[tauri::command]
+pub async fn list_video_downloads_from_path(
+    db_path: String,
+    limit: i64,
+    offset: i64,
+) -> CmdResult<Vec<VideoDownloadLog>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT id, url, downloaded_at_ms, status
+         FROM video_downloads
+         ORDER BY downloaded_at_ms DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![limit, offset], |r| {
+        Ok(VideoDownloadLog {
+            id: r.get(0)?,
+            url: r.get(1)?,
+            downloaded_at_ms: r.get(2)?,
+            status: r.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(CmdError::from)
 }
