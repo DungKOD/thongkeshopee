@@ -101,11 +101,17 @@ CREATE INDEX IF NOT EXISTS idx_orders_item       ON raw_shopee_order_items(item_
 CREATE INDEX IF NOT EXISTS idx_orders_status     ON raw_shopee_order_items(order_status);
 
 -- =============================================================
--- raw_fb_ad_groups — 1 row/ad_group × date range.
+-- raw_fb_ads — unified FB ads table (campaign + ad_group).
+-- `level` = 'campaign' | 'ad_group'. `clicks` và `cpc` đã normalize lúc INSERT:
+--   clicks = link_clicks ?? all_clicks ?? result_count  (KQ từ obj "Link Click")
+--   cpc    = link_cpc ?? all_cpc ?? cost_per_result
+-- Aggregate ưu tiên level='ad_group' per sub_id tuple để tránh double-count
+-- khi user import cả 2 file cùng ngày.
 -- =============================================================
-CREATE TABLE IF NOT EXISTS raw_fb_ad_groups (
+CREATE TABLE IF NOT EXISTS raw_fb_ads (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    ad_group_name      TEXT NOT NULL,
+    level              TEXT NOT NULL,              -- 'campaign' | 'ad_group'
+    name               TEXT NOT NULL,
     sub_id1            TEXT NOT NULL DEFAULT '',
     sub_id2            TEXT NOT NULL DEFAULT '',
     sub_id3            TEXT NOT NULL DEFAULT '',
@@ -115,55 +121,20 @@ CREATE TABLE IF NOT EXISTS raw_fb_ad_groups (
     report_end         TEXT,
     status             TEXT,
     spend              REAL,
+    clicks             INTEGER,                    -- normalized
+    cpc                REAL,                       -- normalized
     impressions        INTEGER,
     reach              INTEGER,
-    frequency          REAL,
-    link_clicks        INTEGER,
-    shop_clicks        INTEGER,
-    all_clicks         INTEGER,
-    link_cpc           REAL,
-    all_cpc            REAL,
-    link_ctr           REAL,
-    all_ctr            REAL,
-    landing_views      INTEGER,
-    cpm                REAL,
-    raw_json           TEXT,
+    raw_json           TEXT,                       -- các field phụ (frequency, CTR, CPM, landing_views, shop_clicks, result_indicator, cost_per_result, ...)
     day_date           TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
     source_file_id     INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
-    UNIQUE(day_date, ad_group_name)
+    UNIQUE(day_date, level, name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fb_ad_day         ON raw_fb_ad_groups(day_date);
-CREATE INDEX IF NOT EXISTS idx_fb_ad_subid       ON raw_fb_ad_groups(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
-CREATE INDEX IF NOT EXISTS idx_fb_ad_day_subid   ON raw_fb_ad_groups(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
-
--- =============================================================
--- raw_fb_campaigns — tương tự, level campaign (ít field hơn).
--- =============================================================
-CREATE TABLE IF NOT EXISTS raw_fb_campaigns (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    campaign_name      TEXT NOT NULL,
-    sub_id1            TEXT NOT NULL DEFAULT '',
-    sub_id2            TEXT NOT NULL DEFAULT '',
-    sub_id3            TEXT NOT NULL DEFAULT '',
-    sub_id4            TEXT NOT NULL DEFAULT '',
-    sub_id5            TEXT NOT NULL DEFAULT '',
-    report_start       TEXT,
-    report_end         TEXT,
-    status             TEXT,
-    spend              REAL,
-    impressions        INTEGER,
-    reach              INTEGER,
-    result_count       INTEGER,
-    result_indicator   TEXT,
-    raw_json           TEXT,
-    day_date           TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
-    source_file_id     INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
-    UNIQUE(day_date, campaign_name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_fb_camp_day       ON raw_fb_campaigns(day_date);
-CREATE INDEX IF NOT EXISTS idx_fb_camp_subid     ON raw_fb_campaigns(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
+CREATE INDEX IF NOT EXISTS idx_fb_ads_day        ON raw_fb_ads(day_date);
+CREATE INDEX IF NOT EXISTS idx_fb_ads_level      ON raw_fb_ads(day_date, level);
+CREATE INDEX IF NOT EXISTS idx_fb_ads_subid      ON raw_fb_ads(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
+CREATE INDEX IF NOT EXISTS idx_fb_ads_day_subid  ON raw_fb_ads(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
 
 -- =============================================================
 -- manual_entries — user nhập tay hoặc override.
@@ -190,6 +161,40 @@ CREATE TABLE IF NOT EXISTS manual_entries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_manual_day        ON manual_entries(day_date);
+
+-- =============================================================
+-- video_downloads — audit log mọi lần download video.
+-- Chỉ log khi URL đúng cấu trúc (pass validate) + download được gọi.
+-- Không log URL garbage/không tải được info.
+-- =============================================================
+CREATE TABLE IF NOT EXISTS video_downloads (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    url                TEXT NOT NULL,
+    downloaded_at_ms   INTEGER NOT NULL,
+    status             TEXT NOT NULL          -- 'success' | 'failed'
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_downloads_time ON video_downloads(downloaded_at_ms DESC);
+
+-- =============================================================
+-- sync_state — singleton row theo dõi trạng thái sync Drive.
+-- dirty=1 → DB có thay đổi chưa upload. dirty=0 → đã sync.
+-- change_id tăng monotone mỗi mutation → CAS pattern chống race
+-- khi mutation xảy ra ĐANG upload (snapshot cũ, mutation sau không kịp).
+-- Triggers khởi tạo trong `migrate()` để update body khi code đổi.
+-- =============================================================
+CREATE TABLE IF NOT EXISTS sync_state (
+    id                            INTEGER PRIMARY KEY CHECK (id = 1),
+    dirty                         INTEGER NOT NULL DEFAULT 1,
+    last_synced_at_ms             INTEGER,
+    last_synced_remote_mtime_ms   INTEGER,
+    last_error                    TEXT,
+    change_id                     INTEGER NOT NULL DEFAULT 0,
+    last_uploaded_change_id       INTEGER NOT NULL DEFAULT 0
+);
+
+-- Seed singleton. Lần đầu: dirty=1 để force upload local data (nếu có).
+INSERT OR IGNORE INTO sync_state (id, dirty) VALUES (1, 1);
 
 -- =============================================================
 -- Bảng version migration (để future-proof khi thay schema).

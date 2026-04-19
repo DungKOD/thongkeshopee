@@ -223,7 +223,7 @@ pub fn preview_import_fb_ad_groups(
 
     let mut existing: HashSet<String> = HashSet::new();
     let mut stmt = conn.prepare(
-        "SELECT ad_group_name FROM raw_fb_ad_groups WHERE day_date = ?",
+        "SELECT name FROM raw_fb_ads WHERE day_date = ? AND level = 'ad_group'",
     )?;
     for row in stmt.query_map(params![day_date], |r| r.get::<_, String>(0))? {
         existing.insert(row?);
@@ -275,7 +275,7 @@ pub fn preview_import_fb_campaigns(
 
     let mut existing: HashSet<String> = HashSet::new();
     let mut stmt = conn.prepare(
-        "SELECT campaign_name FROM raw_fb_campaigns WHERE day_date = ?",
+        "SELECT name FROM raw_fb_ads WHERE day_date = ? AND level = 'campaign'",
     )?;
     for row in stmt.query_map(params![day_date], |r| r.get::<_, String>(0))? {
         existing.insert(row?);

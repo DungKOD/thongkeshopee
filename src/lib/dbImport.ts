@@ -79,6 +79,8 @@ export interface FbAdGroupRow {
   allCtr: number | null;
   landingViews: number | null;
   cpm: number | null;
+  resultCount: number | null;
+  costPerResult: number | null;
   rawJson: string | null;
 }
 
@@ -93,6 +95,11 @@ export interface FbCampaignRow {
   reach: number | null;
   resultCount: number | null;
   resultIndicator: string | null;
+  linkClicks: number | null;
+  allClicks: number | null;
+  linkCpc: number | null;
+  allCpc: number | null;
+  costPerResult: number | null;
   rawJson: string | null;
 }
 
@@ -286,6 +293,8 @@ const FB_AD_GROUP_USED = new Set([
   "CTR (Tất cả)",
   "Lượt xem trang đích",
   "CPM (Chi phí trên mỗi 1.000 lượt hiển thị) (VND)",
+  "Kết quả",
+  "Chi phí trên mỗi kết quả",
 ]);
 
 function toFbAdGroupRow(r: Record<string, string>): FbAdGroupRow | null {
@@ -314,6 +323,8 @@ function toFbAdGroupRow(r: Record<string, string>): FbAdGroupRow | null {
     allCtr: parseNumOrNull(r["CTR (Tất cả)"]),
     landingViews: parseNumOrNull(r["Lượt xem trang đích"]),
     cpm: parseNumOrNull(r["CPM (Chi phí trên mỗi 1.000 lượt hiển thị) (VND)"]),
+    resultCount: parseNumOrNull(r["Kết quả"]),
+    costPerResult: parseNumOrNull(r["Chi phí trên mỗi kết quả"]),
     rawJson: buildRawJson(r, FB_AD_GROUP_USED),
   };
 }
@@ -325,9 +336,14 @@ const FB_CAMPAIGN_USED = new Set([
   "Lượt phân phối chiến dịch",
   "Kết quả",
   "Chỉ báo kết quả",
+  "Chi phí trên mỗi kết quả",
   "Số tiền đã chi tiêu (VND)",
   "Lượt hiển thị",
   "Người tiếp cận",
+  "Lượt click vào liên kết",
+  "Lượt click (tất cả)",
+  "CPC (chi phí trên mỗi lượt click vào liên kết) (VND)",
+  "CPC (tất cả) (VND)",
 ]);
 
 function toFbCampaignRow(r: Record<string, string>): FbCampaignRow | null {
@@ -346,6 +362,13 @@ function toFbCampaignRow(r: Record<string, string>): FbCampaignRow | null {
     reach: parseNumOrNull(r["Người tiếp cận"]),
     resultCount: parseNumOrNull(r["Kết quả"]),
     resultIndicator: strOrNull(r["Chỉ báo kết quả"]),
+    linkClicks: parseNumOrNull(r["Lượt click vào liên kết"]),
+    allClicks: parseNumOrNull(r["Lượt click (tất cả)"]),
+    linkCpc: parseNumOrNull(
+      r["CPC (chi phí trên mỗi lượt click vào liên kết) (VND)"],
+    ),
+    allCpc: parseNumOrNull(r["CPC (tất cả) (VND)"]),
+    costPerResult: parseNumOrNull(r["Chi phí trên mỗi kết quả"]),
     rawJson: buildRawJson(r, FB_CAMPAIGN_USED),
   };
 }

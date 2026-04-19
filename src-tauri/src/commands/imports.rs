@@ -446,7 +446,28 @@ pub struct FbAdGroupRow {
     pub all_ctr: Option<f64>,
     pub landing_views: Option<i64>,
     pub cpm: Option<f64>,
+    pub result_count: Option<i64>,
+    pub cost_per_result: Option<f64>,
     pub raw_json: Option<String>,
+}
+
+/// Normalize click count: ưu tiên link_clicks → all_clicks → result_count.
+/// Dùng cho cả ad_group lẫn campaign lúc INSERT vào raw_fb_ads.
+fn normalize_clicks(
+    link: Option<i64>,
+    all: Option<i64>,
+    result: Option<i64>,
+) -> Option<i64> {
+    link.or(all).or(result)
+}
+
+/// Normalize CPC: ưu tiên link_cpc → all_cpc → cost_per_result (FB-reported).
+fn normalize_cpc(
+    link: Option<f64>,
+    all: Option<f64>,
+    cost_per_result: Option<f64>,
+) -> Option<f64> {
+    link.or(all).or(cost_per_result)
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,41 +540,20 @@ pub fn import_fb_ad_groups(
     let mut inserted: i64 = 0;
     let mut duplicated: i64 = 0;
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO raw_fb_ad_groups
-             (ad_group_name,
-              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-              report_start, report_end, status,
-              spend, impressions, reach, frequency,
-              link_clicks, shop_clicks, all_clicks,
-              link_cpc, all_cpc, link_ctr, all_ctr,
-              landing_views, cpm, raw_json,
-              day_date, source_file_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(day_date, ad_group_name) DO UPDATE SET
-                sub_id1 = excluded.sub_id1, sub_id2 = excluded.sub_id2,
-                sub_id3 = excluded.sub_id3, sub_id4 = excluded.sub_id4,
-                sub_id5 = excluded.sub_id5,
-                report_start = excluded.report_start, report_end = excluded.report_end,
-                status = excluded.status,
-                spend = excluded.spend, impressions = excluded.impressions,
-                reach = excluded.reach, frequency = excluded.frequency,
-                link_clicks = excluded.link_clicks, shop_clicks = excluded.shop_clicks,
-                all_clicks = excluded.all_clicks,
-                link_cpc = excluded.link_cpc, all_cpc = excluded.all_cpc,
-                link_ctr = excluded.link_ctr, all_ctr = excluded.all_ctr,
-                landing_views = excluded.landing_views, cpm = excluded.cpm,
-                raw_json = excluded.raw_json, source_file_id = excluded.source_file_id",
-        )?;
+        let mut stmt = tx.prepare(FB_ADS_UPSERT_SQL)?;
         for r in &payload.rows {
             let before: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM raw_fb_ad_groups WHERE day_date = ? AND ad_group_name = ?",
+                    "SELECT COUNT(*) FROM raw_fb_ads
+                     WHERE day_date = ? AND level = 'ad_group' AND name = ?",
                     params![day_date, r.ad_group_name],
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
+            let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
+            let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
             stmt.execute(params![
+                "ad_group",
                 r.ad_group_name,
                 r.sub_ids[0],
                 r.sub_ids[1],
@@ -564,18 +564,10 @@ pub fn import_fb_ad_groups(
                 r.report_end,
                 r.status,
                 r.spend,
+                clicks,
+                cpc,
                 r.impressions,
                 r.reach,
-                r.frequency,
-                r.link_clicks,
-                r.shop_clicks,
-                r.all_clicks,
-                r.link_cpc,
-                r.all_cpc,
-                r.link_ctr,
-                r.all_ctr,
-                r.landing_views,
-                r.cpm,
                 r.raw_json,
                 day_date,
                 source_file_id,
@@ -583,7 +575,7 @@ pub fn import_fb_ad_groups(
             if before == 0 {
                 inserted += 1;
             } else {
-                duplicated += 1; // = replaced
+                duplicated += 1;
             }
         }
     }
@@ -598,6 +590,27 @@ pub fn import_fb_ad_groups(
         duplicated,
     })
 }
+
+/// UPSERT template shared giữa `import_fb_ad_groups` và `import_fb_campaigns`.
+/// ON CONFLICT theo `(day_date, level, name)` — 2 level cùng name không đụng nhau.
+const FB_ADS_UPSERT_SQL: &str = "
+    INSERT INTO raw_fb_ads
+    (level, name,
+     sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+     report_start, report_end, status,
+     spend, clicks, cpc, impressions, reach,
+     raw_json, day_date, source_file_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(day_date, level, name) DO UPDATE SET
+       sub_id1 = excluded.sub_id1, sub_id2 = excluded.sub_id2,
+       sub_id3 = excluded.sub_id3, sub_id4 = excluded.sub_id4,
+       sub_id5 = excluded.sub_id5,
+       report_start = excluded.report_start, report_end = excluded.report_end,
+       status = excluded.status,
+       spend = excluded.spend, clicks = excluded.clicks, cpc = excluded.cpc,
+       impressions = excluded.impressions, reach = excluded.reach,
+       raw_json = excluded.raw_json, source_file_id = excluded.source_file_id
+";
 
 // ============================================================
 // FB Campaigns
@@ -616,6 +629,11 @@ pub struct FbCampaignRow {
     pub reach: Option<i64>,
     pub result_count: Option<i64>,
     pub result_indicator: Option<String>,
+    pub link_clicks: Option<i64>,
+    pub all_clicks: Option<i64>,
+    pub link_cpc: Option<f64>,
+    pub all_cpc: Option<f64>,
+    pub cost_per_result: Option<f64>,
     pub raw_json: Option<String>,
 }
 
@@ -662,34 +680,20 @@ pub fn import_fb_campaigns(
     let mut inserted: i64 = 0;
     let mut duplicated: i64 = 0;
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO raw_fb_campaigns
-             (campaign_name,
-              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-              report_start, report_end, status,
-              spend, impressions, reach, result_count, result_indicator,
-              raw_json, day_date, source_file_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(day_date, campaign_name) DO UPDATE SET
-                sub_id1 = excluded.sub_id1, sub_id2 = excluded.sub_id2,
-                sub_id3 = excluded.sub_id3, sub_id4 = excluded.sub_id4,
-                sub_id5 = excluded.sub_id5,
-                report_start = excluded.report_start, report_end = excluded.report_end,
-                status = excluded.status,
-                spend = excluded.spend, impressions = excluded.impressions,
-                reach = excluded.reach, result_count = excluded.result_count,
-                result_indicator = excluded.result_indicator,
-                raw_json = excluded.raw_json, source_file_id = excluded.source_file_id",
-        )?;
+        let mut stmt = tx.prepare(FB_ADS_UPSERT_SQL)?;
         for r in &payload.rows {
             let before: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM raw_fb_campaigns WHERE day_date = ? AND campaign_name = ?",
+                    "SELECT COUNT(*) FROM raw_fb_ads
+                     WHERE day_date = ? AND level = 'campaign' AND name = ?",
                     params![day_date, r.campaign_name],
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
+            let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
+            let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
             stmt.execute(params![
+                "campaign",
                 r.campaign_name,
                 r.sub_ids[0],
                 r.sub_ids[1],
@@ -700,10 +704,10 @@ pub fn import_fb_campaigns(
                 r.report_end,
                 r.status,
                 r.spend,
+                clicks,
+                cpc,
                 r.impressions,
                 r.reach,
-                r.result_count,
-                r.result_indicator,
                 r.raw_json,
                 day_date,
                 source_file_id,
@@ -711,7 +715,7 @@ pub fn import_fb_campaigns(
             if before == 0 {
                 inserted += 1;
             } else {
-                duplicated += 1; // = replaced
+                duplicated += 1;
             }
         }
     }

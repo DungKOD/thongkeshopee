@@ -54,8 +54,7 @@ pub fn batch_commit_deletes(
 
         // 2. Xóa raw rows có canonical prefix-compatible với target (trên cùng day).
         for table in [
-            "raw_fb_ad_groups",
-            "raw_fb_campaigns",
+            "raw_fb_ads",
             "raw_shopee_clicks",
             "raw_shopee_order_items",
         ] {
@@ -69,8 +68,7 @@ pub fn batch_commit_deletes(
         "DELETE FROM days WHERE date NOT IN (
             SELECT day_date FROM raw_shopee_clicks UNION
             SELECT day_date FROM raw_shopee_order_items UNION
-            SELECT day_date FROM raw_fb_ad_groups UNION
-            SELECT day_date FROM raw_fb_campaigns UNION
+            SELECT day_date FROM raw_fb_ads UNION
             SELECT day_date FROM manual_entries
          )",
         [],

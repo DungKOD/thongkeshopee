@@ -81,24 +81,195 @@ pub fn init_db(app: &AppHandle) -> Result<Connection> {
 /// Check DDL hiện tại của các bảng, fix nếu phát hiện schema cũ.
 /// Idempotent — chạy mỗi lần startup an toàn.
 fn migrate(conn: &Connection) -> Result<()> {
-    // Check FB ad_groups UNIQUE: cũ là `(source_file_id, ad_group_name)`,
-    // mới là `(day_date, ad_group_name)`. Pattern match DDL để detect.
-    let needs_fb_rebuild = has_legacy_fb_unique(conn, "raw_fb_ad_groups", "source_file_id, ad_group_name")?
+    // Legacy UNIQUE cũ (pre-v2): `(source_file_id, name)`. Nếu còn phát hiện,
+    // data FB cũ bỏ luôn — về trước v2 không còn user thực nào giữ data.
+    let needs_fb_drop = has_legacy_fb_unique(conn, "raw_fb_ad_groups", "source_file_id, ad_group_name")?
         || has_legacy_fb_unique(conn, "raw_fb_campaigns", "source_file_id, campaign_name")?;
 
-    if needs_fb_rebuild {
-        // Data FB cũ sẽ mất (orphan imported_files rows cũng dọn luôn).
+    if needs_fb_drop {
         conn.execute_batch(
             "DROP TABLE IF EXISTS raw_fb_ad_groups;
              DROP TABLE IF EXISTS raw_fb_campaigns;
              DELETE FROM imported_files WHERE kind IN ('fb_ad_group', 'fb_campaign');",
         )?;
-        // Re-apply schema → recreate 2 bảng đã drop với UNIQUE mới.
-        conn.execute_batch(SCHEMA_SQL)?;
+    }
 
+    // v3: gộp 2 bảng FB → 1 bảng `raw_fb_ads`, normalize clicks + cpc lúc INSERT.
+    // Nếu còn bảng cũ → copy data sang, drop cũ.
+    migrate_fb_unify(conn).context("fb unify migration failed")?;
+    migrate_sync_state(conn).context("sync_state migration failed")?;
+
+    Ok(())
+}
+
+/// v3 migration: copy raw_fb_ad_groups + raw_fb_campaigns → raw_fb_ads, drop cũ.
+/// Normalize clicks/cpc lúc copy.
+fn migrate_fb_unify(conn: &Connection) -> Result<()> {
+    let has_ad_groups = table_exists(conn, "raw_fb_ad_groups")?;
+    let has_campaigns = table_exists(conn, "raw_fb_campaigns")?;
+    if !has_ad_groups && !has_campaigns {
+        return Ok(());
+    }
+
+    if has_ad_groups {
+        // Check cột tồn tại — bảng cũ có thể thiếu link_clicks/all_clicks etc.
+        let cols = table_columns(conn, "raw_fb_ad_groups")?;
+        let has = |c: &str| cols.iter().any(|x| x == c);
+
+        // Tính biểu thức clicks + cpc theo cột sẵn có (fallback 0/NULL nếu thiếu).
+        let clicks_expr = build_coalesce(&[
+            has("link_clicks").then_some("link_clicks"),
+            has("all_clicks").then_some("all_clicks"),
+        ]);
+        let cpc_expr = build_coalesce(&[
+            has("link_cpc").then_some("link_cpc"),
+            has("all_cpc").then_some("all_cpc"),
+        ]);
+
+        let sql = format!(
+            "INSERT OR IGNORE INTO raw_fb_ads
+             (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              report_start, report_end, status,
+              spend, clicks, cpc, impressions, reach,
+              raw_json, day_date, source_file_id)
+             SELECT 'ad_group', ad_group_name,
+                    sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                    report_start, report_end, status,
+                    spend, {clicks_expr}, {cpc_expr}, impressions, reach,
+                    raw_json, day_date, source_file_id
+             FROM raw_fb_ad_groups"
+        );
+        conn.execute(&sql, [])?;
+        conn.execute("DROP TABLE raw_fb_ad_groups", [])?;
+    }
+
+    if has_campaigns {
+        let cols = table_columns(conn, "raw_fb_campaigns")?;
+        let has = |c: &str| cols.iter().any(|x| x == c);
+
+        let clicks_expr = build_coalesce(&[
+            has("link_clicks").then_some("link_clicks"),
+            has("all_clicks").then_some("all_clicks"),
+            has("result_count").then_some("result_count"),
+        ]);
+        let cpc_expr = build_coalesce(&[
+            has("link_cpc").then_some("link_cpc"),
+            has("all_cpc").then_some("all_cpc"),
+        ]);
+
+        let sql = format!(
+            "INSERT OR IGNORE INTO raw_fb_ads
+             (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              report_start, report_end, status,
+              spend, clicks, cpc, impressions, reach,
+              raw_json, day_date, source_file_id)
+             SELECT 'campaign', campaign_name,
+                    sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                    report_start, report_end, status,
+                    spend, {clicks_expr}, {cpc_expr}, impressions, reach,
+                    raw_json, day_date, source_file_id
+             FROM raw_fb_campaigns"
+        );
+        conn.execute(&sql, [])?;
+        conn.execute("DROP TABLE raw_fb_campaigns", [])?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        [name],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Build SQL `COALESCE(a, b, c)` từ list Option<&str> — bỏ None. Nếu hết → "NULL".
+fn build_coalesce(opts: &[Option<&str>]) -> String {
+    let parts: Vec<&str> = opts.iter().filter_map(|x| *x).collect();
+    match parts.len() {
+        0 => "NULL".to_string(),
+        1 => parts[0].to_string(),
+        _ => format!("COALESCE({})", parts.join(", ")),
+    }
+}
+
+/// Đảm bảo sync_state có đủ cột mới + triggers luôn up-to-date.
+/// Idempotent: ALTER TABLE ADD COLUMN chỉ chạy nếu cột chưa có;
+/// DROP + CREATE triggers chạy mỗi lần (rẻ, đảm bảo body match code).
+fn migrate_sync_state(conn: &Connection) -> Result<()> {
+    // Check cột tồn tại chưa (sync_state cũ chỉ có 5 cột).
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sync_state)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    if !cols.iter().any(|c| c == "change_id") {
         conn.execute(
-            "INSERT OR IGNORE INTO _schema_version(version, applied_at)
-             VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            "ALTER TABLE sync_state ADD COLUMN change_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !cols.iter().any(|c| c == "last_uploaded_change_id") {
+        conn.execute(
+            "ALTER TABLE sync_state ADD COLUMN last_uploaded_change_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Drop + re-create sync triggers để đảm bảo body match code hiện tại.
+    // Triggers increment cả dirty lẫn change_id (cho CAS pattern).
+    let trigger_specs: &[(&str, &str, &str)] = &[
+        ("trg_sync_clicks_ins",   "INSERT", "raw_shopee_clicks"),
+        ("trg_sync_clicks_upd",   "UPDATE", "raw_shopee_clicks"),
+        ("trg_sync_clicks_del",   "DELETE", "raw_shopee_clicks"),
+        ("trg_sync_orders_ins",   "INSERT", "raw_shopee_order_items"),
+        ("trg_sync_orders_upd",   "UPDATE", "raw_shopee_order_items"),
+        ("trg_sync_orders_del",   "DELETE", "raw_shopee_order_items"),
+        ("trg_sync_fb_ads_ins",   "INSERT", "raw_fb_ads"),
+        ("trg_sync_fb_ads_upd",   "UPDATE", "raw_fb_ads"),
+        ("trg_sync_fb_ads_del",   "DELETE", "raw_fb_ads"),
+        ("trg_sync_manual_ins",   "INSERT", "manual_entries"),
+        ("trg_sync_manual_upd",   "UPDATE", "manual_entries"),
+        ("trg_sync_manual_del",   "DELETE", "manual_entries"),
+        ("trg_sync_video_ins",    "INSERT", "video_downloads"),
+        ("trg_sync_video_upd",    "UPDATE", "video_downloads"),
+        ("trg_sync_video_del",    "DELETE", "video_downloads"),
+    ];
+
+    // Drop legacy triggers trên bảng FB cũ (đã gộp vào raw_fb_ads ở v3).
+    for name in [
+        "trg_sync_fb_ad_ins",
+        "trg_sync_fb_ad_upd",
+        "trg_sync_fb_ad_del",
+        "trg_sync_fb_camp_ins",
+        "trg_sync_fb_camp_upd",
+        "trg_sync_fb_camp_del",
+    ] {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {name}"), [])?;
+    }
+
+    for (name, event, table) in trigger_specs {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {name}"), [])?;
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER {name} AFTER {event} ON {table}
+                 BEGIN UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1; END"
+            ),
             [],
         )?;
     }
@@ -151,8 +322,7 @@ mod tests {
             "days",
             "imported_files",
             "manual_entries",
-            "raw_fb_ad_groups",
-            "raw_fb_campaigns",
+            "raw_fb_ads",
             "raw_shopee_clicks",
             "raw_shopee_order_items",
         ];

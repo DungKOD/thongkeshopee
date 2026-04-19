@@ -114,69 +114,52 @@ fn aggregate_rows_for_day(conn: &Connection, day_date: &str) -> CmdResult<Vec<Ui
     // Phase 1: load raw data từ 5 nguồn, giữ canonical tuple.
     // ============================================================
 
-    // FB ad_groups
-    struct FbAg {
+    // FB ads — unified. Dedup per sub_id_tuple: nếu tuple có row level='ad_group'
+    // thì CHỈ dùng ad_group (bỏ campaign); nếu không có → dùng campaign.
+    // Logic: `preferred_rank = MIN(0 if ad_group else 1) OVER PARTITION BY tuple`,
+    // rồi filter row cùng rank.
+    struct FbAds {
         canonical: Canonical,
         spend: Option<f64>,
         imps: Option<i64>,
-        link_clicks: Option<i64>,
+        clicks: Option<i64>,
         weighted_cpc_sum: Option<f64>,
     }
-    let mut fb_ags: Vec<FbAg> = Vec::new();
+    let mut fb_ads: Vec<FbAds> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-                    SUM(spend), SUM(impressions), SUM(link_clicks),
-                    SUM(CASE WHEN link_clicks IS NOT NULL AND link_cpc IS NOT NULL
-                        THEN link_clicks * link_cpc ELSE 0 END)
-             FROM raw_fb_ad_groups
-             WHERE day_date = ?
+            "WITH ranked AS (
+                SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                       level, spend, clicks, cpc, impressions,
+                       MIN(CASE level WHEN 'ad_group' THEN 0 ELSE 1 END)
+                         OVER (PARTITION BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5)
+                         AS preferred_rank
+                FROM raw_fb_ads
+                WHERE day_date = ?
+             )
+             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                    SUM(spend),
+                    SUM(impressions),
+                    SUM(clicks),
+                    SUM(CASE WHEN clicks IS NOT NULL AND cpc IS NOT NULL
+                             THEN clicks * cpc ELSE 0 END)
+             FROM ranked
+             WHERE (CASE level WHEN 'ad_group' THEN 0 ELSE 1 END) = preferred_rank
              GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5",
         )?;
         let iter = stmt.query_map(params![day_date], |r| {
             let tuple: [String; 5] =
                 [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
-            Ok(FbAg {
+            Ok(FbAds {
                 canonical: to_canonical(tuple),
                 spend: r.get(5)?,
                 imps: r.get(6)?,
-                link_clicks: r.get(7)?,
+                clicks: r.get(7)?,
                 weighted_cpc_sum: r.get(8)?,
             })
         })?;
         for row in iter {
-            fb_ags.push(row?);
-        }
-    }
-
-    // FB campaigns
-    struct FbCamp {
-        canonical: Canonical,
-        spend: Option<f64>,
-        imps: Option<i64>,
-        result_count: Option<i64>,
-    }
-    let mut fb_camps: Vec<FbCamp> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-                    SUM(spend), SUM(impressions), SUM(result_count)
-             FROM raw_fb_campaigns
-             WHERE day_date = ?
-             GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5",
-        )?;
-        let iter = stmt.query_map(params![day_date], |r| {
-            let tuple: [String; 5] =
-                [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
-            Ok(FbCamp {
-                canonical: to_canonical(tuple),
-                spend: r.get(5)?,
-                imps: r.get(6)?,
-                result_count: r.get(7)?,
-            })
-        })?;
-        for row in iter {
-            fb_camps.push(row?);
+            fb_ads.push(row?);
         }
     }
 
@@ -316,8 +299,8 @@ fn aggregate_rows_for_day(conn: &Connection, day_date: &str) -> CmdResult<Vec<Ui
         has_manual: false,
     };
 
-    // FB ad_groups
-    for r in fb_ags {
+    // FB ads (đã dedup ad_group ưu tiên trong SQL).
+    for r in fb_ads {
         let rep = resolve(&r.canonical);
         let entry = map.entry(rep.clone()).or_insert_with(|| make_empty(&rep));
         entry.has_fb = true;
@@ -327,33 +310,15 @@ fn aggregate_rows_for_day(conn: &Connection, day_date: &str) -> CmdResult<Vec<Ui
         if r.imps.is_some() {
             entry.impressions = Some(entry.impressions.unwrap_or(0) + r.imps.unwrap_or(0));
         }
-        if r.link_clicks.is_some() {
-            entry.ads_clicks = Some(entry.ads_clicks.unwrap_or(0) + r.link_clicks.unwrap_or(0));
+        if r.clicks.is_some() {
+            entry.ads_clicks = Some(entry.ads_clicks.unwrap_or(0) + r.clicks.unwrap_or(0));
         }
-        // CPC chỉ lấy từ DB khi raw_fb_ad_groups.link_cpc có giá trị thực
-        // (weighted_cpc_sum > 0). Nếu = 0 nghĩa là raw không có CPC → để None
-        // để fallback spend/clicks ở cuối.
-        if let (Some(wsum), Some(clicks)) = (r.weighted_cpc_sum, r.link_clicks) {
+        // CPC weighted: SUM(clicks * cpc) / SUM(clicks). Fallback spend/clicks
+        // ở cuối function nếu weighted sum = 0 (raw không có CPC).
+        if let (Some(wsum), Some(clicks)) = (r.weighted_cpc_sum, r.clicks) {
             if clicks > 0 && wsum > 0.0 {
                 entry.cpc = Some(wsum / clicks as f64);
             }
-        }
-    }
-
-    // FB campaigns — OVERRIDE spend nếu có (campaign là rollup chính thức).
-    for r in fb_camps {
-        let rep = resolve(&r.canonical);
-        let entry = map.entry(rep.clone()).or_insert_with(|| make_empty(&rep));
-        entry.has_fb = true;
-        if r.spend.is_some() {
-            // Override chứ không cộng — campaign CSV đã là tổng rollup.
-            entry.total_spend = r.spend;
-        }
-        if r.imps.is_some() {
-            entry.impressions = r.imps;
-        }
-        if entry.ads_clicks.is_none() && r.result_count.is_some() {
-            entry.ads_clicks = r.result_count;
         }
     }
 
