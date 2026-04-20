@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
+import { auth } from "../lib/firebase";
+import { logVideoDownload } from "../lib/drive";
 
 /**
  * Tải video từ nhiều nền tảng (TikTok, Douyin, Xiaohongshu, FB, IG, YouTube...).
@@ -85,13 +87,17 @@ export function DownloadVideoPage() {
     setError("");
     setInfo(null);
     setSuccess("");
+    const sourceUrl = url.trim();
     try {
       const data = await invoke<VideoInfo>("get_video_info", {
-        url: url.trim(),
+        url: sourceUrl,
       });
       setInfo(data);
+      // Log search success — AS upsert theo URL, mỗi URL chỉ 1 row với status cuối.
+      void logStatus(sourceUrl, "success");
     } catch (e) {
       setError(String(e));
+      void logStatus(sourceUrl, "failed");
     } finally {
       setLoading(false);
     }
@@ -118,19 +124,28 @@ export function DownloadVideoPage() {
         savePath,
       });
       setSuccess(`Đã lưu: ${path}`);
-      void invoke("log_video_download", {
-        url: sourceUrl,
-        status: "success",
-      }).catch(() => {});
+      void logStatus(sourceUrl, "success");
     } catch (e) {
       setError(String(e));
-      void invoke("log_video_download", {
-        url: sourceUrl,
-        status: "failed",
-      }).catch(() => {});
+      void logStatus(sourceUrl, "failed");
     } finally {
       setDownloading(false);
       setProgress(null);
+    }
+  };
+
+  // Best-effort log: BE ghi local DB + post Sheet. Không block UI, swallow lỗi.
+  const logStatus = async (
+    sourceUrl: string,
+    status: "success" | "failed",
+  ) => {
+    try {
+      const user = auth.currentUser;
+      if (!user) return;
+      const idToken = await user.getIdToken(false);
+      await logVideoDownload(idToken, sourceUrl, status);
+    } catch {
+      /* best-effort */
     }
   };
 

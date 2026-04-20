@@ -162,19 +162,8 @@ CREATE TABLE IF NOT EXISTS manual_entries (
 
 CREATE INDEX IF NOT EXISTS idx_manual_day        ON manual_entries(day_date);
 
--- =============================================================
--- video_downloads — audit log mọi lần download video.
--- Chỉ log khi URL đúng cấu trúc (pass validate) + download được gọi.
--- Không log URL garbage/không tải được info.
--- =============================================================
-CREATE TABLE IF NOT EXISTS video_downloads (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    url                TEXT NOT NULL,
-    downloaded_at_ms   INTEGER NOT NULL,
-    status             TEXT NOT NULL          -- 'success' | 'failed'
-);
-
-CREATE INDEX IF NOT EXISTS idx_video_downloads_time ON video_downloads(downloaded_at_ms DESC);
+-- video_downloads table ĐÃ MOVE sang `video_logs.db` riêng (v4).
+-- Xem `db/video_db.rs`. Primary audit = Google Sheet qua Apps Script.
 
 -- =============================================================
 -- sync_state — singleton row theo dõi trạng thái sync Drive.

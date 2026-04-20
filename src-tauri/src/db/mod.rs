@@ -15,6 +15,9 @@ use rusqlite::Connection;
 use tauri::{AppHandle, Manager};
 
 pub mod types;
+pub mod video_db;
+
+pub use video_db::VideoDbState;
 
 /// SQL script áp dụng khi khởi động app (idempotent, safe để chạy mỗi lần).
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -108,7 +111,26 @@ fn migrate(conn: &Connection) -> Result<()> {
     // Nếu còn bảng cũ → copy data sang, drop cũ.
     migrate_fb_unify(conn).context("fb unify migration failed")?;
     migrate_sync_state(conn).context("sync_state migration failed")?;
+    migrate_drop_video_downloads(conn).context("drop video_downloads failed")?;
 
+    Ok(())
+}
+
+/// v4 migration: drop `video_downloads` khỏi main DB. Table đã move sang
+/// `video_logs.db` riêng để main DB backup Drive gọn nhẹ hơn.
+/// Data cũ KHÔNG copy sang (audit storage mới là Google Sheet).
+fn migrate_drop_video_downloads(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS trg_sync_video_ins;
+         DROP TRIGGER IF EXISTS trg_sync_video_upd;
+         DROP TRIGGER IF EXISTS trg_sync_video_del;
+         DROP TABLE IF EXISTS video_downloads;",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
     Ok(())
 }
 
@@ -256,9 +278,6 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
         ("trg_sync_manual_ins",   "INSERT", "manual_entries"),
         ("trg_sync_manual_upd",   "UPDATE", "manual_entries"),
         ("trg_sync_manual_del",   "DELETE", "manual_entries"),
-        ("trg_sync_video_ins",    "INSERT", "video_downloads"),
-        ("trg_sync_video_upd",    "UPDATE", "video_downloads"),
-        ("trg_sync_video_del",    "DELETE", "video_downloads"),
         // Tombstones: INSERT khi user xóa → cần sync qua Drive. DELETE khi user
         // restore (tương lai) hoặc compact — cũng mark dirty.
         ("trg_sync_tombstones_ins", "INSERT", "tombstones"),
@@ -302,10 +321,11 @@ fn has_legacy_fb_unique(conn: &Connection, table: &str, legacy: &str) -> Result<
     Ok(sql.as_deref().map(|s| s.contains(legacy)).unwrap_or(false))
 }
 
-/// Setup hook cho `tauri::Builder`: init DB + manage state.
+/// Setup hook cho `tauri::Builder`: init main DB + video logs DB + manage state.
 pub fn setup(app: &AppHandle) -> Result<()> {
     let conn = init_db(app)?;
     app.manage(DbState(Mutex::new(conn)));
+    video_db::setup(app)?;
     Ok(())
 }
 

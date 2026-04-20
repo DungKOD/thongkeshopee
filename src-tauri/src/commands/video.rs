@@ -13,7 +13,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::db::DbState;
+use crate::db::VideoDbState;
 
 use super::{CmdError, CmdResult};
 
@@ -762,11 +762,18 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Log 1 lần download video. Frontend gọi sau khi download_video thành công hoặc fail.
-/// URL phải đúng cấu trúc (đã pass get_video_info) — caller chịu trách nhiệm filter.
+/// Log 1 lần download video. Ghi vào local `video_logs.db` (always) + best-effort
+/// post lên Google Sheet qua Apps Script. Nếu Sheet call fail → swallow lỗi, local vẫn OK.
+/// Timestamp format ở BE theo local time của máy user (`HH:MM:SS DD/MM/YYYY`).
+///
+/// Input `url` có thể là text rác chứa link (share text Douyin/XHS có emoji + mô tả).
+/// Dùng `extract_url()` để tách clean URL đầu tiên trước khi log — đảm bảo Sheet
+/// upsert-by-URL hoạt động đúng (không bị mismatch do text khác nhau cùng URL).
 #[tauri::command]
 pub async fn log_video_download(
-    db: State<'_, DbState>,
+    video_db: State<'_, VideoDbState>,
+    apps_script_url: String,
+    id_token: String,
     url: String,
     status: String,
 ) -> CmdResult<()> {
@@ -775,66 +782,330 @@ pub async fn log_video_download(
             "Invalid status: {status} (must be success/failed)"
         )));
     }
-    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+
+    let clean_url = extract_url(&url);
+
+    // 1. Local DB ghi trước — đảm bảo không mất log dù Sheet down.
+    {
+        let conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO video_downloads (url, downloaded_at_ms, status) VALUES (?1, ?2, ?3)",
+            params![&clean_url, now_ms(), &status],
+        )?;
+    }
+
+    // 2. Best-effort Sheet post. Swallow lỗi để không block user flow.
+    let timestamp = chrono::Local::now()
+        .format("%H:%M:%S %d/%m/%Y")
+        .to_string();
+    if let Err(e) = super::drive::as_log_video_download(
+        &apps_script_url,
+        &id_token,
+        &clean_url,
+        &status,
+        &timestamp,
+    )
+    .await
+    {
+        eprintln!("[video log] Sheet post failed: {e}");
+    }
+
+    Ok(())
+}
+
+/// Query local video_downloads từ `video_logs.db`. User xem history của chính mình.
+#[tauri::command]
+pub async fn list_video_downloads(
+    video_db: State<'_, VideoDbState>,
+    limit: i64,
+    offset: i64,
+) -> CmdResult<Vec<VideoDownloadLog>> {
+    let conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, url, downloaded_at_ms, status
+         FROM video_downloads
+         ORDER BY downloaded_at_ms DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![limit, offset], |r| {
+        Ok(VideoDownloadLog {
+            id: r.get(0)?,
+            url: r.get(1)?,
+            downloaded_at_ms: r.get(2)?,
+            status: r.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(CmdError::from)
+}
+
+// ============================================================
+// Admin: cache video log của user khác từ Google Sheet.
+// Flow: fetch Sheet (all pages) → replace cache → UI đọc từ cache.
+// ============================================================
+
+const FETCH_PAGE_SIZE: i64 = 1000;
+
+/// Output của admin cache query — shape khớp `VideoLogRow` ở Sheet.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminCachedLogRow {
+    pub timestamp: String,
+    pub url: String,
+    pub status: String,
+}
+
+/// Metadata về lần fetch gần nhất cho 1 user. `None` = chưa fetch lần nào.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminFetchMeta {
+    pub fetched_at_ms: i64,
+    pub row_count: i64,
+}
+
+/// Admin-only: fetch TOÀN BỘ sheet tab của `target_local_part` → ghi cache DB.
+/// Atomic: transaction clear + insert mới → không để lại state half-filled.
+/// Apps Script verify admin nên user thường invoke cũng bị reject ở AS.
+/// Trả về số row đã cache.
+#[tauri::command]
+pub async fn admin_fetch_user_log_sheet(
+    video_db: State<'_, VideoDbState>,
+    apps_script_url: String,
+    id_token: String,
+    target_local_part: String,
+) -> CmdResult<i64> {
+    // Loop fetch từng trang đến hết.
+    let mut all: Vec<super::drive::VideoLogRow> = Vec::new();
+    let mut offset = 0i64;
+    loop {
+        let page = super::drive::as_read_user_video_log(
+            &apps_script_url,
+            &id_token,
+            &target_local_part,
+            FETCH_PAGE_SIZE,
+            offset,
+        )
+        .await?;
+        let page_len = page.len() as i64;
+        if page_len == 0 {
+            break;
+        }
+        all.extend(page);
+        offset += page_len;
+        if page_len < FETCH_PAGE_SIZE {
+            break;
+        }
+    }
+
+    // Replace cache atomically.
+    let mut conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM admin_user_log_cache WHERE local_part = ?1",
+        params![&target_local_part],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO admin_user_log_cache
+             (local_part, row_order, timestamp, url, status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (i, row) in all.iter().enumerate() {
+            stmt.execute(params![
+                &target_local_part,
+                i as i64,
+                &row.timestamp,
+                &row.url,
+                &row.status,
+            ])?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO admin_user_log_fetch_meta (local_part, fetched_at_ms, row_count)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(local_part) DO UPDATE SET
+             fetched_at_ms = excluded.fetched_at_ms,
+             row_count = excluded.row_count",
+        params![&target_local_part, now_ms(), all.len() as i64],
+    )?;
+    tx.commit()?;
+
+    Ok(all.len() as i64)
+}
+
+/// Đọc cache rows theo pagination. `row_order` ASC = giữ nguyên thứ tự Sheet
+/// (newest-first từ AS). Caller paginate qua `limit` + `offset`.
+#[tauri::command]
+pub async fn admin_read_user_log_cache(
+    video_db: State<'_, VideoDbState>,
+    target_local_part: String,
+    limit: i64,
+    offset: i64,
+) -> CmdResult<Vec<AdminCachedLogRow>> {
+    let conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let mut stmt = conn.prepare(
+        "SELECT timestamp, url, status
+         FROM admin_user_log_cache
+         WHERE local_part = ?1
+         ORDER BY row_order ASC
+         LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = stmt.query_map(params![&target_local_part, limit, offset], |r| {
+        Ok(AdminCachedLogRow {
+            timestamp: r.get(0)?,
+            url: r.get(1)?,
+            status: r.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(CmdError::from)
+}
+
+/// Admin xóa 1 row: gọi AS xóa ở Sheet → nếu OK xóa local cache theo tuple.
+/// Update row_count trong meta. AS match tuple (timestamp, url, status) —
+/// nếu có duplicate ở Sheet chỉ xóa first match.
+#[tauri::command]
+pub async fn admin_delete_user_log_row(
+    video_db: State<'_, VideoDbState>,
+    apps_script_url: String,
+    id_token: String,
+    target_local_part: String,
+    timestamp: String,
+    url: String,
+    status: String,
+) -> CmdResult<()> {
+    super::drive::as_delete_user_video_log_row(
+        &apps_script_url,
+        &id_token,
+        &target_local_part,
+        &timestamp,
+        &url,
+        &status,
+    )
+    .await?;
+
+    let conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     conn.execute(
-        "INSERT INTO video_downloads (url, downloaded_at_ms, status) VALUES (?1, ?2, ?3)",
-        params![url, now_ms(), status],
+        "DELETE FROM admin_user_log_cache
+         WHERE local_part = ?1 AND timestamp = ?2 AND url = ?3 AND status = ?4",
+        params![&target_local_part, &timestamp, &url, &status],
+    )?;
+    conn.execute(
+        "UPDATE admin_user_log_fetch_meta
+         SET row_count = (
+             SELECT COUNT(*) FROM admin_user_log_cache WHERE local_part = ?1
+         )
+         WHERE local_part = ?1",
+        params![&target_local_part],
     )?;
     Ok(())
 }
 
-/// Query video_downloads từ DB hiện tại (dùng cho admin xem DB của chính mình).
+/// Admin xóa toàn bộ sheet tab: gọi AS `deleteSheet` → clear cache + meta local.
+/// Atomic local (transaction). Sheet delete không rollback được.
 #[tauri::command]
-pub async fn list_video_downloads(
-    db: State<'_, DbState>,
-    limit: i64,
-    offset: i64,
-) -> CmdResult<Vec<VideoDownloadLog>> {
-    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, url, downloaded_at_ms, status
-         FROM video_downloads
-         ORDER BY downloaded_at_ms DESC
-         LIMIT ?1 OFFSET ?2",
+pub async fn admin_delete_user_log_sheet(
+    video_db: State<'_, VideoDbState>,
+    apps_script_url: String,
+    id_token: String,
+    target_local_part: String,
+) -> CmdResult<()> {
+    super::drive::as_delete_user_video_log_sheet(
+        &apps_script_url,
+        &id_token,
+        &target_local_part,
+    )
+    .await?;
+
+    let mut conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM admin_user_log_cache WHERE local_part = ?1",
+        params![&target_local_part],
     )?;
-    let rows = stmt.query_map(params![limit, offset], |r| {
-        Ok(VideoDownloadLog {
-            id: r.get(0)?,
-            url: r.get(1)?,
-            downloaded_at_ms: r.get(2)?,
-            status: r.get(3)?,
-        })
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(CmdError::from)
+    tx.execute(
+        "DELETE FROM admin_user_log_fetch_meta WHERE local_part = ?1",
+        params![&target_local_part],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
-/// Query video_downloads từ DB file bất kỳ (admin xem DB của user khác sau khi download về).
-/// Mở read-only connection, không ảnh hưởng DB live.
+/// User list cache — JSON blob singleton. FE tự parse thành `UserListEntry[]`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminUserListCache {
+    pub users_json: String,
+    pub fetched_at_ms: i64,
+}
+
+/// Đọc user list cache (stale-while-revalidate — FE render ngay lúc mở tab).
+/// None = chưa fetch bao giờ.
 #[tauri::command]
-pub async fn list_video_downloads_from_path(
-    db_path: String,
-    limit: i64,
-    offset: i64,
-) -> CmdResult<Vec<VideoDownloadLog>> {
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+pub async fn admin_read_user_list_cache(
+    video_db: State<'_, VideoDbState>,
+) -> CmdResult<Option<AdminUserListCache>> {
+    let conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    Ok(conn
+        .query_row(
+            "SELECT data_json, fetched_at_ms FROM admin_user_list_cache WHERE id = 1",
+            [],
+            |r| {
+                Ok(AdminUserListCache {
+                    users_json: r.get(0)?,
+                    fetched_at_ms: r.get(1)?,
+                })
+            },
+        )
+        .ok())
+}
+
+/// Fetch user list từ AS → save cache singleton → trả về. Admin check chạy
+/// trong AS. FE gọi background sau khi render cache.
+#[tauri::command]
+pub async fn admin_fetch_user_list(
+    video_db: State<'_, VideoDbState>,
+    apps_script_url: String,
+    id_token: String,
+) -> CmdResult<AdminUserListCache> {
+    let users = super::drive::as_list_users(&apps_script_url, &id_token).await?;
+    let users_json = serde_json::to_string(&users)
+        .map_err(|e| CmdError::msg(format!("serialize users: {e}")))?;
+    let now = now_ms();
+
+    let conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    conn.execute(
+        "INSERT INTO admin_user_list_cache (id, data_json, fetched_at_ms)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+             data_json = excluded.data_json,
+             fetched_at_ms = excluded.fetched_at_ms",
+        params![&users_json, now],
     )?;
-    let mut stmt = conn.prepare(
-        "SELECT id, url, downloaded_at_ms, status
-         FROM video_downloads
-         ORDER BY downloaded_at_ms DESC
-         LIMIT ?1 OFFSET ?2",
-    )?;
-    let rows = stmt.query_map(params![limit, offset], |r| {
-        Ok(VideoDownloadLog {
-            id: r.get(0)?,
-            url: r.get(1)?,
-            downloaded_at_ms: r.get(2)?,
-            status: r.get(3)?,
-        })
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(CmdError::from)
+
+    Ok(AdminUserListCache {
+        users_json,
+        fetched_at_ms: now,
+    })
+}
+
+/// Metadata fetch gần nhất. `None` = user chưa fetch lần nào.
+#[tauri::command]
+pub async fn admin_user_log_fetch_meta(
+    video_db: State<'_, VideoDbState>,
+    target_local_part: String,
+) -> CmdResult<Option<AdminFetchMeta>> {
+    let conn = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let row = conn
+        .query_row(
+            "SELECT fetched_at_ms, row_count
+             FROM admin_user_log_fetch_meta
+             WHERE local_part = ?1",
+            params![&target_local_part],
+            |r| {
+                Ok(AdminFetchMeta {
+                    fetched_at_ms: r.get(0)?,
+                    row_count: r.get(1)?,
+                })
+            },
+        )
+        .ok();
+    Ok(row)
 }

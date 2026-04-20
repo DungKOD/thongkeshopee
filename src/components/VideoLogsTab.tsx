@@ -1,11 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth } from "../lib/firebase";
 import {
-  adminDownloadUserDb,
-  driveListUsers,
-  listVideoDownloadsFromPath,
+  adminDeleteUserLogRow,
+  adminDeleteUserLogSheet,
+  adminFetchUserList,
+  adminFetchUserLogSheet,
+  adminReadUserListCache,
+  adminReadUserLogCache,
+  adminUserLogFetchMeta,
+  type AdminFetchMeta,
   type UserListEntry,
-  type VideoDownloadLog,
+  type VideoLogRow,
 } from "../lib/drive";
 
 const PAGE_SIZE = 100;
@@ -13,7 +18,12 @@ const PAGE_SIZE = 100;
 interface SelectedUser {
   localPart: string;
   email: string;
-  dbPath: string;
+}
+
+function fmtFetchedAt(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())} ${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
 }
 
 export function VideoLogsTab() {
@@ -23,31 +33,51 @@ export function VideoLogsTab() {
   const [query, setQuery] = useState("");
 
   const [selected, setSelected] = useState<SelectedUser | null>(null);
-  const [loadingDb, setLoadingDb] = useState(false);
-  const [dbError, setDbError] = useState<string | null>(null);
+  const [meta, setMeta] = useState<AdminFetchMeta | null>(null);
 
-  const [logs, setLogs] = useState<VideoDownloadLog[]>([]);
+  // 2 loading states: initial (cache đọc lần đầu) + fetching (gọi Sheet).
+  const [initialLoading, setInitialLoading] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
+  const [logs, setLogs] = useState<VideoLogRow[]>([]);
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [offset, setOffset] = useState(0);
 
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+  // Stale-while-revalidate: đọc cache DB trước (render ngay nếu có),
+  // sau đó fetch fresh từ AS qua background → replace cache → re-render.
   const loadUsers = useCallback(async () => {
     const current = auth.currentUser;
     if (!current) {
       setUsersError("Chưa đăng nhập");
       return;
     }
+
+    // 1. Cache first — render instant nếu đã từng fetch.
+    try {
+      const cached = await adminReadUserListCache();
+      if (cached) {
+        const list: UserListEntry[] = JSON.parse(cached.users_json);
+        setUsers(list.filter((u) => u.localPart));
+      }
+    } catch {
+      /* cache miss/parse OK — tiếp tục fetch */
+    }
+
+    // 2. Fetch fresh background → update cache + UI.
     setUsersLoading(true);
     setUsersError(null);
     try {
       const idToken = await current.getIdToken(false);
-      const list = await driveListUsers(idToken);
-      const withFile = list.filter((u) => u.file !== null && u.localPart);
-      setUsers(withFile);
+      const fresh = await adminFetchUserList(idToken);
+      const list: UserListEntry[] = JSON.parse(fresh.users_json);
+      setUsers(list.filter((u) => u.localPart));
     } catch (e) {
       setUsersError((e as Error).message);
-      setUsers(null);
     } finally {
       setUsersLoading(false);
     }
@@ -61,49 +91,159 @@ export function VideoLogsTab() {
     if (!users) return [];
     const q = query.toLowerCase().trim();
     return q
-      ? users.filter((u) => (u.email ?? "").toLowerCase().includes(q))
+      ? users.filter(
+          (u) =>
+            (u.email ?? "").toLowerCase().includes(q) ||
+            (u.localPart ?? "").toLowerCase().includes(q),
+        )
       : users;
   }, [users, query]);
 
-  const selectUser = useCallback(async (u: UserListEntry) => {
-    if (!u.localPart) return;
-    const current = auth.currentUser;
-    if (!current) return;
+  // Đọc trang đầu từ cache DB. Trả về số rows đọc được.
+  const readCacheFirstPage = useCallback(async (localPart: string) => {
+    const rows = await adminReadUserLogCache(localPart, PAGE_SIZE, 0);
+    setLogs(rows);
+    setOffset(rows.length);
+    setHasMore(rows.length >= PAGE_SIZE);
+    const m = await adminUserLogFetchMeta(localPart);
+    setMeta(m);
+    return rows.length;
+  }, []);
 
-    setLoadingDb(true);
-    setDbError(null);
-    setLogs([]);
-    setHasMore(false);
-    setOffset(0);
-    setLogsError(null);
+  // Fetch Sheet → replace cache → đọc lại trang đầu.
+  const fetchFromSheet = useCallback(
+    async (localPart: string) => {
+      const current = auth.currentUser;
+      if (!current) return;
+      setFetching(true);
+      setFetchError(null);
+      try {
+        const idToken = await current.getIdToken(false);
+        await adminFetchUserLogSheet(idToken, localPart);
+        await readCacheFirstPage(localPart);
+      } catch (e) {
+        setFetchError((e as Error).message);
+      } finally {
+        setFetching(false);
+      }
+    },
+    [readCacheFirstPage],
+  );
 
-    try {
-      const idToken = await current.getIdToken(false);
-      const dbPath = await adminDownloadUserDb(idToken, u.localPart);
+  const selectUser = useCallback(
+    async (u: UserListEntry) => {
+      if (!u.localPart) return;
       setSelected({
         localPart: u.localPart,
         email: u.email ?? u.localPart,
-        dbPath,
       });
-      // Load page đầu.
-      const first = await listVideoDownloadsFromPath(dbPath, PAGE_SIZE, 0);
-      setLogs(first);
-      setOffset(first.length);
-      setHasMore(first.length >= PAGE_SIZE);
+      setLogs([]);
+      setOffset(0);
+      setHasMore(false);
+      setMeta(null);
+      setLogsError(null);
+      setFetchError(null);
+
+      // 1. Cache DB trước — render ngay (dù có hay không).
+      setInitialLoading(true);
+      try {
+        await readCacheFirstPage(u.localPart);
+      } catch (e) {
+        setLogsError((e as Error).message);
+      } finally {
+        setInitialLoading(false);
+      }
+
+      // 2. Luôn fetch Sheet background → update cache + re-render.
+      // (Không còn phụ thuộc cache rỗng — mỗi lần select đều revalidate.)
+      void fetchFromSheet(u.localPart);
+    },
+    [readCacheFirstPage, fetchFromSheet],
+  );
+
+  const refetch = useCallback(() => {
+    if (!selected) return;
+    void fetchFromSheet(selected.localPart);
+  }, [selected, fetchFromSheet]);
+
+  // Track index row đang xóa để disable button + show spinner.
+  const [deletingRowIdx, setDeletingRowIdx] = useState<number | null>(null);
+  const [deletingSheet, setDeletingSheet] = useState(false);
+
+  const deleteRow = useCallback(
+    async (idx: number) => {
+      if (!selected) return;
+      const row = logs[idx];
+      if (!row) return;
+      if (
+        !window.confirm(
+          `Xóa dòng này?\n\n${row.timestamp}\n${row.url}\n${row.status}`,
+        )
+      )
+        return;
+
+      const current = auth.currentUser;
+      if (!current) return;
+
+      setDeletingRowIdx(idx);
+      try {
+        const idToken = await current.getIdToken(false);
+        await adminDeleteUserLogRow(
+          idToken,
+          selected.localPart,
+          row.timestamp,
+          row.url,
+          row.status,
+        );
+        setLogs((prev) => prev.filter((_, i) => i !== idx));
+        setOffset((prev) => Math.max(0, prev - 1));
+        setMeta((prev) =>
+          prev ? { ...prev, row_count: Math.max(0, prev.row_count - 1) } : prev,
+        );
+      } catch (e) {
+        setLogsError((e as Error).message);
+      } finally {
+        setDeletingRowIdx(null);
+      }
+    },
+    [selected, logs],
+  );
+
+  const deleteSheet = useCallback(async () => {
+    if (!selected) return;
+    if (
+      !window.confirm(
+        `Xóa tab "${selected.localPart}" trong Sheet?\n\nXóa toàn bộ log video của ${selected.email}. Không hoàn tác được.\n\n(File Sheet gốc không bị ảnh hưởng.)`,
+      )
+    )
+      return;
+
+    const current = auth.currentUser;
+    if (!current) return;
+
+    setDeletingSheet(true);
+    setLogsError(null);
+    try {
+      const idToken = await current.getIdToken(false);
+      await adminDeleteUserLogSheet(idToken, selected.localPart);
+      setLogs([]);
+      setOffset(0);
+      setHasMore(false);
+      setMeta(null);
     } catch (e) {
-      setDbError((e as Error).message);
+      setLogsError((e as Error).message);
     } finally {
-      setLoadingDb(false);
+      setDeletingSheet(false);
     }
-  }, []);
+  }, [selected]);
 
   const loadMore = useCallback(async () => {
-    if (!selected) return;
+    if (!selected || logsLoading || !hasMore) return;
     setLogsLoading(true);
     setLogsError(null);
     try {
-      const more = await listVideoDownloadsFromPath(
-        selected.dbPath,
+      const more = await adminReadUserLogCache(
+        selected.localPart,
         PAGE_SIZE,
         offset,
       );
@@ -115,7 +255,23 @@ export function VideoLogsTab() {
     } finally {
       setLogsLoading(false);
     }
-  }, [selected, offset]);
+  }, [selected, offset, hasMore, logsLoading]);
+
+  // Infinite scroll: observe sentinel cuối list → khi scroll tới → loadMore.
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || !hasMore || initialLoading || fetching) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) void loadMore();
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [loadMore, hasMore, initialLoading, fetching, logs.length]);
+
+  const busy = initialLoading || fetching;
 
   return (
     <div className="flex h-[calc(100vh-180px)] gap-4">
@@ -135,7 +291,7 @@ export function VideoLogsTab() {
             onClick={() => void loadUsers()}
             disabled={usersLoading}
             className="btn-ripple flex h-7 w-7 items-center justify-center rounded text-white/60 hover:bg-white/10 disabled:opacity-40"
-            title="Tải lại"
+            title="Tải lại danh sách user"
           >
             <span
               className={`material-symbols-rounded text-base ${usersLoading ? "animate-spin" : ""}`}
@@ -158,7 +314,7 @@ export function VideoLogsTab() {
               {users === null
                 ? "—"
                 : users.length === 0
-                  ? "Chưa có user nào có DB trên Drive"
+                  ? "Chưa có user nào"
                   : "Không tìm thấy user"}
             </div>
           ) : (
@@ -210,7 +366,7 @@ export function VideoLogsTab() {
 
       {/* Main: video log table */}
       <section className="flex flex-1 flex-col overflow-hidden rounded-xl border border-surface-8 bg-surface-1">
-        <div className="flex items-center justify-between border-b border-surface-8 px-4 py-3">
+        <div className="flex items-center justify-between gap-3 border-b border-surface-8 px-4 py-3">
           <div className="min-w-0">
             <div className="text-xs text-white/50">
               {selected ? "Video log của" : "Chọn user ở danh sách bên trái"}
@@ -225,23 +381,66 @@ export function VideoLogsTab() {
             )}
           </div>
           {selected && (
-            <div className="text-xs text-white/50">
-              {logs.length} dòng {hasMore ? "(còn nữa)" : ""}
+            <div className="flex items-center gap-3">
+              <div className="text-right text-xs text-white/50">
+                <div>
+                  {meta ? `${meta.row_count} dòng` : `${logs.length} dòng`}
+                  {hasMore ? " (còn nữa)" : ""}
+                </div>
+                {meta && (
+                  <div className="text-[10px] text-white/35">
+                    Cập nhật: {fmtFetchedAt(meta.fetched_at_ms)}
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={refetch}
+                disabled={busy || deletingSheet}
+                className="btn-ripple flex h-8 items-center gap-1.5 rounded-lg bg-shopee-500 px-3 text-xs font-semibold text-white shadow-elev-1 hover:bg-shopee-600 disabled:opacity-50"
+                title="Fetch lại từ Google Sheet"
+              >
+                <span
+                  className={`material-symbols-rounded text-base ${fetching ? "animate-spin" : ""}`}
+                >
+                  cloud_download
+                </span>
+                Tải lại
+              </button>
+              <button
+                onClick={() => void deleteSheet()}
+                disabled={busy || deletingSheet || logs.length === 0}
+                className="btn-ripple flex h-8 items-center gap-1.5 rounded-lg bg-red-600 px-3 text-xs font-semibold text-white shadow-elev-1 hover:bg-red-700 disabled:opacity-50"
+                title="Xóa tab của user này (file Sheet gốc giữ nguyên)"
+              >
+                <span
+                  className={`material-symbols-rounded text-base ${deletingSheet ? "animate-spin" : ""}`}
+                >
+                  {deletingSheet ? "progress_activity" : "delete_sweep"}
+                </span>
+                Xóa tab
+              </button>
             </div>
           )}
         </div>
         <div className="flex-1 overflow-auto">
-          {loadingDb ? (
+          {initialLoading ? (
+            <div className="flex flex-col items-center justify-center gap-2 py-16 text-white/60">
+              <span className="material-symbols-rounded animate-spin text-3xl">
+                database
+              </span>
+              Đang đọc cache...
+            </div>
+          ) : fetching && logs.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-16 text-white/60">
               <span className="material-symbols-rounded animate-spin text-3xl">
                 cloud_download
               </span>
-              Đang tải DB của user...
+              Đang fetch log từ Google Sheet...
             </div>
-          ) : dbError ? (
+          ) : fetchError ? (
             <div className="mx-auto my-10 max-w-md rounded-lg border border-red-500/40 bg-red-900/20 p-4 text-sm text-red-200">
-              <div className="mb-2 font-medium">Lỗi tải DB</div>
-              <div className="text-xs text-red-300/80">{dbError}</div>
+              <div className="mb-2 font-medium">Lỗi fetch sheet</div>
+              <div className="text-xs text-red-300/80">{fetchError}</div>
             </div>
           ) : !selected ? (
             <div className="flex flex-col items-center justify-center gap-2 py-16 text-white/50">
@@ -257,64 +456,95 @@ export function VideoLogsTab() {
               <span className="material-symbols-rounded text-4xl">
                 inbox
               </span>
-              <div className="text-sm">User chưa download video nào</div>
+              <div className="text-sm">User chưa có log video nào</div>
             </div>
           ) : (
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 bg-surface-2">
-                <tr className="text-left text-xs uppercase tracking-wide text-white/50">
-                  <th className="w-10 px-3 py-2">#</th>
-                  <th className="px-3 py-2">URL</th>
-                  <th className="w-44 px-3 py-2">Thời gian</th>
-                  <th className="w-24 px-3 py-2">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {logs.map((row, idx) => (
-                  <tr
-                    key={row.id}
-                    className="border-t border-surface-8 hover:bg-surface-2/60"
-                  >
-                    <td className="px-3 py-2 text-xs text-white/40">
-                      {idx + 1}
-                    </td>
-                    <td className="max-w-[480px] px-3 py-2">
-                      <a
-                        href={row.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        title={row.url}
-                        className="block truncate text-shopee-300 hover:underline"
-                      >
-                        {row.url}
-                      </a>
-                    </td>
-                    <td className="px-3 py-2 text-xs text-white/70">
-                      {new Date(row.downloaded_at_ms).toLocaleString("vi-VN")}
-                    </td>
-                    <td className="px-3 py-2">
-                      <StatusBadge status={row.status} />
-                    </td>
+            <>
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-surface-2">
+                  <tr className="text-left text-xs uppercase tracking-wide text-white/50">
+                    <th className="w-10 px-3 py-2">#</th>
+                    <th className="w-44 px-3 py-2">Thời gian</th>
+                    <th className="px-3 py-2">Link</th>
+                    <th className="w-24 px-3 py-2">Trạng thái</th>
+                    <th className="w-12 px-3 py-2"></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {logs.map((row, idx) => {
+                    const deleting = deletingRowIdx === idx;
+                    return (
+                      <tr
+                        key={`${row.timestamp}-${idx}`}
+                        className="border-t border-surface-8 hover:bg-surface-2/60"
+                      >
+                        <td className="px-3 py-2 text-xs text-white/40">
+                          {idx + 1}
+                        </td>
+                        <td className="px-3 py-2 text-xs tabular-nums text-white/70">
+                          {row.timestamp}
+                        </td>
+                        <td className="max-w-[480px] px-3 py-2">
+                          <a
+                            href={row.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={row.url}
+                            className="block truncate text-shopee-300 hover:underline"
+                          >
+                            {row.url}
+                          </a>
+                        </td>
+                        <td className="px-3 py-2">
+                          <StatusBadge status={row.status} />
+                        </td>
+                        <td className="px-3 py-2">
+                          <button
+                            onClick={() => void deleteRow(idx)}
+                            disabled={
+                              deletingRowIdx !== null || deletingSheet || busy
+                            }
+                            className="btn-ripple flex h-7 w-7 items-center justify-center rounded-full text-white/40 transition-colors hover:bg-red-900/40 hover:text-red-300 disabled:opacity-30"
+                            title="Xóa dòng này"
+                          >
+                            <span
+                              className={`material-symbols-rounded text-base ${deleting ? "animate-spin" : ""}`}
+                            >
+                              {deleting ? "progress_activity" : "delete"}
+                            </span>
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              {hasMore && (
+                <div
+                  ref={sentinelRef}
+                  className="flex items-center justify-center py-4 text-xs text-white/40"
+                >
+                  {logsLoading ? (
+                    <span className="flex items-center gap-2">
+                      <span className="material-symbols-rounded animate-spin text-sm">
+                        progress_activity
+                      </span>
+                      Đang tải thêm...
+                    </span>
+                  ) : (
+                    <span>Kéo để tải thêm</span>
+                  )}
+                </div>
+              )}
+              {logsError && (
+                <div className="px-3 py-2 text-center text-xs text-red-300">
+                  {logsError}
+                </div>
+              )}
+            </>
           )}
         </div>
-        {selected && hasMore && (
-          <div className="border-t border-surface-8 p-3 text-center">
-            <button
-              onClick={() => void loadMore()}
-              disabled={logsLoading}
-              className="btn-ripple rounded-lg bg-shopee-500 px-4 py-1.5 text-sm font-medium text-white hover:bg-shopee-600 disabled:opacity-50"
-            >
-              {logsLoading ? "Đang tải..." : `Tải thêm 100`}
-            </button>
-            {logsError && (
-              <div className="mt-2 text-xs text-red-300">{logsError}</div>
-            )}
-          </div>
-        )}
       </section>
     </div>
   );
@@ -325,16 +555,17 @@ interface StatusBadgeProps {
 }
 
 function StatusBadge({ status }: StatusBadgeProps) {
-  if (status === "success") {
+  const ok = status === "thành công" || status === "success";
+  if (ok) {
     return (
       <span className="rounded-full bg-green-900/40 px-2 py-0.5 text-xs font-medium text-green-300">
-        success
+        {status || "thành công"}
       </span>
     );
   }
   return (
     <span className="rounded-full bg-red-900/40 px-2 py-0.5 text-xs font-medium text-red-300">
-      failed
+      {status || "thất bại"}
     </span>
   );
 }

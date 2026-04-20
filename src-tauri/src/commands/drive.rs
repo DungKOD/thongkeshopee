@@ -33,6 +33,37 @@ struct AppsScriptRequest<'a> {
     fingerprint: Option<String>,
     #[serde(rename = "targetLocalPart", skip_serializing_if = "Option::is_none")]
     target_local_part: Option<String>,
+
+    // Video log fields — dùng cho `logVideoDownload` / `readUserVideoLog`.
+    #[serde(rename = "videoUrl", skip_serializing_if = "Option::is_none")]
+    video_url: Option<&'a str>,
+    #[serde(rename = "videoStatus", skip_serializing_if = "Option::is_none")]
+    video_status: Option<&'a str>,
+    #[serde(rename = "videoTimestamp", skip_serializing_if = "Option::is_none")]
+    video_timestamp: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<i64>,
+}
+
+impl<'a> AppsScriptRequest<'a> {
+    /// Build request mới với tất cả optional fields = None.
+    fn new(action: &'a str, id_token: &'a str) -> Self {
+        Self {
+            action,
+            id_token,
+            base64_data: None,
+            mtime_ms: None,
+            fingerprint: None,
+            target_local_part: None,
+            video_url: None,
+            video_status: None,
+            video_timestamp: None,
+            limit: None,
+            offset: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +90,17 @@ struct AppsScriptResponse {
     users: Option<Vec<UserListEntry>>,
     #[serde(default)]
     fingerprint: Option<String>,
+
+    #[serde(default, rename = "videoLogs")]
+    video_logs: Option<Vec<VideoLogRow>>,
+}
+
+/// Row từ Google Sheet — trả về cho admin khi xem log của user khác.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoLogRow {
+    pub timestamp: String,
+    pub url: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -201,14 +243,7 @@ pub async fn drive_check_or_create(
 ) -> CmdResult<DriveCheckResult> {
     let res = call_apps_script(
         &apps_script_url,
-        AppsScriptRequest {
-            action: "checkOrCreate",
-            id_token: &id_token,
-            base64_data: None,
-            mtime_ms: None,
-            fingerprint: None,
-            target_local_part: None,
-        },
+        AppsScriptRequest::new("checkOrCreate", &id_token),
     )
     .await?;
 
@@ -231,14 +266,7 @@ pub async fn drive_metadata(
 ) -> CmdResult<DriveMetadataResult> {
     let res = call_apps_script(
         &apps_script_url,
-        AppsScriptRequest {
-            action: "metadata",
-            id_token: &id_token,
-            base64_data: None,
-            mtime_ms: None,
-            fingerprint: None,
-            target_local_part: None,
-        },
+        AppsScriptRequest::new("metadata", &id_token),
     )
     .await?;
 
@@ -333,12 +361,10 @@ pub async fn drive_upload_db(
     let res = call_apps_script(
         &apps_script_url,
         AppsScriptRequest {
-            action: "upload",
-            id_token: &id_token,
             base64_data: Some(base64),
             mtime_ms: Some(mtime_ms),
             fingerprint: Some(fingerprint.clone()),
-            target_local_part: None,
+            ..AppsScriptRequest::new("upload", &id_token)
         },
     )
     .await?;
@@ -385,14 +411,7 @@ pub async fn drive_download_db(
 ) -> CmdResult<DriveDownloadResult> {
     let res = call_apps_script(
         &apps_script_url,
-        AppsScriptRequest {
-            action: "download",
-            id_token: &id_token,
-            base64_data: None,
-            mtime_ms: None,
-            fingerprint: None,
-            target_local_part: None,
-        },
+        AppsScriptRequest::new("download", &id_token),
     )
     .await?;
 
@@ -471,68 +490,109 @@ pub async fn drive_list_users(
     apps_script_url: String,
     id_token: String,
 ) -> CmdResult<Vec<UserListEntry>> {
+    as_list_users(&apps_script_url, &id_token).await
+}
+
+/// Helper crate-internal: gọi AS `listUsers` trả về danh sách user.
+/// Dùng bởi `drive_list_users` (tauri command) + `admin_fetch_user_list`
+/// (cache to DB flow).
+pub(crate) async fn as_list_users(
+    apps_script_url: &str,
+    id_token: &str,
+) -> CmdResult<Vec<UserListEntry>> {
     let res = call_apps_script(
-        &apps_script_url,
-        AppsScriptRequest {
-            action: "listUsers",
-            id_token: &id_token,
-            base64_data: None,
-            mtime_ms: None,
-            fingerprint: None,
-            target_local_part: None,
-        },
+        apps_script_url,
+        AppsScriptRequest::new("listUsers", id_token),
     )
     .await?;
     Ok(res.users.unwrap_or_default())
 }
 
-/// Admin-only: download DB file của user khác, lưu vào temp path, trả path.
-/// Apps Script verify admin status trước khi cho download.
-#[tauri::command]
-pub async fn admin_download_user_db(
-    app: AppHandle,
-    apps_script_url: String,
-    id_token: String,
-    target_local_part: String,
-) -> CmdResult<String> {
-    let res = call_apps_script(
-        &apps_script_url,
+/// Best-effort post log video download vào Google Sheet qua Apps Script.
+/// Apps Script verify token → derive local_part từ email → append row vào tab cùng tên.
+/// `status` bắt buộc là `"success"` hoặc `"failed"` (Apps Script map sang tiếng Việt).
+/// `timestamp` định dạng `HH:MM:SS DD/MM/YYYY` (BE format theo local time máy user).
+pub(crate) async fn as_log_video_download(
+    apps_script_url: &str,
+    id_token: &str,
+    url: &str,
+    status: &str,
+    timestamp: &str,
+) -> CmdResult<()> {
+    call_apps_script(
+        apps_script_url,
         AppsScriptRequest {
-            action: "downloadForUser",
-            id_token: &id_token,
-            base64_data: None,
-            mtime_ms: None,
-            fingerprint: None,
-            target_local_part: Some(target_local_part.clone()),
+            video_url: Some(url),
+            video_status: Some(status),
+            video_timestamp: Some(timestamp),
+            ..AppsScriptRequest::new("logVideoDownload", id_token)
         },
     )
     .await?;
+    Ok(())
+}
 
-    let base64 = res
-        .base64_data
-        .ok_or_else(|| CmdError::msg("missing base64Data"))?;
-    let bytes = BASE64
-        .decode(base64.as_bytes())
-        .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
+/// Admin-only: xóa 1 row cụ thể trong sheet tab của target user.
+/// Match qua tuple (timestamp, url, status) — AS scan toàn sheet tìm first match.
+pub(crate) async fn as_delete_user_video_log_row(
+    apps_script_url: &str,
+    id_token: &str,
+    target_local_part: &str,
+    timestamp: &str,
+    url: &str,
+    status: &str,
+) -> CmdResult<()> {
+    call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            target_local_part: Some(target_local_part.to_string()),
+            video_url: Some(url),
+            video_status: Some(status),
+            video_timestamp: Some(timestamp),
+            ..AppsScriptRequest::new("deleteUserVideoLogRow", id_token)
+        },
+    )
+    .await?;
+    Ok(())
+}
 
-    let base_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| CmdError::msg(format!("app_data_dir: {e}")))?;
-    let admin_dir = base_dir.join("admin_view");
-    fs::create_dir_all(&admin_dir).await.map_err(CmdError::from)?;
+/// Admin-only: xóa toàn bộ sheet tab của target user (`ss.deleteSheet`).
+pub(crate) async fn as_delete_user_video_log_sheet(
+    apps_script_url: &str,
+    id_token: &str,
+    target_local_part: &str,
+) -> CmdResult<()> {
+    call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            target_local_part: Some(target_local_part.to_string()),
+            ..AppsScriptRequest::new("deleteUserVideoLogSheet", id_token)
+        },
+    )
+    .await?;
+    Ok(())
+}
 
-    // Lưu theo local_part cho dễ trace. Overwrite nếu admin xem lại cùng user.
-    let target_path = admin_dir.join(format!("{target_local_part}.db"));
-    // Xóa WAL/SHM cũ nếu có.
-    for ext in &["db-wal", "db-shm"] {
-        let _ = fs::remove_file(target_path.with_extension(ext)).await;
-    }
-    fs::write(&target_path, &bytes)
-        .await
-        .map_err(CmdError::from)?;
-
-    Ok(target_path.to_string_lossy().into_owned())
+/// Helper crate-internal: gọi AS `readUserVideoLog` 1 trang. Admin check chạy
+/// trong AS (verify Firestore). Caller tự lo xem phân trang / loop.
+pub(crate) async fn as_read_user_video_log(
+    apps_script_url: &str,
+    id_token: &str,
+    target_local_part: &str,
+    limit: i64,
+    offset: i64,
+) -> CmdResult<Vec<VideoLogRow>> {
+    let res = call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            target_local_part: Some(target_local_part.to_string()),
+            limit: Some(limit),
+            offset: Some(offset),
+            ..AppsScriptRequest::new("readUserVideoLog", id_token)
+        },
+    )
+    .await?;
+    Ok(res.video_logs.unwrap_or_default())
 }
 
 fn pending_db_path(app: &AppHandle) -> CmdResult<PathBuf> {
@@ -576,14 +636,7 @@ pub async fn drive_pull_merge_push(
     // 1. Metadata check. Nếu remote chưa tồn tại → skip pull, chỉ upload.
     let meta = call_apps_script(
         &apps_script_url,
-        AppsScriptRequest {
-            action: "metadata",
-            id_token: &id_token,
-            base64_data: None,
-            mtime_ms: None,
-            fingerprint: None,
-            target_local_part: None,
-        },
+        AppsScriptRequest::new("metadata", &id_token),
     )
     .await?;
     let remote_exists = meta.exists.unwrap_or(false);
@@ -593,14 +646,7 @@ pub async fn drive_pull_merge_push(
         let _ = app.emit("sync-phase", "downloading");
         let dl = call_apps_script(
             &apps_script_url,
-            AppsScriptRequest {
-                action: "download",
-                id_token: &id_token,
-                base64_data: None,
-                mtime_ms: None,
-                fingerprint: None,
-                target_local_part: None,
-            },
+            AppsScriptRequest::new("download", &id_token),
         )
         .await?;
         let base64 = dl
@@ -704,12 +750,10 @@ pub async fn drive_pull_merge_push(
     let res = call_apps_script(
         &apps_script_url,
         AppsScriptRequest {
-            action: "upload",
-            id_token: &id_token,
             base64_data: Some(base64),
             mtime_ms: Some(mtime_ms),
             fingerprint: Some(fingerprint.clone()),
-            target_local_part: None,
+            ..AppsScriptRequest::new("upload", &id_token)
         },
     )
     .await?;

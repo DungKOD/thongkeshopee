@@ -106,34 +106,33 @@ export function driveListUsers(idToken: string): Promise<UserListEntry[]> {
   });
 }
 
-export function adminDownloadUserDb(
+/// Cache singleton — user list JSON blob. FE tự parse qua `JSON.parse(users_json)`.
+export interface AdminUserListCache {
+  users_json: string;
+  fetched_at_ms: number;
+}
+
+/// Đọc user list cache (DB local). null = chưa fetch bao giờ → FE fallback rỗng.
+export function adminReadUserListCache(): Promise<AdminUserListCache | null> {
+  return invoke<AdminUserListCache | null>("admin_read_user_list_cache");
+}
+
+/// Fetch user list từ AS → replace cache → trả về. Background revalidate.
+export function adminFetchUserList(
   idToken: string,
-  targetLocalPart: string,
-): Promise<string> {
-  return invoke<string>("admin_download_user_db", {
+): Promise<AdminUserListCache> {
+  return invoke<AdminUserListCache>("admin_fetch_user_list", {
     appsScriptUrl: url(),
     idToken,
-    targetLocalPart,
   });
 }
 
+/// Row từ local `video_logs.db` — user xem history của chính mình.
 export interface VideoDownloadLog {
   id: number;
   url: string;
   downloaded_at_ms: number;
   status: string;
-}
-
-export function listVideoDownloadsFromPath(
-  dbPath: string,
-  limit: number,
-  offset: number,
-): Promise<VideoDownloadLog[]> {
-  return invoke<VideoDownloadLog[]>("list_video_downloads_from_path", {
-    dbPath,
-    limit,
-    offset,
-  });
 }
 
 export function listVideoDownloads(
@@ -143,5 +142,98 @@ export function listVideoDownloads(
   return invoke<VideoDownloadLog[]>("list_video_downloads", {
     limit,
     offset,
+  });
+}
+
+/// Row từ Google Sheet — admin xem log của user khác.
+/// `timestamp` đã format sẵn ở BE theo local time (HH:MM:SS DD/MM/YYYY).
+/// `status` đã tiếng Việt từ Apps Script: "thành công" | "thất bại".
+export interface VideoLogRow {
+  timestamp: string;
+  url: string;
+  status: string;
+}
+
+/// Log 1 lần download video: BE ghi local DB + best-effort post Sheet.
+export function logVideoDownload(
+  idToken: string,
+  videoUrl: string,
+  status: "success" | "failed",
+): Promise<void> {
+  return invoke<void>("log_video_download", {
+    appsScriptUrl: url(),
+    idToken,
+    url: videoUrl,
+    status,
+  });
+}
+
+/// Admin-only: fetch TOÀN BỘ sheet của target → replace cache DB local.
+/// Trả về số row đã cache. Dùng khi "Tải lại" hoặc lần đầu xem user.
+export function adminFetchUserLogSheet(
+  idToken: string,
+  targetLocalPart: string,
+): Promise<number> {
+  return invoke<number>("admin_fetch_user_log_sheet", {
+    appsScriptUrl: url(),
+    idToken,
+    targetLocalPart,
+  });
+}
+
+/// Đọc cache rows (DB local) cho 1 user. Infinite scroll paginate qua hàm này.
+export function adminReadUserLogCache(
+  targetLocalPart: string,
+  limit: number,
+  offset: number,
+): Promise<VideoLogRow[]> {
+  return invoke<VideoLogRow[]>("admin_read_user_log_cache", {
+    targetLocalPart,
+    limit,
+    offset,
+  });
+}
+
+export interface AdminFetchMeta {
+  fetched_at_ms: number;
+  row_count: number;
+}
+
+/// Metadata fetch gần nhất (null = chưa fetch bao giờ).
+export function adminUserLogFetchMeta(
+  targetLocalPart: string,
+): Promise<AdminFetchMeta | null> {
+  return invoke<AdminFetchMeta | null>("admin_user_log_fetch_meta", {
+    targetLocalPart,
+  });
+}
+
+/// Admin xóa 1 row ở Sheet + local cache. Match qua tuple (timestamp, url, status).
+export function adminDeleteUserLogRow(
+  idToken: string,
+  targetLocalPart: string,
+  timestamp: string,
+  videoUrl: string,
+  status: string,
+): Promise<void> {
+  return invoke<void>("admin_delete_user_log_row", {
+    appsScriptUrl: url(),
+    idToken,
+    targetLocalPart,
+    timestamp,
+    url: videoUrl,
+    status,
+  });
+}
+
+/// Admin xóa toàn bộ sheet tab + clear cache.
+export function adminDeleteUserLogSheet(
+  idToken: string,
+  targetLocalPart: string,
+): Promise<void> {
+  return invoke<void>("admin_delete_user_log_sheet", {
+    appsScriptUrl: url(),
+    idToken,
+    targetLocalPart,
   });
 }

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
+import { DevCredit } from "./DevCredit";
 
 type Mode = "signin" | "signup";
 
@@ -52,7 +53,7 @@ export function LoginScreen() {
   };
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-gradient-to-br from-surface-0 via-surface-1 to-shopee-900/30 p-6">
+    <main className="flex min-h-screen flex-col items-center justify-center bg-gradient-to-br from-surface-0 via-surface-1 to-shopee-900/30 p-6">
       <div className="w-full max-w-sm rounded-2xl border border-surface-8 bg-surface-1 p-8 shadow-elev-16">
         <div className="mb-6 text-center">
           <span className="material-symbols-rounded text-5xl text-shopee-400">
@@ -134,6 +135,8 @@ export function LoginScreen() {
             ? "Chưa có tài khoản? Đăng ký"
             : "Đã có tài khoản? Đăng nhập"}
         </button>
+
+        <DevCredit />
       </div>
     </main>
   );

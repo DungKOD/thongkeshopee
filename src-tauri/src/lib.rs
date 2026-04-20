@@ -39,7 +39,13 @@ pub fn run() {
             commands::video::download_video,
             commands::video::log_video_download,
             commands::video::list_video_downloads,
-            commands::video::list_video_downloads_from_path,
+            commands::video::admin_fetch_user_log_sheet,
+            commands::video::admin_read_user_log_cache,
+            commands::video::admin_user_log_fetch_meta,
+            commands::video::admin_delete_user_log_row,
+            commands::video::admin_delete_user_log_sheet,
+            commands::video::admin_read_user_list_cache,
+            commands::video::admin_fetch_user_list,
             commands::drive::drive_check_or_create,
             commands::drive::drive_metadata,
             commands::drive::drive_upload_db,
@@ -51,7 +57,6 @@ pub fn run() {
             commands::drive::machine_fingerprint,
             commands::drive::sync_state_get,
             commands::drive::sync_state_record_error,
-            commands::drive::admin_download_user_db,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

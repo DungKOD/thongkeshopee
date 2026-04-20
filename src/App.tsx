@@ -21,6 +21,7 @@ import { LoginScreen } from "./components/LoginScreen";
 import { PaywallScreen } from "./components/PaywallScreen";
 import { UserListDialog } from "./components/UserListDialog";
 import { UserMenu } from "./components/UserMenu";
+import { DevCredit } from "./components/DevCredit";
 import { VideoLogsTab } from "./components/VideoLogsTab";
 import "./App.css";
 
@@ -875,6 +876,8 @@ function AppInner() {
         onCommit={handleCommitPending}
         onCancel={clearPending}
       />
+
+      <DevCredit variant="floating" />
     </main>
   );
 }

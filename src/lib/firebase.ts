@@ -23,3 +23,8 @@ export const db: Firestore = getFirestore(firebaseApp);
 export const googleProvider = new GoogleAuthProvider();
 
 void setPersistence(auth, browserLocalPersistence);
+
+// Dev-only: expose `auth` lên window cho DevTools debug. Remove sau khi xong.
+if (import.meta.env.DEV) {
+  (globalThis as unknown as { __auth: Auth }).__auth = auth;
+}
