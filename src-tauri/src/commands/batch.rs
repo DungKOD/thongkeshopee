@@ -9,11 +9,12 @@
 //! Sau khi xóa: cleanup `days` orphan (không còn raw/manual nào) → UI tự
 //! không hiển thị day đó.
 
+use chrono::Utc;
 use rusqlite::params;
 use tauri::State;
 
 use crate::db::types::BatchDeletePayload;
-use crate::db::DbState;
+use crate::db::{tombstone_key_sub, DbState};
 
 use super::query::{is_prefix, to_canonical, Canonical};
 use super::{CmdError, CmdResult};
@@ -25,11 +26,19 @@ pub fn batch_commit_deletes(
 ) -> CmdResult<BatchResult> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let tx = conn.transaction()?;
+    let now = Utc::now().to_rfc3339();
 
     let mut days_deleted = 0_i64;
     for date in &payload.days {
         let n = tx.execute("DELETE FROM days WHERE date = ?", params![date])?;
         days_deleted += n as i64;
+
+        // Tombstone 'day' — apply khi merge: xóa day ở peer, CASCADE raw rows.
+        tx.execute(
+            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+             VALUES ('day', ?, ?)",
+            params![date, now],
+        )?;
     }
 
     let mut rows_deleted = 0_i64;
@@ -61,6 +70,13 @@ pub fn batch_commit_deletes(
             rows_deleted +=
                 delete_prefix_compatible(&tx, table, &row.day_date, &target)?;
         }
+
+        // Tombstone 'ui_row' — apply khi merge: xóa manual + raw prefix-compatible ở peer.
+        tx.execute(
+            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+             VALUES ('ui_row', ?, ?)",
+            params![tombstone_key_sub(&row.day_date, &row.sub_ids), now],
+        )?;
     }
 
     // Cleanup days orphan (không còn raw/manual nào) — auto-remove.

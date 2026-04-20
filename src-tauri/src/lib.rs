@@ -45,6 +45,7 @@ pub fn run() {
             commands::drive::drive_upload_db,
             commands::drive::drive_download_db,
             commands::drive::drive_apply_pending,
+            commands::drive::drive_pull_merge_push,
             commands::drive::drive_list_users,
             commands::drive::restart_app,
             commands::drive::machine_fingerprint,

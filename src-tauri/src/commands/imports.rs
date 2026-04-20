@@ -134,6 +134,13 @@ fn register_imported_file(
         params![day_date, now],
     )?;
 
+    // Resurrect: import mới cho day X → huỷ tombstone 'day' nếu có.
+    // Giữ tombstones 'ui_row' / 'manual_entry' vì import raw không chạm manual_entries.
+    tx.execute(
+        "DELETE FROM tombstones WHERE entity_type = 'day' AND entity_key = ?",
+        params![day_date],
+    )?;
+
     let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM imported_files WHERE file_hash = ?",

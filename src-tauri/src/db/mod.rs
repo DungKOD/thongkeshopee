@@ -28,6 +28,16 @@ pub const IMPORTS_SUBDIR: &str = "imports";
 /// State quản lý connection, wrap `Mutex` để share giữa các Tauri command.
 pub struct DbState(pub Mutex<Connection>);
 
+/// Build tombstone `entity_key` cho sub_id tuple + day. Dùng cho `ui_row`
+/// và `manual_entry`: `{day}|{s1}|{s2}|{s3}|{s4}|{s5}`. Separator `|` không
+/// xuất hiện trong sub_id thực tế (sub_id không chứa ký tự `|`).
+pub fn tombstone_key_sub(day_date: &str, sub_ids: &[String; 5]) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        day_date, sub_ids[0], sub_ids[1], sub_ids[2], sub_ids[3], sub_ids[4]
+    )
+}
+
 /// Resolve đường dẫn file DB dựa trên `app_data_dir()` của platform.
 /// Tạo folder cha nếu chưa có.
 pub fn resolve_db_path(app: &AppHandle) -> Result<PathBuf> {
@@ -249,6 +259,10 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
         ("trg_sync_video_ins",    "INSERT", "video_downloads"),
         ("trg_sync_video_upd",    "UPDATE", "video_downloads"),
         ("trg_sync_video_del",    "DELETE", "video_downloads"),
+        // Tombstones: INSERT khi user xóa → cần sync qua Drive. DELETE khi user
+        // restore (tương lai) hoặc compact — cũng mark dirty.
+        ("trg_sync_tombstones_ins", "INSERT", "tombstones"),
+        ("trg_sync_tombstones_del", "DELETE", "tombstones"),
     ];
 
     // Drop legacy triggers trên bảng FB cũ (đã gộp vào raw_fb_ads ở v3).
@@ -365,6 +379,49 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM imported_files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(file_count, 0, "CASCADE phải xóa imported_files");
+    }
+
+    #[test]
+    fn tombstones_unique_and_key_format() {
+        let conn = test_conn();
+        // Unique theo (entity_type, entity_key).
+        conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('day', '2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('day', '2026-04-20', 'now2')",
+            [],
+        );
+        assert!(dup.is_err(), "tombstone (type, key) phải unique");
+
+        // Khác entity_type cùng key → OK (ui_row vs manual_entry riêng).
+        let sub_ids = ["shop".into(), "a".into(), "".into(), "".into(), "".into()];
+        let k = tombstone_key_sub("2026-04-20", &sub_ids);
+        assert_eq!(k, "2026-04-20|shop|a|||");
+        conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('ui_row', ?, 'now')",
+            [&k],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('manual_entry', ?, 'now')",
+            [&k],
+        )
+        .unwrap();
+
+        // Check constraint — type không hợp lệ phải reject.
+        let bad = conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('invalid', 'x', 'now')",
+            [],
+        );
+        assert!(bad.is_err(), "entity_type không hợp lệ phải reject");
     }
 
     #[test]

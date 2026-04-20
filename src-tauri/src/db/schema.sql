@@ -197,6 +197,31 @@ CREATE TABLE IF NOT EXISTS sync_state (
 INSERT OR IGNORE INTO sync_state (id, dirty) VALUES (1, 1);
 
 -- =============================================================
+-- tombstones — track deletion để merge cross-device không "hồi sinh" row
+-- đã xóa. Apply khi pull-merge-push (xem plan sync v2).
+--
+-- entity_type:
+--   'day'          — cả ngày bị xóa. entity_key = date ('YYYY-MM-DD').
+--                    Apply: DELETE FROM days WHERE date=? → CASCADE raw/imported.
+--   'ui_row'       — 1 "dòng UI" (tuple sub_id canonical) bị xóa staged.
+--                    entity_key = '{day}|{s1}|{s2}|{s3}|{s4}|{s5}'.
+--                    Apply: xóa manual_entries khớp tuple + raw rows prefix-compatible.
+--   'manual_entry' — chỉ xóa manual override (không động raw).
+--                    entity_key = '{day}|{s1}|{s2}|{s3}|{s4}|{s5}'.
+--                    Apply: DELETE FROM manual_entries WHERE sub_ids + day_date.
+-- deleted_at: ISO8601 UTC, dùng audit/debug.
+-- =============================================================
+CREATE TABLE IF NOT EXISTS tombstones (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type  TEXT NOT NULL CHECK (entity_type IN ('day', 'ui_row', 'manual_entry')),
+    entity_key   TEXT NOT NULL,
+    deleted_at   TEXT NOT NULL,
+    UNIQUE(entity_type, entity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tombstones_type ON tombstones(entity_type);
+
+-- =============================================================
 -- Bảng version migration (để future-proof khi thay schema).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS _schema_version (

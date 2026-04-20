@@ -16,7 +16,7 @@ import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { usePremium, useIsAdmin } from "./hooks/usePremium";
-import { useDriveSync } from "./hooks/useDriveSync";
+import { useDriveSync, type SyncPhase } from "./hooks/useDriveSync";
 import { LoginScreen } from "./components/LoginScreen";
 import { PaywallScreen } from "./components/PaywallScreen";
 import { UserListDialog } from "./components/UserListDialog";
@@ -119,10 +119,13 @@ function AppInner() {
     markMutation,
   } = useDbStats();
 
-  // Sync chạy ngầm — không expose status ra UI trừ overlay restart.
-  const { status: syncStatus } = useDriveSync({
+  // Sync v2: pull-merge-push. Khi vào app: metadata check; nếu dirty hoặc remote
+  // mới + khác máy → pull-merge-push + refetch UI. UI chặn overlay suốt startup
+  // (cả checking + syncing) để user không thao tác với data cũ trước khi merge xong.
+  const { isStartupPhase, syncPhase } = useDriveSync({
     mutationVersion,
     enabled: true,
+    onRemoteApplied: refetch,
   });
 
   const { showToast } = useToast();
@@ -424,6 +427,10 @@ function AppInner() {
     observer.observe(el);
     return () => observer.disconnect();
   }, [canLoadMore]);
+
+  if (isStartupPhase) {
+    return <SplashScreen {...splashTextFor(syncPhase)} />;
+  }
 
   return (
     <main className="min-h-full bg-surface-0 pb-24">
@@ -847,8 +854,6 @@ function AppInner() {
         />
       )}
 
-      {syncStatus === "restarting" && <RestartingOverlay />}
-
       {entryDialog && (
         <ManualEntryDialog
           isOpen={true}
@@ -925,9 +930,9 @@ function AuthGate() {
   const { user, loading: authLoading } = useAuth();
   const { status, expiredAt } = usePremium();
 
-  if (authLoading) return <LoadingScreen />;
+  if (authLoading) return <SplashScreen title="Đang tải..." />;
   if (!user) return <LoginScreen />;
-  if (status === "loading") return <LoadingScreen />;
+  if (status === "loading") return <SplashScreen title="Đang tải..." />;
   if (status === "inactive" || status === "expired") {
     return <PaywallScreen expiredAt={expiredAt} reason={status} />;
   }
@@ -939,30 +944,52 @@ function AuthGate() {
   );
 }
 
-function LoadingScreen() {
-  return (
-    <main className="flex min-h-screen items-center justify-center bg-surface-0">
-      <div className="flex flex-col items-center gap-3 text-white/60">
-        <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">
-          progress_activity
-        </span>
-        <span className="text-sm">Đang tải...</span>
-      </div>
-    </main>
-  );
+/// Map sync phase → text cho SplashScreen. Null (chưa có event) → default
+/// "Đang đồng bộ Drive..." để UX nhất quán với lúc init.
+function splashTextFor(phase: SyncPhase): { title: string; subtitle?: string } {
+  switch (phase) {
+    case "downloading":
+      return {
+        title: "Đang tải xuống...",
+        subtitle: "Lấy dữ liệu mới từ Drive.",
+      };
+    case "merging":
+      return {
+        title: "Đang hợp nhất...",
+        subtitle: "Kết hợp dữ liệu local với bản từ Drive.",
+      };
+    case "uploading":
+      return {
+        title: "Đang đẩy lên Drive...",
+        subtitle: "Lưu thay đổi cuối cùng.",
+      };
+    default:
+      return {
+        title: "Đang đồng bộ Drive...",
+        subtitle: "Hợp nhất dữ liệu từ các máy khác, vui lòng chờ.",
+      };
+  }
 }
 
-function RestartingOverlay() {
+/// Fullscreen splash dùng chung cho cả "đang tải" và "đang đồng bộ Drive".
+/// Chỉ khác text — layout, icon giống nhau để UX nhất quán.
+function SplashScreen({
+  title,
+  subtitle,
+}: {
+  title: string;
+  subtitle?: string;
+}) {
   return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-black/90 text-white">
+    <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-surface-0 text-white">
       <span className="material-symbols-rounded animate-spin text-5xl text-shopee-400">
         cloud_sync
       </span>
-      <div className="text-lg font-medium">Đang tải dữ liệu từ Drive...</div>
-      <div className="text-sm text-white/60">
-        Máy khác đã cập nhật DB. App sẽ tự restart khi xong.
-      </div>
-    </div>
+      <div className="text-lg font-medium">{title}</div>
+      {subtitle && (
+        <div className="text-sm text-white/60">{subtitle}</div>
+      )}
+    </main>
   );
 }
 

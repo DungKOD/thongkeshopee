@@ -60,6 +60,17 @@ export function driveUploadDb(idToken: string): Promise<DriveUploadResult> {
   });
 }
 
+/// Pull remote DB → merge local-win + apply tombstones → push snapshot lên Drive.
+/// Thay thế `driveUploadDb` cho flow sync v2 (cross-device safe).
+export function drivePullMergePush(
+  idToken: string,
+): Promise<DriveUploadResult> {
+  return invoke<DriveUploadResult>("drive_pull_merge_push", {
+    appsScriptUrl: url(),
+    idToken,
+  });
+}
+
 export function driveDownloadDb(idToken: string): Promise<DriveDownloadResult> {
   return invoke<DriveDownloadResult>("drive_download_db", {
     appsScriptUrl: url(),

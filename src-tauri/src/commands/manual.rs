@@ -12,7 +12,7 @@ use rusqlite::{params, OptionalExtension};
 use tauri::State;
 
 use crate::db::types::{ManualEntryInput, ManualRowKey};
-use crate::db::DbState;
+use crate::db::{tombstone_key_sub, DbState};
 
 use super::{CmdError, CmdResult};
 
@@ -28,6 +28,17 @@ pub fn save_manual_entry(
     tx.execute(
         "INSERT OR IGNORE INTO days(date, created_at) VALUES(?, ?)",
         params![input.day_date, now],
+    )?;
+
+    // Resurrect: nếu trước đó user đã xóa tuple này (tombstone 'ui_row' hoặc 'manual_entry')
+    // thì save = huỷ tombstone — tránh merge cross-device xoá mất entry vừa tạo.
+    // Cũng huỷ tombstone 'day' nếu có (save manual entry trên 1 ngày đã bị xóa).
+    let key = tombstone_key_sub(&input.day_date, &input.sub_ids);
+    tx.execute(
+        "DELETE FROM tombstones
+         WHERE (entity_type IN ('ui_row', 'manual_entry') AND entity_key = ?)
+            OR (entity_type = 'day' AND entity_key = ?)",
+        params![key, input.day_date],
     )?;
 
     // UPSERT manual_entries — UNIQUE(sub_ids, day_date) → DO UPDATE.
@@ -70,13 +81,17 @@ pub fn save_manual_entry(
 }
 
 /// Xóa 1 manual entry theo key. Không ảnh hưởng raw tables.
+/// Ghi tombstone 'manual_entry' để merge cross-device không hồi sinh override đã xóa.
 #[tauri::command]
 pub fn delete_manual_entry(
     state: State<'_, DbState>,
     key: ManualRowKey,
 ) -> CmdResult<()> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    conn.execute(
+    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let tx = conn.transaction()?;
+    let now = Utc::now().to_rfc3339();
+
+    tx.execute(
         "DELETE FROM manual_entries
          WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
            AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
@@ -89,6 +104,14 @@ pub fn delete_manual_entry(
             key.day_date,
         ],
     )?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+         VALUES ('manual_entry', ?, ?)",
+        params![tombstone_key_sub(&key.day_date, &key.sub_ids), now],
+    )?;
+
+    tx.commit()?;
     Ok(())
 }
 
