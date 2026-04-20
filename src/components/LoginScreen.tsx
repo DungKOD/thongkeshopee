@@ -56,10 +56,13 @@ export function LoginScreen() {
     <main className="flex min-h-screen flex-col items-center justify-center bg-gradient-to-br from-surface-0 via-surface-1 to-shopee-900/30 p-6">
       <div className="w-full max-w-sm rounded-2xl border border-surface-8 bg-surface-1 p-8 shadow-elev-16">
         <div className="mb-6 text-center">
-          <span className="material-symbols-rounded text-5xl text-shopee-400">
-            analytics
-          </span>
-          <h1 className="mt-2 text-xl font-semibold text-white/90">
+          <img
+            src="/shopee.png"
+            alt="Shopee"
+            className="mx-auto h-16 w-16 rounded-xl object-contain shadow-elev-4"
+            draggable={false}
+          />
+          <h1 className="mt-3 text-xl font-semibold text-white/90">
             Thống kê Shopee Affiliate
           </h1>
           <p className="mt-1 text-sm text-white/60">
