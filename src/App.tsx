@@ -22,6 +22,7 @@ import { PaywallScreen } from "./components/PaywallScreen";
 import { UserListDialog } from "./components/UserListDialog";
 import { UserMenu } from "./components/UserMenu";
 import { DevCredit } from "./components/DevCredit";
+import { SmartCalculator } from "./components/SmartCalculator";
 import { VideoLogsTab } from "./components/VideoLogsTab";
 import "./App.css";
 
@@ -877,6 +878,7 @@ function AppInner() {
         onCancel={clearPending}
       />
 
+      <SmartCalculator />
       <DevCredit variant="floating" />
     </main>
   );
