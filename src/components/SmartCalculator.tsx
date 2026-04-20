@@ -31,7 +31,8 @@ const LS_EXPR = "smartcalc:expression";
 const LS_HISTORY = "smartcalc:history";
 const HISTORY_MAX = 50;
 const PANEL_W = 320;
-const PANEL_H_MAX = 560;
+const PANEL_H_MAX = 640;
+const HISTORY_H = 240;
 
 function loadLS<T>(key: string, fallback: T): T {
   try {
@@ -320,10 +321,13 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
           </button>
         </div>
 
-        {/* History */}
-        <div className="max-h-[180px] min-h-[100px] overflow-auto bg-surface-0/40 px-2 py-1.5">
+        {/* History — fixed height, scroll khi nhiều. */}
+        <div
+          className="overflow-auto bg-surface-0/40 px-2 py-1.5"
+          style={{ height: `${HISTORY_H}px` }}
+        >
           {history.length === 0 ? (
-            <div className="flex h-full min-h-[90px] items-center justify-center text-center text-xs text-white/30">
+            <div className="flex h-full items-center justify-center text-center text-xs text-white/30">
               Chưa có phép tính nào
             </div>
           ) : (
