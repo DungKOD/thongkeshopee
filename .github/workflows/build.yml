@@ -4,35 +4,60 @@ on:
   push:
     branches: [master]
     tags: ['v*']
-  pull_request:
-    branches: [master]
   workflow_dispatch:
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    timeout-minutes: 45
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon (M1/M2/M3)
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+            rust_target: aarch64-apple-darwin
+            name: macos-arm64
+          # macOS Intel
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+            rust_target: x86_64-apple-darwin
+            name: macos-x86_64
+          # Windows x64
+          - platform: windows-latest
+            args: ""
+            rust_target: ""
+            name: windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
-          key: windows-x64
+          key: ${{ matrix.name }}
 
-      - name: Install dependencies
+      - name: Install npm dependencies
         run: npm ci
 
+      # Inject env từ Secrets → .env.local để Vite pick up lúc build.
       - name: Create .env.local from secrets
         shell: bash
         run: |
@@ -48,92 +73,37 @@ jobs:
           VITE_ADMIN_NOTE=${{ secrets.VITE_ADMIN_NOTE }}
           EOF
 
-      - name: Build
-        run: npm run tauri build
+      # tauri-action handles: frontend build → rust build → bundle →
+      # auto-detect artifact paths → upload to GitHub Release (nếu tagName).
+      # `tagName` chỉ set khi push tag v* → trigger release flow.
+      - name: Build Tauri app
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: "Thống kê Shopee ${{ github.ref_name }}"
+          releaseBody: |
+            ### Download
 
-      - name: Upload Windows artifacts
+            - **Windows**: tải file `.msi` hoặc `.exe` bên dưới
+            - **macOS Apple Silicon (M1/M2/M3)**: tải `.dmg` có `aarch64`
+            - **macOS Intel**: tải `.dmg` có `x64`
+
+            ### Notes
+            Ứng dụng chưa ký (code signing) — Windows SmartScreen có thể cảnh báo,
+            chọn "More info" → "Run anyway". macOS: nếu Gatekeeper block, right-click
+            app trong Applications → "Open" → Open.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # Fallback upload artifacts (khi push master không tag — không có release).
+      - name: Upload artifacts (no tag)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') && steps.tauri.outputs.artifactPaths != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: windows-installer
-          path: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
+          name: ${{ matrix.name }}
+          path: ${{ steps.tauri.outputs.artifactPaths }}
           if-no-files-found: warn
-
-  build-macos:
-    runs-on: macos-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ./src-tauri -> target
-          key: ${{ matrix.target }}
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Create .env.local from secrets
-        run: |
-          cat > .env.local <<EOF
-          VITE_FIREBASE_API_KEY=${{ secrets.VITE_FIREBASE_API_KEY }}
-          VITE_FIREBASE_AUTH_DOMAIN=${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
-          VITE_FIREBASE_PROJECT_ID=${{ secrets.VITE_FIREBASE_PROJECT_ID }}
-          VITE_FIREBASE_STORAGE_BUCKET=${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
-          VITE_FIREBASE_MESSAGING_SENDER_ID=${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
-          VITE_FIREBASE_APP_ID=${{ secrets.VITE_FIREBASE_APP_ID }}
-          VITE_APPS_SCRIPT_URL=${{ secrets.VITE_APPS_SCRIPT_URL }}
-          VITE_ADMIN_ZALO=${{ secrets.VITE_ADMIN_ZALO }}
-          VITE_ADMIN_NOTE=${{ secrets.VITE_ADMIN_NOTE }}
-          EOF
-
-      - name: Build
-        run: npm run tauri build -- --target ${{ matrix.target }}
-
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.target }}
-          path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-          if-no-files-found: warn
-
-  # Tạo draft GitHub Release khi push tag v*. Gom artifacts 3 platform.
-  release:
-    needs: [build-windows, build-macos]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          generate_release_notes: true
-          files: |
-            artifacts/**/*.msi
-            artifacts/**/*.exe
-            artifacts/**/*.dmg
