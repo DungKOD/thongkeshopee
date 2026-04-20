@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 /**
  * Máy tính thông minh — floating draggable window.
@@ -264,10 +265,10 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
     setExpression(item.expression);
     inputRef.current?.focus();
   };
+  const [confirmClearHistory, setConfirmClearHistory] = useState(false);
   const clearHistory = () => {
     if (history.length === 0) return;
-    if (!confirm("Xóa toàn bộ lịch sử?")) return;
-    setHistory([]);
+    setConfirmClearHistory(true);
   };
 
   return (
@@ -445,6 +446,19 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={confirmClearHistory}
+        title="Xóa toàn bộ lịch sử?"
+        message={`Xóa ${history.length} phép tính đã lưu. Không hoàn tác được.`}
+        confirmLabel="Xóa lịch sử"
+        danger
+        onConfirm={() => {
+          setHistory([]);
+          setConfirmClearHistory(false);
+        }}
+        onClose={() => setConfirmClearHistory(false)}
+      />
     </div>
   );
 }

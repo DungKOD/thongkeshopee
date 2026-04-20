@@ -4,7 +4,8 @@ import { createPortal } from "react-dom";
 interface ConfirmDialogProps {
   isOpen: boolean;
   title: string;
-  message: string;
+  /** Text hoặc node bất kỳ (vd chi tiết row dạng mono). `string` tự wrap qua `<p>`. */
+  message: React.ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;

@@ -12,6 +12,7 @@ import {
   type UserListEntry,
   type VideoLogRow,
 } from "../lib/drive";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 const PAGE_SIZE = 100;
 
@@ -170,18 +171,19 @@ export function VideoLogsTab() {
   const [deletingRowIdx, setDeletingRowIdx] = useState<number | null>(null);
   const [deletingSheet, setDeletingSheet] = useState(false);
 
-  const deleteRow = useCallback(
+  // Confirm dialog state — share cho cả delete row + delete sheet.
+  const [confirmState, setConfirmState] = useState<{
+    title: string;
+    message: React.ReactNode;
+    confirmLabel: string;
+    onConfirm: () => void | Promise<void>;
+  } | null>(null);
+
+  const doDeleteRow = useCallback(
     async (idx: number) => {
       if (!selected) return;
       const row = logs[idx];
       if (!row) return;
-      if (
-        !window.confirm(
-          `Xóa dòng này?\n\n${row.timestamp}\n${row.url}\n${row.status}`,
-        )
-      )
-        return;
-
       const current = auth.currentUser;
       if (!current) return;
 
@@ -209,15 +211,38 @@ export function VideoLogsTab() {
     [selected, logs],
   );
 
-  const deleteSheet = useCallback(async () => {
-    if (!selected) return;
-    if (
-      !window.confirm(
-        `Xóa tab "${selected.localPart}" trong Sheet?\n\nXóa toàn bộ log video của ${selected.email}. Không hoàn tác được.\n\n(File Sheet gốc không bị ảnh hưởng.)`,
-      )
-    )
-      return;
+  const deleteRow = useCallback(
+    (idx: number) => {
+      const row = logs[idx];
+      if (!row || !selected) return;
+      setConfirmState({
+        title: "Xóa dòng log này?",
+        confirmLabel: "Xóa dòng",
+        message: (
+          <div className="space-y-2">
+            <p className="text-white/80">
+              Sẽ xóa khỏi Google Sheet + cache local. Không hoàn tác được.
+            </p>
+            <div className="rounded-md border border-surface-8 bg-surface-0 px-3 py-2 font-mono text-xs text-white/60">
+              <div>🕐 {row.timestamp}</div>
+              <div className="truncate">🔗 {row.url}</div>
+              <div>
+                {row.status === "thất bại" ? "❌" : "✅"} {row.status}
+              </div>
+            </div>
+          </div>
+        ),
+        onConfirm: async () => {
+          setConfirmState(null);
+          await doDeleteRow(idx);
+        },
+      });
+    },
+    [logs, selected, doDeleteRow],
+  );
 
+  const doDeleteSheet = useCallback(async () => {
+    if (!selected) return;
     const current = auth.currentUser;
     if (!current) return;
 
@@ -236,6 +261,30 @@ export function VideoLogsTab() {
       setDeletingSheet(false);
     }
   }, [selected]);
+
+  const deleteSheet = useCallback(() => {
+    if (!selected) return;
+    setConfirmState({
+      title: `Xóa tab "${selected.localPart}"?`,
+      confirmLabel: "Xóa tab",
+      message: (
+        <div className="space-y-2">
+          <p className="text-white/80">
+            Xóa toàn bộ log video của{" "}
+            <span className="font-semibold text-white">{selected.email}</span>.
+            Không hoàn tác được.
+          </p>
+          <p className="text-xs text-white/50">
+            (File Sheet gốc không bị ảnh hưởng — chỉ xóa tab của user này.)
+          </p>
+        </div>
+      ),
+      onConfirm: async () => {
+        setConfirmState(null);
+        await doDeleteSheet();
+      },
+    });
+  }, [selected, doDeleteSheet]);
 
   const loadMore = useCallback(async () => {
     if (!selected || logsLoading || !hasMore) return;
@@ -546,6 +595,16 @@ export function VideoLogsTab() {
           )}
         </div>
       </section>
+
+      <ConfirmDialog
+        isOpen={!!confirmState}
+        title={confirmState?.title ?? ""}
+        message={confirmState?.message ?? ""}
+        confirmLabel={confirmState?.confirmLabel ?? "Xác nhận"}
+        danger
+        onConfirm={() => void confirmState?.onConfirm()}
+        onClose={() => setConfirmState(null)}
+      />
     </div>
   );
 }
