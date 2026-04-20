@@ -108,3 +108,24 @@ input[type="number"] {
   -moz-appearance: textfield;
   appearance: textfield;
 }
+
+/* ========================================================
+ * Hover zoom + glow cho số trong bảng Thống kê.
+ * Áp dụng mọi <td class="tabular-nums"> trong <tbody> — số zoom nhẹ +
+ * sáng + text-shadow để user hover vào là đọc rõ ngay. Không affect
+ * calculator panel (không dùng <table>) hay các vị trí khác.
+ * ======================================================== */
+tbody td.tabular-nums {
+  transition: transform 150ms ease-out, color 150ms ease-out,
+    text-shadow 150ms ease-out;
+  transform-origin: center;
+}
+
+tbody td.tabular-nums:hover {
+  transform: scale(1.12);
+  color: rgb(255 255 255);
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
+  z-index: 10;
+  position: relative;
+  cursor: default;
+}

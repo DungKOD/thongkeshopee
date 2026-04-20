@@ -454,12 +454,9 @@ function AppInner() {
       <header className="sticky top-0 z-30 bg-gradient-to-r from-shopee-600 to-shopee-500 shadow-elev-4">
         <div className="flex items-center justify-between px-6 py-3">
           <div className="flex items-center gap-3">
-            <img
-              src="/shopee.png"
-              alt="Shopee"
-              className="h-9 w-9 rounded-md object-contain shadow-elev-2"
-              draggable={false}
-            />
+            <span className="material-symbols-rounded text-3xl text-white">
+              analytics
+            </span>
             <div>
               <h1 className="text-xl font-semibold tracking-tight text-white">
                 Thống kê Shopee Affiliate
