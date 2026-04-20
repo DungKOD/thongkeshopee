@@ -94,6 +94,48 @@ function fmt(n: number): string {
   return rounded.toLocaleString("en", { maximumFractionDigits: 8 });
 }
 
+/**
+ * Lọc input — chỉ giữ digit + operators + parens + dot + percent + space.
+ * Dùng cho onChange để chặn paste text chứa chữ.
+ */
+function sanitizeInput(s: string): string {
+  return s.replace(/[^\d+\-*/().%\s]/g, "");
+}
+
+/**
+ * Extract số từ text (của element user ctrl+click). Xử lý cả locale VN (1.234,56)
+ * và EN (1,234.56) + thousand separator. Trả về chuỗi số hợp lệ cho calculator,
+ * hoặc null nếu text không chứa số.
+ */
+function extractNumberFromText(text: string): string | null {
+  if (!text) return null;
+  // Strip currency/whitespace.
+  const stripped = text.replace(/[₫$€£¥\s\u00A0]/g, "");
+  const match = stripped.match(/-?[\d.,]+/);
+  if (!match) return null;
+  const raw = match[0];
+  if (!/\d/.test(raw)) return null;
+
+  // Có cả . và , → cái nằm sau là decimal, cái còn lại là thousand separator.
+  if (raw.includes(".") && raw.includes(",")) {
+    const lastDot = raw.lastIndexOf(".");
+    const lastComma = raw.lastIndexOf(",");
+    if (lastDot > lastComma) return raw.replace(/,/g, "");
+    return raw.replace(/\./g, "").replace(",", ".");
+  }
+  // Chỉ có , — check pattern thousand `1,234,567`.
+  if (raw.includes(",")) {
+    if (/^-?\d{1,3}(,\d{3})+$/.test(raw)) return raw.replace(/,/g, "");
+    return raw.replace(",", ".");
+  }
+  // Chỉ có . — check pattern thousand `1.234.567` (VN).
+  if (raw.includes(".")) {
+    if (/^-?\d{1,3}(\.\d{3})+$/.test(raw)) return raw.replace(/\./g, "");
+    return raw;
+  }
+  return raw;
+}
+
 export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
   const [position, setPosition] = useState<Position>(() =>
     loadLS(LS_POS, initialPosition()),
@@ -148,6 +190,34 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
+
+  // Ctrl/Cmd + click vào số bất kỳ trong app → auto append vào expression.
+  // Chỉ active khi calculator open. Capture phase để chặn handler dưới.
+  useEffect(() => {
+    if (!isOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      // Bỏ qua click trong chính panel máy tính (tránh self-loop).
+      if (target.closest("[data-smartcalc-panel]")) return;
+      // Bỏ qua click vào <input>/<textarea> (user đang edit field khác).
+      const tag = target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+      const text = target.textContent ?? "";
+      const num = extractNumberFromText(text);
+      if (num == null) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      setExpression((prev) => prev + num);
+      // Visual pulse: focus input để user thấy ngay giá trị đã chèn.
+      inputRef.current?.focus();
+    };
+    window.addEventListener("click", handler, true);
+    return () => window.removeEventListener("click", handler, true);
+  }, [isOpen]);
 
   const startDrag = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -211,6 +281,7 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
         maxHeight: `${PANEL_H_MAX}px`,
       }}
       aria-hidden={!isOpen}
+      data-smartcalc-panel
     >
       <div className="flex flex-col overflow-hidden rounded-xl border border-surface-8 bg-surface-1/95 shadow-elev-16 backdrop-blur-md">
         {/* Draggable header */}
@@ -284,14 +355,23 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
             ref={inputRef}
             type="text"
             value={expression}
-            onChange={(e) => setExpression(e.currentTarget.value)}
+            onChange={(e) =>
+              setExpression(sanitizeInput(e.currentTarget.value))
+            }
+            onPaste={(e) => {
+              // Filter clipboard — chỉ lấy phần số/toán tử.
+              e.preventDefault();
+              const raw = e.clipboardData.getData("text");
+              const clean = sanitizeInput(raw);
+              if (clean) setExpression((prev) => prev + clean);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
                 e.preventDefault();
                 commit();
               }
             }}
-            placeholder="Nhập phép tính..."
+            placeholder="Chỉ số + − × ÷ ( ) . %"
             className="w-full rounded-md bg-surface-1 px-3 py-2 text-right text-lg font-medium tabular-nums text-white/95 outline-none transition-all focus:ring-2 focus:ring-shopee-500/50"
             spellCheck={false}
             autoComplete="off"
