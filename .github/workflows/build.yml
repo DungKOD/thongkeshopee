@@ -99,11 +99,23 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-      # Fallback upload artifacts (khi push master không tag — không có release).
+      # tauri-action trả artifactPaths dạng JSON array → convert sang newline list
+      # cho actions/upload-artifact (chỉ chấp nhận multiline string / glob).
+      - name: Format artifact paths
+        id: paths
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') && steps.tauri.outputs.artifactPaths != '' }}
+        shell: bash
+        run: |
+          {
+            echo 'list<<EOF'
+            echo '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]'
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Upload artifacts (no tag)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') && steps.tauri.outputs.artifactPaths != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ steps.tauri.outputs.artifactPaths }}
-          if-no-files-found: warn
+          path: ${{ steps.paths.outputs.list }}
+          if-no-files-found: error
