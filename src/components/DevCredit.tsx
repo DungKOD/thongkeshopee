@@ -14,23 +14,24 @@ const DEV_ZALO_URL = `https://zalo.me/${DEV_ZALO}`;
 export function DevCredit({ variant = "inline" }: DevCreditProps) {
   if (variant === "floating") {
     return (
-      <div className="pointer-events-none fixed bottom-3 right-3 z-20">
+      <div className="pointer-events-none fixed bottom-4 right-4 z-20">
         <a
           href={DEV_ZALO_URL}
           target="_blank"
           rel="noreferrer"
-          className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-surface-8 bg-surface-1/90 px-3 py-1.5 text-[11px] font-medium text-white/70 shadow-elev-2 backdrop-blur-sm transition-colors hover:border-shopee-500/50 hover:bg-surface-2 hover:text-white"
+          className="pointer-events-auto flex items-center gap-2.5 rounded-full border border-surface-8 bg-surface-1/95 px-4 py-2.5 text-sm font-medium text-white/90 opacity-40 shadow-elev-4 backdrop-blur-md transition-all duration-200 hover:scale-105 hover:border-shopee-500/60 hover:bg-surface-2 hover:opacity-100 hover:shadow-elev-8"
           title={`Liên hệ Zalo ${DEV_ZALO}`}
         >
-          <span className="material-symbols-rounded text-sm text-shopee-400">
+          <span className="material-symbols-rounded text-lg text-shopee-400">
             code
           </span>
-          <span>
-            Dev: <span className="font-semibold text-white/90">{DEV_NAME}</span>
+          <span className="whitespace-nowrap">
+            Dev:{" "}
+            <span className="font-bold text-white">{DEV_NAME}</span>
           </span>
           <span className="text-white/30">·</span>
-          <span className="flex items-center gap-0.5 text-shopee-300">
-            <span className="material-symbols-rounded text-sm">chat</span>
+          <span className="flex items-center gap-1 whitespace-nowrap font-semibold text-shopee-300">
+            <span className="material-symbols-rounded text-lg">chat</span>
             Zalo {DEV_ZALO}
           </span>
         </a>
