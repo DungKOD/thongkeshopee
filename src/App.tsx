@@ -145,6 +145,21 @@ function AppInner() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [userListOpen, setUserListOpen] = useState(false);
+  // Máy tính — open state lift lên App để header button toggle được.
+  const [calcOpen, setCalcOpen] = useState<boolean>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("smartcalc:open") ?? "false");
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("smartcalc:open", JSON.stringify(calcOpen));
+    } catch {
+      /* quota */
+    }
+  }, [calcOpen]);
   const [activeTab, setActiveTab] = useState<
     "stats" | "download" | "video-logs"
   >("stats");
@@ -476,6 +491,17 @@ function AppInner() {
                 User
               </button>
             )}
+            <button
+              onClick={() => setCalcOpen((o) => !o)}
+              className={`btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white transition-colors ${
+                calcOpen ? "bg-white/20" : "hover:bg-white/10 active:bg-white/20"
+              }`}
+              title={calcOpen ? "Đóng máy tính" : "Mở máy tính"}
+              aria-label="Máy tính thông minh"
+              aria-pressed={calcOpen}
+            >
+              <span className="material-symbols-rounded">calculate</span>
+            </button>
             <button
               onClick={() => setSettingsOpen(true)}
               className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
@@ -878,7 +904,10 @@ function AppInner() {
         onCancel={clearPending}
       />
 
-      <SmartCalculator />
+      <SmartCalculator
+        isOpen={calcOpen}
+        onClose={() => setCalcOpen(false)}
+      />
       <DevCredit variant="floating" />
     </main>
   );

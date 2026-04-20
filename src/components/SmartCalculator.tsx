@@ -1,16 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * Máy tính thông minh nổi góc phải màn hình.
- * - Mũi tên toggle show/hide có slide animation (translate-x + duration-300).
- * - Eval biểu thức live (`2+3*4` hiển thị `14` ngay khi gõ).
- * - History 50 phép tính gần nhất, persist localStorage (`smartcalc:*`).
- * - Click 1 history item → recall vào input (chain calculation).
- * - Keyboard: Enter = commit, digits/operators gõ trực tiếp.
- *
- * Safety: `new Function()` eval — OK vì local Tauri app, user tự nhập, không
- * có external input. Sanitize regex chỉ allow `0-9 + - * / ( ) . space`.
+ * Máy tính thông minh — floating draggable window.
+ * - Open/close bởi button ở header app (prop `isOpen` từ parent).
+ * - Fade in/out opacity transition (200ms) khi toggle.
+ * - Drag bằng cách grab header panel. Vị trí persist localStorage.
+ * - Semi-transparent (opacity 95) để không chặn toàn bộ content phía sau.
+ * - Evaluate live, chain calculation, history 50 items (persist localStorage).
+ * - Hỗ trợ +, -, *, /, %, (). Percent = `/100` (50% = 0.5, 100*10% = 10).
  */
+
+interface SmartCalculatorProps {
+  isOpen: boolean;
+  onClose: () => void;
+}
 
 interface HistoryItem {
   expression: string;
@@ -18,10 +21,17 @@ interface HistoryItem {
   timestamp: number;
 }
 
-const LS_OPEN = "smartcalc:open";
+interface Position {
+  x: number;
+  y: number;
+}
+
+const LS_POS = "smartcalc:pos";
 const LS_EXPR = "smartcalc:expression";
 const LS_HISTORY = "smartcalc:history";
 const HISTORY_MAX = 50;
+const PANEL_W = 320;
+const PANEL_H_MAX = 560;
 
 function loadLS<T>(key: string, fallback: T): T {
   try {
@@ -36,8 +46,25 @@ function saveLS(key: string, value: unknown) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {
-    /* quota exceeded — silently drop */
+    /* quota */
   }
+}
+
+function clampPosition(p: Position): Position {
+  const maxX = Math.max(0, window.innerWidth - PANEL_W);
+  const maxY = Math.max(0, window.innerHeight - 100); // chừa ít nhất header visible
+  return {
+    x: Math.min(Math.max(0, p.x), maxX),
+    y: Math.min(Math.max(0, p.y), maxY),
+  };
+}
+
+function initialPosition(): Position {
+  // Mặc định góc phải trên, cách mép 24px. Clamp defensive.
+  return clampPosition({
+    x: window.innerWidth - PANEL_W - 24,
+    y: 120,
+  });
 }
 
 type EvalResult =
@@ -47,11 +74,8 @@ type EvalResult =
 function tryEvaluate(expr: string): EvalResult {
   const trimmed = expr.trim();
   if (!trimmed) return { ok: false, error: "" };
-  // Whitelist ký tự — chặn bất kỳ JS identifier / keyword nào.
   if (!/^[\d+\-*/().%\s]+$/.test(trimmed))
     return { ok: false, error: "Ký tự không hỗ trợ" };
-  // `%` trong toán học = chia 100 (không phải modulo JS). Replace trước khi eval.
-  // `50%` → `50/100` = 0.5. `100*10%` → `100*10/100` = 10.
   const normalized = trimmed.replace(/%/g, "/100");
   try {
     const fn = new Function(`"use strict"; return (${normalized})`);
@@ -70,27 +94,73 @@ function fmt(n: number): string {
   return rounded.toLocaleString("en", { maximumFractionDigits: 8 });
 }
 
-export function SmartCalculator() {
-  const [isOpen, setIsOpen] = useState<boolean>(() => loadLS(LS_OPEN, false));
+export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
+  const [position, setPosition] = useState<Position>(() =>
+    loadLS(LS_POS, initialPosition()),
+  );
   const [expression, setExpression] = useState<string>(() =>
     loadLS(LS_EXPR, ""),
   );
   const [history, setHistory] = useState<HistoryItem[]>(() =>
     loadLS(LS_HISTORY, []),
   );
+  const [dragState, setDragState] = useState<{
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  useEffect(() => saveLS(LS_OPEN, isOpen), [isOpen]);
+  useEffect(() => saveLS(LS_POS, position), [position]);
   useEffect(() => saveLS(LS_EXPR, expression), [expression]);
   useEffect(() => saveLS(LS_HISTORY, history), [history]);
 
+  // Focus input sau khi fade-in xong (tránh scroll lung tung).
   useEffect(() => {
     if (isOpen) {
-      // Delay focus đến khi slide-in xong để tránh scroll lung tung.
-      const t = setTimeout(() => inputRef.current?.focus(), 300);
+      const t = setTimeout(() => inputRef.current?.focus(), 220);
       return () => clearTimeout(t);
     }
   }, [isOpen]);
+
+  // Global mouse tracking cho drag. Chỉ active khi dragState set.
+  useEffect(() => {
+    if (!dragState) return;
+    const onMove = (e: MouseEvent) => {
+      setPosition(
+        clampPosition({
+          x: e.clientX - dragState.offsetX,
+          y: e.clientY - dragState.offsetY,
+        }),
+      );
+    };
+    const onUp = () => setDragState(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragState]);
+
+  // Resize window → clamp vị trí để panel không ra ngoài viewport.
+  useEffect(() => {
+    const onResize = () => setPosition((p) => clampPosition(p));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const startDrag = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      // Chỉ drag khi click vào header (không phải button bên trong header).
+      if ((e.target as HTMLElement).closest("button")) return;
+      e.preventDefault();
+      setDragState({
+        offsetX: e.clientX - position.x,
+        offsetY: e.clientY - position.y,
+      });
+    },
+    [position],
+  );
 
   const evalResult = tryEvaluate(expression);
   const liveResult = evalResult.ok ? fmt(evalResult.value) : "";
@@ -131,55 +201,58 @@ export function SmartCalculator() {
 
   return (
     <div
-      className="fixed right-0 top-1/2 z-40 flex -translate-y-1/2 items-center"
-      aria-label="Máy tính thông minh"
+      className={`fixed z-40 transition-opacity duration-200 ease-out ${
+        isOpen ? "opacity-95 hover:opacity-100" : "pointer-events-none opacity-0"
+      } ${dragState ? "opacity-100 select-none" : ""}`}
+      style={{
+        left: `${position.x}px`,
+        top: `${position.y}px`,
+        width: `${PANEL_W}px`,
+        maxHeight: `${PANEL_H_MAX}px`,
+      }}
+      aria-hidden={!isOpen}
     >
-      {/* Toggle arrow — luôn hiển thị, mép trái panel */}
-      <button
-        onClick={() => setIsOpen((o) => !o)}
-        className="btn-ripple z-10 flex h-16 w-8 items-center justify-center rounded-l-lg bg-gradient-to-br from-shopee-500 to-shopee-600 text-white shadow-elev-4 transition-all hover:from-shopee-400 hover:to-shopee-500 hover:w-9"
-        title={isOpen ? "Thu gọn máy tính" : "Mở máy tính"}
-        aria-label={isOpen ? "Thu gọn máy tính" : "Mở máy tính"}
-        aria-expanded={isOpen}
-      >
-        <span
-          className="material-symbols-rounded transition-transform duration-300 ease-out"
-          style={{ transform: isOpen ? "rotate(0deg)" : "rotate(180deg)" }}
+      <div className="flex flex-col overflow-hidden rounded-xl border border-surface-8 bg-surface-1/95 shadow-elev-16 backdrop-blur-md">
+        {/* Draggable header */}
+        <div
+          onMouseDown={startDrag}
+          className={`flex items-center gap-2 bg-gradient-to-r from-shopee-600 to-shopee-500 px-3 py-2 ${
+            dragState ? "cursor-grabbing" : "cursor-grab"
+          }`}
         >
-          chevron_right
-        </span>
-      </button>
-
-      {/* Panel — slide từ phải vào */}
-      <div
-        className={`flex w-80 flex-col overflow-hidden border-y border-r-0 border-l border-surface-8 bg-surface-1 shadow-elev-16 transition-transform duration-300 ease-out ${
-          isOpen ? "translate-x-0" : "translate-x-full"
-        }`}
-        aria-hidden={!isOpen}
-      >
-        {/* Header */}
-        <div className="flex items-center gap-2 bg-gradient-to-r from-shopee-600 to-shopee-500 px-4 py-2.5">
-          <span className="material-symbols-rounded text-white">calculate</span>
-          <span className="flex-1 text-sm font-semibold text-white">
+          <span className="material-symbols-rounded text-white/90">
+            drag_indicator
+          </span>
+          <span className="flex-1 select-none text-sm font-semibold text-white">
             Máy tính
           </span>
           <button
+            type="button"
             onClick={clearHistory}
             disabled={history.length === 0}
             className="btn-ripple flex h-7 w-7 items-center justify-center rounded-full text-white/70 hover:bg-white/15 disabled:opacity-30"
-            title="Xóa toàn bộ lịch sử"
+            title="Xóa lịch sử"
             aria-label="Xóa lịch sử"
           >
             <span className="material-symbols-rounded text-base">
               history_off
             </span>
           </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn-ripple flex h-7 w-7 items-center justify-center rounded-full text-white/90 hover:bg-white/15"
+            title="Đóng"
+            aria-label="Đóng máy tính"
+          >
+            <span className="material-symbols-rounded text-base">close</span>
+          </button>
         </div>
 
         {/* History */}
-        <div className="min-h-[120px] max-h-[200px] flex-1 overflow-auto bg-surface-0/40 px-2 py-1.5">
+        <div className="max-h-[180px] min-h-[100px] overflow-auto bg-surface-0/40 px-2 py-1.5">
           {history.length === 0 ? (
-            <div className="flex h-full min-h-[100px] items-center justify-center text-center text-xs text-white/30">
+            <div className="flex h-full min-h-[90px] items-center justify-center text-center text-xs text-white/30">
               Chưa có phép tính nào
             </div>
           ) : (
@@ -187,6 +260,7 @@ export function SmartCalculator() {
               {history.map((h, idx) => (
                 <li key={`${h.timestamp}-${idx}`}>
                   <button
+                    type="button"
                     onClick={() => recall(h)}
                     className="group w-full rounded-md px-2 py-1 text-right transition-colors hover:bg-surface-2/60"
                     title="Click để tính lại"
