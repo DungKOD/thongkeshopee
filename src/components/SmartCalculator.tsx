@@ -273,7 +273,7 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
   return (
     <div
       className={`fixed z-40 transition-opacity duration-200 ease-out ${
-        isOpen ? "opacity-95 hover:opacity-100" : "pointer-events-none opacity-0"
+        isOpen ? "opacity-40 hover:opacity-100" : "pointer-events-none opacity-0"
       } ${dragState ? "opacity-100 select-none" : ""}`}
       style={{
         left: `${position.x}px`,
