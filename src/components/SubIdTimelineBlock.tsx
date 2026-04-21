@@ -21,6 +21,7 @@ interface SubIdTimelineBlockProps {
   pendingRowDeletes: Set<string>;
   onToggleRowDelete: (row: UiRow) => void;
   onEditRow: (row: UiRow) => void;
+  readOnly?: boolean;
 }
 
 const HEADERS: Array<{ label: string; tooltip?: string }> = [
@@ -69,6 +70,7 @@ export function SubIdTimelineBlock({
   pendingRowDeletes,
   onToggleRowDelete,
   onEditRow,
+  readOnly = false,
 }: SubIdTimelineBlockProps) {
   const { settings } = useSettings();
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
@@ -169,6 +171,7 @@ export function SubIdTimelineBlock({
                 onEdit={() => onEditRow(r)}
                 onToggleDelete={() => onToggleRowDelete(r)}
                 onViewDetail={() => setDetailRow(r)}
+                readOnly={readOnly}
               />
             ))}
           </tbody>
@@ -222,6 +225,7 @@ interface TimelineRowProps {
   onEdit: () => void;
   onToggleDelete: () => void;
   onViewDetail: () => void;
+  readOnly?: boolean;
 }
 
 function TimelineRow({
@@ -230,6 +234,7 @@ function TimelineRow({
   onEdit,
   onToggleDelete,
   onViewDetail,
+  readOnly = false,
 }: TimelineRowProps) {
   const { settings } = useSettings();
   const shopeeClicks = sumFiltered(
@@ -326,39 +331,41 @@ function TimelineRow({
         {row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
       </td>
       <td className={cellCls}>
-        <div className="flex justify-center gap-0.5">
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!pending) onEdit();
-            }}
-            disabled={pending}
-            className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-              pending
-                ? "cursor-not-allowed text-white/20"
-                : "text-shopee-400 hover:bg-shopee-500/10"
-            }`}
-            title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
-          >
-            <span className="material-symbols-rounded text-lg">edit</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleDelete();
-            }}
-            className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-              pending
-                ? "text-amber-400 hover:bg-amber-500/10"
-                : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
-            }`}
-            title={pending ? "Khôi phục" : "Đánh dấu xóa"}
-          >
-            <span className="material-symbols-rounded text-lg">
-              {pending ? "undo" : "delete"}
-            </span>
-          </button>
-        </div>
+        {!readOnly && (
+          <div className="flex justify-center gap-0.5">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!pending) onEdit();
+              }}
+              disabled={pending}
+              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                pending
+                  ? "cursor-not-allowed text-white/20"
+                  : "text-shopee-400 hover:bg-shopee-500/10"
+              }`}
+              title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
+            >
+              <span className="material-symbols-rounded text-lg">edit</span>
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleDelete();
+              }}
+              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                pending
+                  ? "text-amber-400 hover:bg-amber-500/10"
+                  : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
+              }`}
+              title={pending ? "Khôi phục" : "Đánh dấu xóa"}
+            >
+              <span className="material-symbols-rounded text-lg">
+                {pending ? "undo" : "delete"}
+              </span>
+            </button>
+          </div>
+        )}
       </td>
     </tr>
   );

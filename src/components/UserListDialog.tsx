@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { auth } from "../lib/firebase";
 import { driveListUsers, type UserListEntry } from "../lib/drive";
+import { useAdminView } from "../contexts/AdminViewContext";
 
 interface UserListDialogProps {
   isOpen: boolean;
@@ -180,7 +181,7 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
               </thead>
               <tbody>
                 {filtered.map((u) => (
-                  <UserRow key={u.uid} user={u} />
+                  <UserRow key={u.uid} user={u} onClose={onClose} />
                 ))}
               </tbody>
             </table>
@@ -229,14 +230,48 @@ function Th({ label, active, desc, onClick }: ThProps) {
 
 interface UserRowProps {
   user: UserListEntry;
+  onClose: () => void;
 }
 
-function UserRow({ user }: UserRowProps) {
+function UserRow({ user, onClose }: UserRowProps) {
   const expiredAt = parseTs(user.expiredAt);
   const createdAt = parseTs(user.createdAt);
   const isExpired =
     user.premium && expiredAt && expiredAt.getTime() < Date.now();
   const hasFile = user.file !== null;
+  const isSelf = auth.currentUser?.uid === user.uid;
+  const canView = hasFile && !!user.localPart && !isSelf;
+
+  const { enter, busy, view } = useAdminView();
+  const isCurrent = view?.uid === user.uid;
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const handleView = async () => {
+    if (!user.localPart) return;
+    setLocalError(null);
+    try {
+      await enter({
+        uid: user.uid,
+        localPart: user.localPart,
+        email: user.email,
+      });
+      onClose();
+    } catch (e) {
+      setLocalError((e as Error).message ?? String(e));
+    }
+  };
+
+  const title = isCurrent
+    ? "Đang xem user này"
+    : isSelf
+      ? "Đây là tài khoản của bạn — đang xem DB của chính mình rồi"
+      : !hasFile
+        ? "User chưa backup DB"
+        : !user.localPart
+          ? "Thiếu local-part (email không hợp lệ)"
+          : busy
+            ? "Đang tải..."
+            : "Xem DB user này (read-only)";
 
   return (
     <tr
@@ -258,6 +293,11 @@ function UserRow({ user }: UserRowProps) {
           )}
           {user.localPart ? `${user.localPart}.db` : user.uid.slice(0, 8)}
         </div>
+        {localError && (
+          <div className="mt-1 truncate text-xs text-red-300" title={localError}>
+            {localError}
+          </div>
+        )}
       </td>
       <td className="px-6 py-3">
         {isExpired ? (
@@ -277,16 +317,17 @@ function UserRow({ user }: UserRowProps) {
       <td className="px-6 py-3 text-right">
         <button
           type="button"
-          disabled
-          className="btn-ripple inline-flex items-center gap-1 rounded-lg border border-surface-8 bg-surface-2 px-3 py-1 text-xs text-white/40"
-          title={
-            hasFile
-              ? "Xem DB (Phase B — đang triển khai)"
-              : "User chưa backup DB"
-          }
+          onClick={handleView}
+          disabled={!canView || busy || isCurrent}
+          className={`btn-ripple inline-flex items-center gap-1 rounded-lg border px-3 py-1 text-xs ${
+            canView && !busy && !isCurrent
+              ? "border-shopee-500/60 bg-shopee-900/30 text-shopee-200 hover:bg-shopee-800/40"
+              : "border-surface-8 bg-surface-2 text-white/40"
+          }`}
+          title={title}
         >
           <span className="material-symbols-rounded text-sm">visibility</span>
-          Xem
+          {isCurrent ? "Đang xem" : isSelf ? "Chính bạn" : "Xem"}
         </button>
       </td>
     </tr>

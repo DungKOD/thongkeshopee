@@ -8,6 +8,7 @@ interface CampaignRowProps {
   onEdit: () => void;
   onToggleDelete: () => void;
   onViewDetail: () => void;
+  readOnly?: boolean;
 }
 
 const cellCls = "px-3 py-2.5 text-center";
@@ -28,6 +29,7 @@ export function VideoRow({
   onEdit,
   onToggleDelete,
   onViewDetail,
+  readOnly = false,
 }: CampaignRowProps) {
   const { settings } = useSettings();
   const shopeeClicks = sumFiltered(
@@ -147,41 +149,43 @@ export function VideoRow({
           : "—"}
       </td>
       <td className={cellCls}>
-        <div className="flex justify-center gap-0.5">
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!pending) onEdit();
-            }}
-            disabled={pending}
-            className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-              pending
-                ? "cursor-not-allowed text-white/20"
-                : "text-shopee-400 hover:bg-shopee-500/10"
-            }`}
-            title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
-            aria-label="Sửa"
-          >
-            <span className="material-symbols-rounded text-lg">edit</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleDelete();
-            }}
-            className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-              pending
-                ? "text-amber-400 hover:bg-amber-500/10"
-                : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
-            }`}
-            title={pending ? "Khôi phục" : "Đánh dấu xóa"}
-            aria-label={pending ? "Khôi phục" : "Đánh dấu xóa"}
-          >
-            <span className="material-symbols-rounded text-lg">
-              {pending ? "undo" : "delete"}
-            </span>
-          </button>
-        </div>
+        {!readOnly && (
+          <div className="flex justify-center gap-0.5">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!pending) onEdit();
+              }}
+              disabled={pending}
+              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                pending
+                  ? "cursor-not-allowed text-white/20"
+                  : "text-shopee-400 hover:bg-shopee-500/10"
+              }`}
+              title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
+              aria-label="Sửa"
+            >
+              <span className="material-symbols-rounded text-lg">edit</span>
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleDelete();
+              }}
+              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                pending
+                  ? "text-amber-400 hover:bg-amber-500/10"
+                  : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
+              }`}
+              title={pending ? "Khôi phục" : "Đánh dấu xóa"}
+              aria-label={pending ? "Khôi phục" : "Đánh dấu xóa"}
+            >
+              <span className="material-symbols-rounded text-lg">
+                {pending ? "undo" : "delete"}
+              </span>
+            </button>
+          </div>
+        )}
       </td>
     </tr>
   );

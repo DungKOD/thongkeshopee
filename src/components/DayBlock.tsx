@@ -13,6 +13,7 @@ interface DayBlockProps {
   onToggleRowDelete: (row: UiRow) => void;
   onEditRow: (row: UiRow) => void;
   onEditDay: (date: string) => void;
+  readOnly?: boolean;
 }
 
 const ROI_TOOLTIP =
@@ -63,6 +64,7 @@ export function DayBlock({
   onToggleRowDelete,
   onEditRow,
   onEditDay,
+  readOnly = false,
 }: DayBlockProps) {
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
   const { settings } = useSettings();
@@ -129,20 +131,22 @@ export function DayBlock({
             </span>
           )}
         </div>
-        <button
-          onClick={() => onToggleDayDelete(day.date)}
-          className={`btn-ripple flex h-9 w-9 items-center justify-center rounded-full ${
-            dayPending
-              ? "text-amber-400 hover:bg-amber-500/10"
-              : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
-          }`}
-          title={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
-          aria-label={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
-        >
-          <span className="material-symbols-rounded">
-            {dayPending ? "undo" : "delete"}
-          </span>
-        </button>
+        {!readOnly && (
+          <button
+            onClick={() => onToggleDayDelete(day.date)}
+            className={`btn-ripple flex h-9 w-9 items-center justify-center rounded-full ${
+              dayPending
+                ? "text-amber-400 hover:bg-amber-500/10"
+                : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
+            }`}
+            title={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
+            aria-label={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
+          >
+            <span className="material-symbols-rounded">
+              {dayPending ? "undo" : "delete"}
+            </span>
+          </button>
+        )}
       </header>
 
       <div className="overflow-x-auto">
@@ -208,6 +212,7 @@ export function DayBlock({
                       }
                     }}
                     onViewDetail={() => setDetailRow(r)}
+                    readOnly={readOnly}
                   />
                 );
               })
@@ -250,25 +255,27 @@ export function DayBlock({
         </table>
       </div>
 
-      <div className="border-t border-surface-8 bg-surface-1 px-5 py-2">
-        <button
-          onClick={() => {
-            if (!effectiveDayPending) onEditDay(day.date);
-          }}
-          disabled={effectiveDayPending}
-          className={`btn-ripple flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
-            effectiveDayPending
-              ? "cursor-not-allowed text-white/20"
-              : "text-shopee-400 hover:bg-shopee-500/10 active:bg-shopee-500/20"
-          }`}
-          title={
-            effectiveDayPending ? "Ngày đã đánh dấu xóa — bỏ để thêm dòng" : ""
-          }
-        >
-          <span className="material-symbols-rounded text-base">add</span>
-          Thêm dòng
-        </button>
-      </div>
+      {!readOnly && (
+        <div className="border-t border-surface-8 bg-surface-1 px-5 py-2">
+          <button
+            onClick={() => {
+              if (!effectiveDayPending) onEditDay(day.date);
+            }}
+            disabled={effectiveDayPending}
+            className={`btn-ripple flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
+              effectiveDayPending
+                ? "cursor-not-allowed text-white/20"
+                : "text-shopee-400 hover:bg-shopee-500/10 active:bg-shopee-500/20"
+            }`}
+            title={
+              effectiveDayPending ? "Ngày đã đánh dấu xóa — bỏ để thêm dòng" : ""
+            }
+          >
+            <span className="material-symbols-rounded text-base">add</span>
+            Thêm dòng
+          </button>
+        </div>
+      )}
 
       <ProductDetailDialog
         isOpen={!!detailRow}

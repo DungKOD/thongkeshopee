@@ -573,6 +573,31 @@ pub(crate) async fn as_delete_user_video_log_sheet(
     Ok(())
 }
 
+/// Helper crate-internal: gọi AS `downloadForUser` — admin tải DB của user
+/// khác. Trả về `(base64Data, sizeBytes, lastModifiedMs)`. AS verify admin
+/// server-side qua Firestore, 403 nếu caller không phải admin.
+pub(crate) async fn as_download_for_user(
+    apps_script_url: &str,
+    id_token: &str,
+    target_local_part: &str,
+) -> CmdResult<(String, u64, i64)> {
+    let res = call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            target_local_part: Some(target_local_part.to_string()),
+            ..AppsScriptRequest::new("downloadForUser", id_token)
+        },
+    )
+    .await?;
+
+    let base64 = res
+        .base64_data
+        .ok_or_else(|| CmdError::msg("missing base64Data"))?;
+    let size = res.size_bytes.unwrap_or(0);
+    let mtime = res.last_modified.unwrap_or_else(now_ms);
+    Ok((base64, size, mtime))
+}
+
 /// Helper crate-internal: gọi AS `readUserVideoLog` 1 trang. Admin check chạy
 /// trong AS (verify Firestore). Caller tự lo xem phân trang / loop.
 pub(crate) async fn as_read_user_video_log(

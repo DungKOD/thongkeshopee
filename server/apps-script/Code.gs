@@ -1,8 +1,8 @@
 /**
- * ThongKe Shopee — Drive proxy + Admin endpoints
+ * ThongKe Shopee — Drive proxy + Admin endpoints + Video Log Sheet
  *
  * Deploy as Web App (execute as Me, access Anyone). Client gửi Firebase ID token;
- * script verify qua Firebase REST → thao tác Drive dưới tài khoản owner.
+ * script verify qua Firebase REST → thao tác Drive + Google Sheet dưới tài khoản owner.
  *
  * CONFIG: hardcoded dưới đây. Có thể override qua Script Properties nếu cần
  * (Project Settings → Script Properties → add key cùng tên).
@@ -10,6 +10,9 @@
  * File naming convention: {email_local_part}.db
  *   - `abc@gmail.com` → `abc.db`
  *   - Collision detection qua file.description chứa owner UID.
+ *
+ * Video log Sheet: tab name = email local-part. 3 cột: Thời gian | Link | Trạng thái.
+ * Upsert theo URL (mỗi URL chỉ 1 row, giữ status cuối). Sort newest-first theo timestamp.
  */
 
 const CONFIG_DEFAULTS = {
@@ -20,6 +23,9 @@ const CONFIG_DEFAULTS = {
 
 const DB_FILENAME_SUFFIX = '.db';
 const MIME_SQLITE = 'application/vnd.sqlite3';
+
+const VIDEO_LOG_SHEET_ID = '1LcUA9kQRhWl_Hq7qi_fJ8zgTfUSneRzxNAEcm1iiYLI';
+const VIDEO_LOG_HEADER = ['Thời gian', 'Link', 'Trạng thái'];
 
 function doPost(e) {
   try {
@@ -45,6 +51,32 @@ function doPost(e) {
         return handleListUsers(user, idToken);
       case 'downloadForUser':
         return handleDownloadForUser(user, idToken, body.targetLocalPart);
+      case 'logVideoDownload':
+        return handleLogVideoDownload(
+          user,
+          body.videoUrl,
+          body.videoStatus,
+          body.videoTimestamp,
+        );
+      case 'readUserVideoLog':
+        return handleReadUserVideoLog(
+          user,
+          idToken,
+          body.targetLocalPart,
+          body.limit,
+          body.offset,
+        );
+      case 'deleteUserVideoLogRow':
+        return handleDeleteUserVideoLogRow(
+          user,
+          idToken,
+          body.targetLocalPart,
+          body.videoTimestamp,
+          body.videoUrl,
+          body.videoStatus,
+        );
+      case 'deleteUserVideoLogSheet':
+        return handleDeleteUserVideoLogSheet(user, idToken, body.targetLocalPart);
       default:
         return jsonError(400, 'Unknown action: ' + action);
     }
@@ -54,7 +86,7 @@ function doPost(e) {
 }
 
 function doGet() {
-  return jsonOk({ service: 'ThongKeShopee Drive Proxy', version: 2 });
+  return jsonOk({ service: 'ThongKeShopee Drive Proxy', version: 4 });
 }
 
 // ============================================================
@@ -426,6 +458,187 @@ function handleListUsers(user, idToken) {
   });
 
   return jsonOk({ users: users });
+}
+
+// ============================================================
+// Video log — Google Sheet as primary audit store
+// Sheet tab name = email local-part. 3 cột: Thời gian | Link | Trạng thái.
+// Upsert theo URL: mỗi URL chỉ 1 row, luôn giữ status mới nhất.
+// ============================================================
+
+function vnStatus_(s) {
+  if (s === 'success') return 'thành công';
+  if (s === 'failed') return 'thất bại';
+  return String(s || '');
+}
+
+/**
+ * Parse timestamp "HH:MM:SS DD/MM/YYYY" → epoch ms. Trả 0 nếu format lỗi.
+ * Dùng để sort newest-first bất kể row order trong sheet.
+ */
+function parseTs_(s) {
+  const parts = String(s || '').split(' ');
+  if (parts.length !== 2) return 0;
+  const hms = parts[0].split(':').map(Number);
+  const dmy = parts[1].split('/').map(Number);
+  const t = new Date(
+    dmy[2] || 1970,
+    (dmy[1] || 1) - 1,
+    dmy[0] || 1,
+    hms[0] || 0,
+    hms[1] || 0,
+    hms[2] || 0,
+  ).getTime();
+  return isNaN(t) ? 0 : t;
+}
+
+/**
+ * Get-or-create sheet tab theo localPart. Lần đầu: header + freeze row 1 +
+ * set format plain text cho toàn sheet để tránh auto-parse ngày/số.
+ */
+function getOrCreateLogSheet_(localPart) {
+  const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
+  let sheet = ss.getSheetByName(localPart);
+  if (!sheet) {
+    sheet = ss.insertSheet(localPart);
+    sheet.getRange(1, 1, sheet.getMaxRows(), 3).setNumberFormat('@');
+    sheet
+      .getRange(1, 1, 1, VIDEO_LOG_HEADER.length)
+      .setValues([VIDEO_LOG_HEADER])
+      .setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    sheet.setColumnWidth(1, 160);
+    sheet.setColumnWidth(2, 480);
+    sheet.setColumnWidth(3, 100);
+  }
+  return sheet;
+}
+
+/**
+ * Upsert theo URL: xóa row cũ (nếu có) cùng URL → insert row mới ngay sau header.
+ * Sheet view + UI đều newest-first. Mỗi URL giữ 1 row với status cuối.
+ */
+function handleLogVideoDownload(user, videoUrl, videoStatus, videoTimestamp) {
+  if (!videoUrl || !videoStatus || !videoTimestamp) {
+    return jsonError(400, 'Missing videoUrl/videoStatus/videoTimestamp');
+  }
+  if (videoStatus !== 'success' && videoStatus !== 'failed') {
+    return jsonError(400, 'Invalid videoStatus: ' + videoStatus);
+  }
+
+  const localPart = emailToLocalPart(user.email);
+  const sheet = getOrCreateLogSheet_(localPart);
+  const statusVN = vnStatus_(videoStatus);
+
+  // Xóa row cũ (nếu có) match theo col B (URL). Iterate bottom-up để
+  // delete safely theo index (legacy có thể có nhiều duplicate).
+  const lastRow = sheet.getLastRow();
+  let replaced = false;
+  if (lastRow > 1) {
+    const urls = sheet.getRange(2, 2, lastRow - 1, 1).getValues();
+    for (let i = urls.length - 1; i >= 0; i--) {
+      if (String(urls[i][0]) === videoUrl) {
+        sheet.deleteRow(i + 2);
+        replaced = true;
+      }
+    }
+  }
+
+  // Insert row mới ngay sau header → sheet view newest-first.
+  sheet.insertRowBefore(2);
+  sheet.getRange(2, 1, 1, 3).setValues([[videoTimestamp, videoUrl, statusVN]]);
+
+  return jsonOk({ upserted: true, replaced: replaced });
+}
+
+/**
+ * Admin-only: đọc sheet tab của target user. Sort newest-first bằng parse
+ * timestamp — robust với cả legacy rows (append-bottom cũ) + rows mới
+ * (insert-top). Pagination limit/offset áp dụng trên danh sách đã sort.
+ */
+function handleReadUserVideoLog(user, idToken, targetLocalPart, limit, offset) {
+  if (!isAdmin(user, idToken)) return jsonError(403, 'Admin required');
+  if (!targetLocalPart) return jsonError(400, 'Missing targetLocalPart');
+
+  const lim = Math.max(1, Math.min(5000, parseInt(limit, 10) || 100));
+  const off = Math.max(0, parseInt(offset, 10) || 0);
+
+  const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
+  const sheet = ss.getSheetByName(targetLocalPart);
+  if (!sheet) return jsonOk({ videoLogs: [] });
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return jsonOk({ videoLogs: [] });
+
+  const all = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+  all.sort(function (a, b) {
+    return parseTs_(b[0]) - parseTs_(a[0]);
+  });
+
+  const page = all.slice(off, off + lim);
+  const videoLogs = page.map(function (r) {
+    return {
+      timestamp: String(r[0] || ''),
+      url: String(r[1] || ''),
+      status: String(r[2] || ''),
+    };
+  });
+
+  return jsonOk({ videoLogs: videoLogs });
+}
+
+/**
+ * Admin-only: xóa 1 row match (timestamp, url, status). First-match only —
+ * nếu sheet có duplicate chính xác cả 3 cột (hiếm) thì chỉ xóa row đầu tiên.
+ */
+function handleDeleteUserVideoLogRow(
+  user,
+  idToken,
+  targetLocalPart,
+  timestamp,
+  videoUrl,
+  status,
+) {
+  if (!isAdmin(user, idToken)) return jsonError(403, 'Admin required');
+  if (!targetLocalPart) return jsonError(400, 'Missing targetLocalPart');
+  if (!timestamp || !videoUrl || !status) {
+    return jsonError(400, 'Missing timestamp/videoUrl/status');
+  }
+
+  const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
+  const sheet = ss.getSheetByName(targetLocalPart);
+  if (!sheet) return jsonError(404, 'Sheet tab not found');
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return jsonError(404, 'Sheet empty');
+
+  const data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (
+      String(data[i][0]) === timestamp &&
+      String(data[i][1]) === videoUrl &&
+      String(data[i][2]) === status
+    ) {
+      sheet.deleteRow(i + 2);
+      return jsonOk({ deleted: true, rowIndex: i + 2 });
+    }
+  }
+  return jsonError(404, 'Row not found (tuple mismatch)');
+}
+
+/**
+ * Admin-only: xóa tab (sheet) của 1 user. File Sheet gốc không bị xóa.
+ */
+function handleDeleteUserVideoLogSheet(user, idToken, targetLocalPart) {
+  if (!isAdmin(user, idToken)) return jsonError(403, 'Admin required');
+  if (!targetLocalPart) return jsonError(400, 'Missing targetLocalPart');
+
+  const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
+  const sheet = ss.getSheetByName(targetLocalPart);
+  if (!sheet) return jsonOk({ deleted: false, reason: 'tab already missing' });
+
+  ss.deleteSheet(sheet);
+  return jsonOk({ deleted: true });
 }
 
 // ============================================================

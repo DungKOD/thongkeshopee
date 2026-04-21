@@ -237,3 +237,41 @@ export function adminDeleteUserLogSheet(
     targetLocalPart,
   });
 }
+
+/// Snapshot info của DB admin đang xem (null = chế độ bình thường).
+export interface AdminViewInfo {
+  uid: string;
+  email: string | null;
+  local_part: string;
+  db_path: string;
+  size_bytes: number;
+  last_modified_ms: number;
+  entered_at_ms: number;
+}
+
+/// Admin-only: download DB của user target + swap connection sang read-only.
+/// Mutation command sau đó sẽ fail với SQLITE_READONLY (safety net).
+export function adminViewUserDb(
+  idToken: string,
+  targetUid: string,
+  targetLocalPart: string,
+  targetEmail: string | null,
+): Promise<AdminViewInfo> {
+  return invoke<AdminViewInfo>("admin_view_user_db", {
+    appsScriptUrl: url(),
+    idToken,
+    targetUid,
+    targetLocalPart,
+    targetEmail,
+  });
+}
+
+/// Exit admin-view mode — reopen DB gốc của admin (RW + PRAGMA).
+export function adminExitViewUserDb(): Promise<void> {
+  return invoke<void>("admin_exit_view_user_db");
+}
+
+/// Query state hiện tại (chủ yếu cho debug — FE giữ state trong context).
+export function adminViewStateGet(): Promise<AdminViewInfo | null> {
+  return invoke<AdminViewInfo | null>("admin_view_state_get");
+}

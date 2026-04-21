@@ -15,6 +15,10 @@ import type { PreviewBatch } from "./lib/dbImport";
 import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import {
+  AdminViewProvider,
+  useAdminView,
+} from "./contexts/AdminViewContext";
 import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useDriveSync, type SyncPhase } from "./hooks/useDriveSync";
 import { LoginScreen } from "./components/LoginScreen";
@@ -121,14 +125,28 @@ function AppInner() {
     markMutation,
   } = useDbStats();
 
+  const { view: adminView, busy: adminBusy, exit: adminExit } = useAdminView();
+  const inAdminView = adminView !== null;
+
   // Sync v2: pull-merge-push. Khi vào app: metadata check; nếu dirty hoặc remote
   // mới + khác máy → pull-merge-push + refetch UI. UI chặn overlay suốt startup
   // (cả checking + syncing) để user không thao tác với data cũ trước khi merge xong.
+  //
+  // Khi admin đang xem DB của user khác → disable sync (dirty của DB khác không
+  // được upload lên Drive của admin).
   const { isStartupPhase, syncPhase } = useDriveSync({
     mutationVersion,
-    enabled: true,
+    enabled: !inAdminView,
     onRemoteApplied: refetch,
   });
+
+  // Khi swap sang DB khác (hoặc thoát) → refetch + clear pending changes
+  // của admin (pending state UI không hợp lệ với DB mới).
+  useEffect(() => {
+    clearPending();
+    void refetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminView?.uid]);
 
   const { showToast } = useToast();
   const { settings, setClickSource, registerSources, setProfitFee } =
@@ -451,6 +469,14 @@ function AppInner() {
 
   return (
     <main className="min-h-full bg-surface-0 pb-24">
+      {inAdminView && adminView && (
+        <AdminViewBanner
+          email={adminView.email}
+          localPart={adminView.local_part}
+          busy={adminBusy}
+          onExit={() => void adminExit()}
+        />
+      )}
       <header className="sticky top-0 z-30 bg-gradient-to-r from-shopee-600 to-shopee-500 shadow-elev-4">
         <div className="flex items-center justify-between px-6 py-3">
           <div className="flex items-center gap-3">
@@ -511,7 +537,7 @@ function AppInner() {
               <span className="material-symbols-rounded">settings</span>
             </button>
             <UserMenu />
-            {activeTab === "stats" && (
+            {activeTab === "stats" && !inAdminView && (
               <>
                 <button
                   onClick={handleImportClick}
@@ -596,30 +622,34 @@ function AppInner() {
             </span>
             <div>
               <h2 className="text-lg font-medium text-white/90">
-                Chưa có data nào
+                {inAdminView ? "User này chưa có data" : "Chưa có data nào"}
               </h2>
               <p className="mt-1 text-sm text-white/60">
-                Bắt đầu bằng import CSV hoặc thêm dòng thủ công
+                {inAdminView
+                  ? "DB của user đang xem chưa có ngày nào được import"
+                  : "Bắt đầu bằng import CSV hoặc thêm dòng thủ công"}
               </p>
             </div>
-            <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
-              <button
-                onClick={() => setEntryDialog({ date: todayIso() })}
-                className="btn-ripple flex items-center gap-2 rounded-lg bg-shopee-500 px-5 py-2.5 text-sm font-medium text-white shadow-elev-2 hover:bg-shopee-600 hover:shadow-elev-4"
-              >
-                <span className="material-symbols-rounded text-base">add</span>
-                Thêm dòng đầu tiên
-              </button>
-              <button
-                onClick={handleImportClick}
-                className="btn-ripple flex items-center gap-2 rounded-lg border border-surface-8 bg-surface-4 px-5 py-2.5 text-sm font-medium text-white/90 hover:bg-surface-6"
-              >
-                <span className="material-symbols-rounded text-base">
-                  upload_file
-                </span>
-                Import CSV
-              </button>
-            </div>
+            {!inAdminView && (
+              <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+                <button
+                  onClick={() => setEntryDialog({ date: todayIso() })}
+                  className="btn-ripple flex items-center gap-2 rounded-lg bg-shopee-500 px-5 py-2.5 text-sm font-medium text-white shadow-elev-2 hover:bg-shopee-600 hover:shadow-elev-4"
+                >
+                  <span className="material-symbols-rounded text-base">add</span>
+                  Thêm dòng đầu tiên
+                </button>
+                <button
+                  onClick={handleImportClick}
+                  className="btn-ripple flex items-center gap-2 rounded-lg border border-surface-8 bg-surface-4 px-5 py-2.5 text-sm font-medium text-white/90 hover:bg-surface-6"
+                >
+                  <span className="material-symbols-rounded text-base">
+                    upload_file
+                  </span>
+                  Import CSV
+                </button>
+              </div>
+            )}
           </div>
         ) : (
           <>
@@ -827,6 +857,7 @@ function AppInner() {
                     onEditRow={(r) =>
                       setEntryDialog({ date: r.dayDate, row: r })
                     }
+                    readOnly={inAdminView}
                   />
                 ) : (
                   finalDays.map((day) => (
@@ -843,6 +874,7 @@ function AppInner() {
                         setEntryDialog({ date: r.dayDate, row: r })
                       }
                       onEditDay={(date) => setEntryDialog({ date })}
+                      readOnly={inAdminView}
                     />
                   ))
                 )}
@@ -944,6 +976,54 @@ interface TabButtonProps {
   label: string;
 }
 
+interface AdminViewBannerProps {
+  email: string | null;
+  localPart: string;
+  busy: boolean;
+  onExit: () => void;
+}
+
+function AdminViewBanner({
+  email,
+  localPart,
+  busy,
+  onExit,
+}: AdminViewBannerProps) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-600/90 px-6 py-2 text-sm text-white shadow-elev-4">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="material-symbols-rounded text-base">
+          admin_panel_settings
+        </span>
+        <span className="font-medium whitespace-nowrap">Chế độ xem admin:</span>
+        <span
+          className="truncate font-mono text-white/95"
+          title={email ?? localPart}
+        >
+          {email ?? `${localPart}.db`}
+        </span>
+        <span className="hidden rounded-full bg-white/20 px-2 py-0.5 text-[11px] font-medium md:inline">
+          READ-ONLY
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={onExit}
+        disabled={busy}
+        className="btn-ripple flex shrink-0 items-center gap-1 rounded-md border border-white/60 bg-white/10 px-3 py-1 text-xs font-medium text-white hover:bg-white/20 disabled:opacity-50"
+        title="Thoát chế độ xem — quay lại DB của bạn"
+      >
+        <span
+          className={`material-symbols-rounded text-sm ${busy ? "animate-spin" : ""}`}
+        >
+          {busy ? "progress_activity" : "logout"}
+        </span>
+        Thoát
+      </button>
+    </div>
+  );
+}
+
 function TabButton({ active, onClick, icon, label }: TabButtonProps) {
   return (
     <button
@@ -973,7 +1053,9 @@ function AuthGate() {
 
   return (
     <SettingsProvider>
-      <AppInner />
+      <AdminViewProvider>
+        <AppInner />
+      </AdminViewProvider>
     </SettingsProvider>
   );
 }

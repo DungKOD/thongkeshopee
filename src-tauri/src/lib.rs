@@ -1,6 +1,8 @@
 mod commands;
 mod db;
 
+use tauri::Manager;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -14,6 +16,10 @@ pub fn run() {
             }
             // Init SQLite DB + manage state.
             db::setup(app.handle())?;
+            // Admin view state — track user đang được admin xem (None = normal mode).
+            app.manage(commands::admin_view::AdminViewState(
+                std::sync::Mutex::new(None),
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -57,6 +63,9 @@ pub fn run() {
             commands::drive::machine_fingerprint,
             commands::drive::sync_state_get,
             commands::drive::sync_state_record_error,
+            commands::admin_view::admin_view_user_db,
+            commands::admin_view::admin_exit_view_user_db,
+            commands::admin_view::admin_view_state_get,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
