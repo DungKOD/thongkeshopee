@@ -724,18 +724,9 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
         [],
     )?;
 
-    // 7. video_downloads — không có UNIQUE → dedup by (url, downloaded_at_ms).
-    tx.execute(
-        "INSERT INTO main.video_downloads (url, downloaded_at_ms, status)
-         SELECT r.url, r.downloaded_at_ms, r.status FROM remote.video_downloads r
-         WHERE NOT EXISTS (
-            SELECT 1 FROM main.video_downloads m
-            WHERE m.url = r.url AND m.downloaded_at_ms = r.downloaded_at_ms
-         )",
-        [],
-    )?;
-
-    // 8. tombstones — UNIQUE(entity_type, entity_key).
+    // 7. tombstones — UNIQUE(entity_type, entity_key).
+    // (video_downloads đã move sang video_logs.db ở migration v4 — không merge
+    // trong flow DB sync, video log đồng bộ qua Apps Script Google Sheet riêng.)
     tx.execute(
         "INSERT OR IGNORE INTO main.tombstones (entity_type, entity_key, deleted_at)
          SELECT entity_type, entity_key, deleted_at FROM remote.tombstones",

@@ -1,13 +1,19 @@
 export interface Env {
   DB_BUCKET: R2Bucket;
   FIREBASE_PROJECT_ID: string;
+  /// Fallback admin whitelist — dùng khi Firestore không reachable/rules deny.
+  /// Firestore `users/{uid}.admin=true` là nguồn chính (single source of truth).
   ADMIN_UIDS: string;
 }
 
 export interface AuthContext {
   uid: string;
   email: string | null;
+  idToken: string;
   isAdmin: boolean;
+  premium: boolean;
+  expiredAt: string | null;
+  createdAt: string | null;
 }
 
 export interface MetadataResponse {

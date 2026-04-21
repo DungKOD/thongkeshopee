@@ -251,19 +251,36 @@ export function useCloudSync({
       const remoteChanged = remoteMtime > storedRemoteMtime;
       const differentMachine =
         remoteFp === null ? true : remoteFp !== localFp;
+      // Local fresh = changeId=0 + lastUploadedChangeId=0 → DB chưa có mutation
+      // nào từ install này (reinstall, clear DB, fresh login). BẮT BUỘC pull khi
+      // remote có data — nếu không, user sẽ thấy UI rỗng và mutation kế sẽ đè
+      // mất R2 backup (change_id > 0 sau mutation → Rust-side guard không trigger).
+      // Trước đây chỉ check (remoteChanged && differentMachine) → miss khi same
+      // machine reinstall (fingerprint giống) → data loss.
+      const localFresh =
+        syncState.changeId === 0 && syncState.lastUploadedChangeId === 0;
 
       console.log("[sync] doStartupCheck state:", {
         "remote.exists": remote.exists,
         dirty: syncState.dirty,
         changeId: syncState.changeId,
         lastUploadedChangeId: syncState.lastUploadedChangeId,
+        localFresh,
         remoteChanged,
         differentMachine,
-        willSync: syncState.dirty || (remoteChanged && differentMachine),
+        willSync:
+          syncState.dirty || localFresh || (remoteChanged && differentMachine),
       });
 
-      // Case 2: dirty local HOẶC remote mới từ máy khác → pull-merge-push.
-      if (syncState.dirty || (remoteChanged && differentMachine)) {
+      // Case 2: fresh install + remote có data (reinstall, cùng máy)
+      //         HOẶC dirty local
+      //         HOẶC remote mới từ máy khác
+      //         → pull-merge-push.
+      if (
+        syncState.dirty ||
+        localFresh ||
+        (remoteChanged && differentMachine)
+      ) {
         await doSync();
         return;
       }
@@ -285,9 +302,27 @@ export function useCloudSync({
     }
   }, [doSync, refreshSyncState]);
 
-  // Startup check — chạy 1 lần khi enabled chuyển true.
+  // Track Firebase auth UID — logout/login cùng app session phải trigger
+  // startup check lại (nếu không → flow "logout → xóa DB → login" miss sync).
+  const [authUid, setAuthUid] = useState<string | null>(
+    auth.currentUser?.uid ?? null,
+  );
+  useEffect(() => {
+    const unsub = auth.onAuthStateChanged((user) => {
+      setAuthUid(user?.uid ?? null);
+    });
+    return () => unsub();
+  }, []);
+
+  // Startup check — chạy MỖI LẦN login (kể cả cùng user, sau logout).
+  // Reset ref trên logout → login tiếp theo re-run.
   useEffect(() => {
     if (!enabled) return;
+    if (!authUid) {
+      startupDoneRef.current = false;
+      setIsStartupPhase(true);
+      return;
+    }
     if (startupDoneRef.current) return;
     startupDoneRef.current = true;
     void (async () => {
@@ -297,7 +332,7 @@ export function useCloudSync({
         setIsStartupPhase(false);
       }
     })();
-  }, [enabled, doStartupCheck]);
+  }, [enabled, authUid, doStartupCheck]);
 
   // Listen sync-phase events từ Rust backend — update syncPhase để UI render text đúng.
   useEffect(() => {
