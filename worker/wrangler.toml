@@ -1,0 +1,13 @@
+name = "thongkeshopee-sync"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+
+[[r2_buckets]]
+binding = "DB_BUCKET"
+bucket_name = "thongkeshopee-db"
+
+[vars]
+FIREBASE_PROJECT_ID = "thongkeshopee-62d61"
+
+# Secrets (set via: wrangler secret put <name>):
+#   ADMIN_UIDS — comma-separated Firebase UIDs có quyền admin

@@ -3,11 +3,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { auth } from "../lib/firebase";
 import { invoke } from "../lib/tauri";
 import {
-  driveMetadata,
-  drivePullMergePush,
-  driveUploadDb,
   machineFingerprint,
-} from "../lib/drive";
+  syncMetadata,
+  syncPullMergePush,
+  syncUploadDb,
+} from "../lib/sync";
 
 export type SyncStatus =
   | "checking"
@@ -30,7 +30,7 @@ interface SyncStateDto {
   last_error: string | null;
 }
 
-interface UseDriveSyncResult {
+interface UseCloudSyncResult {
   status: SyncStatus;
   /// True từ lúc hook được mount đến khi startup check hoàn tất lần đầu.
   /// App.tsx dùng để chặn UI splash suốt startup kể cả khi status chuyển "syncing".
@@ -43,7 +43,7 @@ interface UseDriveSyncResult {
   forceSync: () => Promise<void>;
 }
 
-interface UseDriveSyncOptions {
+interface UseCloudSyncOptions {
   mutationVersion: number;
   enabled: boolean;
   /// Gọi sau mỗi lần sync thành công (merge có thể đã thêm row từ remote
@@ -64,11 +64,11 @@ function backoffFor(attempt: number): number {
 
 const ACTIVITY_EVENTS = ["mousedown", "keydown", "wheel", "touchstart"] as const;
 
-export function useDriveSync({
+export function useCloudSync({
   mutationVersion,
   enabled,
   onRemoteApplied,
-}: UseDriveSyncOptions): UseDriveSyncResult {
+}: UseCloudSyncOptions): UseCloudSyncResult {
   const [status, setStatus] = useState<SyncStatus>(() =>
     typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "checking",
   );
@@ -131,7 +131,7 @@ export function useDriveSync({
     try {
       const idToken = await current.getIdToken(false);
       const [metadata, localFp, beforeSync] = await Promise.all([
-        driveMetadata(idToken),
+        syncMetadata(idToken),
         machineFingerprint(),
         refreshSyncState(),
       ]);
@@ -142,7 +142,7 @@ export function useDriveSync({
       const remoteChanged =
         (metadata.exists ?? false) && remoteMtime > storedRemoteMtime;
       const differentMachine = remoteFp === null ? true : remoteFp !== localFp;
-      // Fresh install: local chưa có mutation nào (changeId=0) + Drive đã có
+      // Fresh install: local chưa có mutation nào (changeId=0) + R2 đã có
       // data → BẮT BUỘC pull-merge-push bất kể fingerprint. Không dùng upload
       // vì sẽ đè DB rỗng lên remote (Rust-side cũng reject, đây là defensive
       // FE để UX tốt hơn: chạy merge thẳng thay vì fail error).
@@ -157,14 +157,14 @@ export function useDriveSync({
         remoteChanged,
         differentMachine,
         needMerge,
-        action: needMerge ? "drivePullMergePush" : "driveUploadDb",
+        action: needMerge ? "syncPullMergePush" : "syncUploadDb",
         changeId: beforeSync.changeId,
         lastUploadedChangeId: beforeSync.lastUploadedChangeId,
       });
 
       const res = needMerge
-        ? await drivePullMergePush(idToken)
-        : await driveUploadDb(idToken, metadata.exists ?? false);
+        ? await syncPullMergePush(idToken)
+        : await syncUploadDb(idToken, metadata.exists ?? false);
       setLastSyncAt(new Date(res.last_modified_ms));
 
       const state = await refreshSyncState();
@@ -216,9 +216,9 @@ export function useDriveSync({
     debounceRef.current = timerId;
   }, [doSync]);
 
-  /// Startup check: kiểm tra metadata Drive → nếu có dirty local HOẶC
-  /// remote mới + khác máy → chạy doSync (pull-merge-push). Merge chạy trong
-  /// cùng connection nên không cần restart.
+  /// Startup check: kiểm tra metadata R2 → nếu có dirty local HOẶC remote mới
+  /// + khác máy → chạy doSync (pull-merge-push). Merge chạy trong cùng
+  /// connection nên không cần restart.
   const doStartupCheck = useCallback(async (): Promise<void> => {
     const current = auth.currentUser;
     if (!current) return;
@@ -233,7 +233,7 @@ export function useDriveSync({
         current.getIdToken(false),
         machineFingerprint(),
       ]);
-      const remote = await driveMetadata(idToken);
+      const remote = await syncMetadata(idToken);
 
       const syncState = await refreshSyncState();
 

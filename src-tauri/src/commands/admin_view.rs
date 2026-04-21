@@ -1,8 +1,8 @@
 //! Admin-only: xem DB của user khác (Phase B).
 //!
-//! Flow: admin gọi `admin_view_user_db(target_local_part, target_uid)` →
-//! Apps Script `downloadForUser` verify admin + trả base64 → Rust decode và
-//! ghi vào `app_data_dir/admin_view/<uid>.db` → mở connection read-only →
+//! Flow: admin gọi `admin_view_user_db(target_uid, target_local_part, target_email)` →
+//! Worker `/admin/download?uid=<uid>` verify admin + trả base64 → Rust decode
+//! và ghi vào `app_data_dir/admin_view/<uid>.db` → mở connection read-only →
 //! swap `DbState` sang connection mới (connection cũ drop, handles release).
 //!
 //! Khi admin exit → `admin_exit_view_user_db` reopen DB gốc (`resolve_db_path`)
@@ -11,9 +11,9 @@
 //! Safety:
 //! - Mở read-only (`SQLITE_OPEN_READ_ONLY`) → mọi mutation command sẽ fail
 //!   với `SQLITE_READONLY` nếu FE không tắt nút — 2 lớp bảo vệ.
-//! - Drive sync PHẢI được tắt ở FE (`useDriveSync({ enabled: false })`) trong
+//! - Cloud sync PHẢI được tắt ở FE (`useCloudSync({ enabled: false })`) trong
 //!   lúc view mode — nếu không, dirty flag của DB user khác sẽ trigger upload
-//!   lên Drive của admin.
+//!   lên R2 của admin.
 //! - AdminViewState lưu trong Tauri state (memory). Restart app → state mất
 //!   → `db::setup` load DB gốc như bình thường, không cần cleanup logic.
 
@@ -27,7 +27,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use tokio::fs;
 
-use super::drive::as_download_for_user;
+use super::sync_client;
 use super::{CmdError, CmdResult};
 use crate::db::{DbState, resolve_db_path};
 
@@ -60,23 +60,22 @@ fn admin_view_dir(app: &AppHandle) -> CmdResult<PathBuf> {
 /// Admin-only: download DB của user target về local + swap `DbState` sang
 /// read-only connection. Trả về metadata để FE hiển thị banner.
 ///
-/// Apps Script verify admin server-side (Firestore `users/{uid}.admin == true`),
-/// sanitize `target_local_part` (regex `^[a-z0-9._+-]+$`) và 404 nếu user
-/// target chưa có file Drive.
+/// Worker verify admin qua `ADMIN_UIDS` secret (whitelist Firebase UID),
+/// 403 nếu caller không phải admin, 404 nếu user target chưa có backup trên R2.
 #[tauri::command]
 pub async fn admin_view_user_db(
     app: AppHandle,
     db: State<'_, DbState>,
     view_state: State<'_, AdminViewState>,
-    apps_script_url: String,
+    sync_api_url: String,
     id_token: String,
     target_uid: String,
     target_local_part: String,
     target_email: Option<String>,
 ) -> CmdResult<AdminViewInfo> {
-    // 1. Gọi AS downloadForUser — verify admin + trả base64 + metadata.
+    // 1. Gọi Worker /admin/download?uid=<uid> — verify admin + trả base64 + metadata.
     let (base64, size_bytes, last_modified_ms) =
-        as_download_for_user(&apps_script_url, &id_token, &target_local_part).await?;
+        sync_client::admin_download(&sync_api_url, &id_token, &target_uid).await?;
 
     let bytes = BASE64
         .decode(base64.as_bytes())

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { SyncStatus } from "../hooks/useDriveSync";
+import type { SyncStatus } from "../hooks/useCloudSync";
 
 interface SyncBadgeProps {
   status: SyncStatus;

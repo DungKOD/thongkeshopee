@@ -3,7 +3,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
 import { auth } from "../lib/firebase";
-import { logVideoDownload } from "../lib/drive";
+import { logVideoDownload } from "../lib/video";
 
 /**
  * Tải video từ nhiều nền tảng (TikTok, Douyin, Xiaohongshu, FB, IG, YouTube...).

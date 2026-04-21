@@ -11,7 +11,7 @@ import {
   adminExitViewUserDb,
   adminViewUserDb,
   type AdminViewInfo,
-} from "../lib/drive";
+} from "../lib/sync";
 
 interface AdminViewContextValue {
   /// Info user đang được xem. null = chế độ bình thường (DB của admin).

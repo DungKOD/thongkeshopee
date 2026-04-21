@@ -1,17 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth } from "../lib/firebase";
+import { adminFetchUserList, adminReadUserListCache, type UserListEntry } from "../lib/sync";
 import {
   adminDeleteUserLogRow,
   adminDeleteUserLogSheet,
-  adminFetchUserList,
   adminFetchUserLogSheet,
-  adminReadUserListCache,
   adminReadUserLogCache,
   adminUserLogFetchMeta,
   type AdminFetchMeta,
-  type UserListEntry,
   type VideoLogRow,
-} from "../lib/drive";
+} from "../lib/video";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 const PAGE_SIZE = 100;

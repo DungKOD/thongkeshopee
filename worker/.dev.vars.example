@@ -1,0 +1,3 @@
+# Copy sang .dev.vars cho local dev (wrangler dev). .dev.vars đã gitignore.
+# Production: set qua `wrangler secret put ADMIN_UIDS`.
+ADMIN_UIDS=uid1,uid2
