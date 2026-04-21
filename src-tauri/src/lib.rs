@@ -26,6 +26,7 @@ pub fn run() {
             commands::query::db_ping,
             commands::query::list_days,
             commands::query::list_days_with_rows,
+            commands::query::load_overview,
             commands::query::list_imported_files,
             commands::query::list_click_referrers,
             commands::query::get_order_items_for_row,
@@ -66,6 +67,7 @@ pub fn run() {
             commands::admin_view::admin_view_user_db,
             commands::admin_view::admin_exit_view_user_db,
             commands::admin_view::admin_view_state_get,
+            commands::screenshot::save_png,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

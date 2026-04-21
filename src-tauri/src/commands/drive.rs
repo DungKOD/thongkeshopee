@@ -3,11 +3,15 @@
 //! Frontend lấy Firebase ID token từ JS SDK, pass vào các command dưới đây.
 //! Apps Script verify token → thao tác Drive dưới tài khoản owner.
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use md5::{Digest, Md5};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -16,6 +20,50 @@ use tokio::fs;
 
 use super::{CmdError, CmdResult};
 use crate::db::DbState;
+
+/// Magic bytes đầu file SQLite — "SQLite format 3\0". Dùng cho backward compat
+/// detection khi download: file cũ (uncompressed) bắt đầu bằng magic này,
+/// file mới (gzipped) bắt đầu bằng `1f 8b`.
+const SQLITE_MAGIC: [u8; 6] = [0x53, 0x51, 0x4C, 0x69, 0x74, 0x65];
+/// Magic bytes đầu file gzip.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// Gzip compress với level 3 (fast) — cân bằng CPU/ratio. SQLite có nhiều
+/// repetition (sub_ids, index padding, schema text) → nén tỉ lệ ~3-4×.
+fn gzip_compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::with_capacity(input.len() / 3), Compression::new(3));
+    encoder.write_all(input)?;
+    encoder.finish()
+}
+
+/// Detect magic + decompress nếu cần. Trả raw SQLite bytes.
+/// Backward compat: bản DB cũ trên Drive (uncompressed) vẫn đọc được.
+fn gunzip_if_needed(input: &[u8]) -> CmdResult<Vec<u8>> {
+    if input.len() >= 2 && input[0..2] == GZIP_MAGIC {
+        let mut decoder = GzDecoder::new(input);
+        let mut out = Vec::with_capacity(input.len() * 3);
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|e| CmdError::msg(format!("gunzip: {e}")))?;
+        return Ok(out);
+    }
+    if input.len() >= SQLITE_MAGIC.len() && input[0..SQLITE_MAGIC.len()] == SQLITE_MAGIC {
+        return Ok(input.to_vec());
+    }
+    // Dump 16 bytes đầu dưới dạng hex để debug — nguồn gốc có thể là file
+    // truncate, base64 partial, hoặc Apps Script trả wrapper lạ.
+    let head_hex: String = input
+        .iter()
+        .take(16)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(CmdError::msg(format!(
+        "payload không phải SQLite/gzip — size={} bytes, head=[{}]",
+        input.len(),
+        head_hex,
+    )))
+}
 
 /// Timeout mặc định cho mọi HTTP call tới Apps Script.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -159,6 +207,13 @@ pub struct DriveUploadResult {
 #[derive(Debug, Serialize)]
 pub struct SyncState {
     pub dirty: bool,
+    /// Mutation counter — tăng mỗi lần ghi DB. =0 nghĩa là DB **fresh**
+    /// (chưa có mutation nào từ install này) → FE dùng để detect scenario
+    /// "reinstall trên máy cũ" và BẮT BUỘC pull-merge-push thay vì upload đè.
+    #[serde(rename = "changeId")]
+    pub change_id: i64,
+    #[serde(rename = "lastUploadedChangeId")]
+    pub last_uploaded_change_id: i64,
     pub last_synced_at_ms: Option<i64>,
     pub last_synced_remote_mtime_ms: Option<i64>,
     pub last_error: Option<String>,
@@ -284,23 +339,28 @@ pub async fn drive_metadata(
 pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
     let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let row = conn.query_row(
-        "SELECT dirty, last_synced_at_ms, last_synced_remote_mtime_ms, last_error
+        "SELECT dirty, change_id, last_uploaded_change_id,
+                last_synced_at_ms, last_synced_remote_mtime_ms, last_error
          FROM sync_state WHERE id = 1",
         [],
         |r| {
             Ok((
                 r.get::<_, i64>(0)? != 0,
-                r.get::<_, Option<i64>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         },
     )?;
     Ok(SyncState {
         dirty: row.0,
-        last_synced_at_ms: row.1,
-        last_synced_remote_mtime_ms: row.2,
-        last_error: row.3,
+        change_id: row.1,
+        last_uploaded_change_id: row.2,
+        last_synced_at_ms: row.3,
+        last_synced_remote_mtime_ms: row.4,
+        last_error: row.5,
     })
 }
 
@@ -326,6 +386,7 @@ pub async fn drive_upload_db(
     db: State<'_, DbState>,
     apps_script_url: String,
     id_token: String,
+    remote_exists: bool,
 ) -> CmdResult<DriveUploadResult> {
     let _ = app.emit("sync-phase", "uploading");
     let snapshot_path = app
@@ -339,24 +400,49 @@ pub async fn drive_upload_db(
 
     // VACUUM INTO — SQLite tạo clean copy không có WAL.
     // Đồng thời đọc change_id tại thời điểm snapshot để CAS sau upload.
+    // DEFENSIVE GUARD: nếu `change_id = 0 AND last_uploaded_change_id = 0`,
+    // DB là fresh (reinstall chưa có mutation) → reject upload để không đè
+    // data có sẵn trên Drive. FE có trách nhiệm route sang pull-merge-push.
     let change_id_at_snapshot: i64 = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        let (change_id, last_uploaded): (i64, i64) = conn.query_row(
+            "SELECT change_id, last_uploaded_change_id FROM sync_state WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // Chặn case duy nhất gây mất data: local fresh (chưa có mutation nào
+        // từ install này) + remote ĐÃ có data trên Drive → upload sẽ đè mất
+        // backup cũ. User mới hoàn toàn (remote_exists=false) vẫn upload được
+        // để khởi tạo file trên Drive.
+        if change_id == 0 && last_uploaded == 0 && remote_exists {
+            return Err(CmdError::msg(
+                "DB fresh + Drive đã có data — route sang drive_pull_merge_push để restore, tránh đè.",
+            ));
+        }
         let path_str = snapshot_path
             .to_str()
             .ok_or_else(|| CmdError::msg("snapshot path không phải UTF-8"))?;
         conn.execute("VACUUM INTO ?1", params![path_str])
             .map_err(CmdError::from)?;
-        conn.query_row(
-            "SELECT change_id FROM sync_state WHERE id = 1",
-            [],
-            |r| r.get::<_, i64>(0),
-        )?
+        change_id
     };
 
     let bytes = fs::read(&snapshot_path).await.map_err(CmdError::from)?;
+    let raw_len = bytes.len();
     let mtime_ms = now_ms();
     let fingerprint = machine_fingerprint_raw();
-    let base64 = BASE64.encode(&bytes);
+
+    // Gzip trước khi base64 — SQLite nén ~3-4× → giảm request payload qua
+    // Apps Script (giới hạn 50MB/request). Level 3 = fast, lợi nhất cho DB.
+    let gzipped = gzip_compress(&bytes)
+        .map_err(|e| CmdError::msg(format!("gzip: {e}")))?;
+    eprintln!(
+        "drive upload: raw={} KB → gzipped={} KB ({:.1}%)",
+        raw_len / 1024,
+        gzipped.len() / 1024,
+        (gzipped.len() as f64 / raw_len.max(1) as f64) * 100.0,
+    );
+    let base64 = BASE64.encode(&gzipped);
 
     let res = call_apps_script(
         &apps_script_url,
@@ -418,9 +504,18 @@ pub async fn drive_download_db(
     let base64 = res
         .base64_data
         .ok_or_else(|| CmdError::msg("missing base64Data"))?;
-    let bytes = BASE64
+    let raw_payload = BASE64
         .decode(base64.as_bytes())
         .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
+
+    // Auto-detect gzip vs uncompressed (backward compat cho backup cũ chưa
+    // nén trên Drive). Trả raw SQLite bytes để ghi pending file.
+    let bytes = gunzip_if_needed(&raw_payload)?;
+    eprintln!(
+        "drive_download_db: payload={} KB → sqlite={} KB",
+        raw_payload.len() / 1024,
+        bytes.len() / 1024,
+    );
 
     let target = pending_db_path(&app)?;
     if let Some(parent) = target.parent() {
@@ -445,6 +540,7 @@ pub async fn drive_apply_pending(app: AppHandle) -> CmdResult<bool> {
 /// Sync version dùng trong `tauri::Builder.setup()` — chạy TRƯỚC `db::setup`.
 /// Nếu có file pending → backup live + rename pending → live. Không lỗi nếu không có pending.
 pub fn apply_pending_sync(app: &AppHandle) -> anyhow::Result<bool> {
+    use rusqlite::Connection;
     use std::fs as std_fs;
 
     let base = app
@@ -455,6 +551,24 @@ pub fn apply_pending_sync(app: &AppHandle) -> anyhow::Result<bool> {
     if !pending.exists() {
         return Ok(false);
     }
+
+    // Validate pending DB integrity TRƯỚC khi swap — tránh file corrupt
+    // (download dở, gzip partial, disk error) làm app crash ở startup.
+    // Nếu fail → xóa pending, giữ live DB cũ, báo lỗi.
+    {
+        let conn = Connection::open(&pending)
+            .map_err(|e| anyhow::anyhow!("mở pending DB thất bại: {e}"))?;
+        let result: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("integrity_check failed: {e}"))?;
+        if result != "ok" {
+            let _ = std_fs::remove_file(&pending);
+            anyhow::bail!(
+                "pending DB corrupt ({}), đã xóa — giữ live DB cũ an toàn",
+                result
+            );
+        }
+    } // drop connection trước rename
 
     let live = crate::db::resolve_db_path(app)?;
 
@@ -658,6 +772,7 @@ pub async fn drive_pull_merge_push(
     apps_script_url: String,
     id_token: String,
 ) -> CmdResult<DriveUploadResult> {
+    eprintln!("=== drive_pull_merge_push: START ===");
     // 1. Metadata check. Nếu remote chưa tồn tại → skip pull, chỉ upload.
     let meta = call_apps_script(
         &apps_script_url,
@@ -665,6 +780,10 @@ pub async fn drive_pull_merge_push(
     )
     .await?;
     let remote_exists = meta.exists.unwrap_or(false);
+    eprintln!(
+        "  metadata: exists={}, size={:?}, mtime={:?}",
+        remote_exists, meta.size_bytes, meta.last_modified
+    );
 
     // 2. Download remote → temp path (nếu tồn tại).
     let temp_path_opt: Option<PathBuf> = if remote_exists {
@@ -677,9 +796,16 @@ pub async fn drive_pull_merge_push(
         let base64 = dl
             .base64_data
             .ok_or_else(|| CmdError::msg("missing base64Data"))?;
-        let bytes = BASE64
+        let raw_payload = BASE64
             .decode(base64.as_bytes())
             .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
+        // Auto-detect gzip vs uncompressed (backward compat với backup cũ).
+        let bytes = gunzip_if_needed(&raw_payload)?;
+        eprintln!(
+            "  download: payload={} KB → sqlite={} KB",
+            raw_payload.len() / 1024,
+            bytes.len() / 1024,
+        );
         let temp_path = app
             .path()
             .app_data_dir()
@@ -719,6 +845,47 @@ pub async fn drive_pull_merge_push(
 
             // Merge + apply tombstones trong 1 transaction. DETACH sau khi commit/rollback.
             let merge_res: Result<(), CmdError> = (|| {
+                // Count trước merge — để biết mức độ trống của main.
+                let before_days: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM main.days",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let remote_days: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM remote.days",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let remote_clicks: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM remote.raw_shopee_clicks",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let remote_orders: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM remote.raw_shopee_order_items",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let remote_fb: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM remote.raw_fb_ads",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let remote_manual: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM remote.manual_entries",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let remote_tombstones: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM remote.tombstones",
+                    [],
+                    |r| r.get(0),
+                )?;
+                eprintln!(
+                    "  pre-merge: local days={}, remote days={}, clicks={}, orders={}, fb_ads={}, manual={}, tombstones={}",
+                    before_days, remote_days, remote_clicks, remote_orders, remote_fb, remote_manual, remote_tombstones,
+                );
+
                 let tx = conn.transaction().map_err(CmdError::from)?;
                 merge_remote_into_local(&tx)?;
                 apply_tombstones(&tx)?;
@@ -734,6 +901,37 @@ pub async fn drive_pull_merge_push(
                 )
                 .map_err(CmdError::from)?;
                 tx.commit().map_err(CmdError::from)?;
+
+                // Count sau merge + apply_tombstones.
+                let after_days: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM main.days",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let after_clicks: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM main.raw_shopee_clicks",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let after_orders: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM main.raw_shopee_order_items",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let after_fb: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM main.raw_fb_ads",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let after_manual: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM main.manual_entries",
+                    [],
+                    |r| r.get(0),
+                )?;
+                eprintln!(
+                    "  post-merge: days={}, clicks={}, orders={}, fb_ads={}, manual={}",
+                    after_days, after_clicks, after_orders, after_fb, after_manual,
+                );
                 Ok(())
             })();
 
@@ -768,9 +966,21 @@ pub async fn drive_pull_merge_push(
     // 5. Upload snapshot.
     let _ = app.emit("sync-phase", "uploading");
     let bytes = fs::read(&snapshot_path).await.map_err(CmdError::from)?;
+    let raw_len = bytes.len();
     let mtime_ms = now_ms();
     let fingerprint = machine_fingerprint_raw();
-    let base64 = BASE64.encode(&bytes);
+
+    // Gzip trước khi base64 — SQLite nén ~3-4× → giảm request payload qua
+    // Apps Script (giới hạn 50MB/request). Level 3 = fast, lợi nhất cho DB.
+    let gzipped = gzip_compress(&bytes)
+        .map_err(|e| CmdError::msg(format!("gzip: {e}")))?;
+    eprintln!(
+        "drive upload: raw={} KB → gzipped={} KB ({:.1}%)",
+        raw_len / 1024,
+        gzipped.len() / 1024,
+        (gzipped.len() as f64 / raw_len.max(1) as f64) * 100.0,
+    );
+    let base64 = BASE64.encode(&gzipped);
 
     let res = call_apps_script(
         &apps_script_url,
@@ -876,16 +1086,30 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
         [],
     )?;
 
-    // 6. manual_entries — UNIQUE(sub_ids, day_date). Local-win (IGNORE nếu trùng key).
+    // 6. manual_entries — UNIQUE(sub_ids, day_date). UPSERT với last-write-wins
+    // theo `updated_at` (ISO8601 → string compare đúng trình tự). Khi cùng key:
+    //   - remote.updated_at > local.updated_at → override fields từ remote
+    //   - remote.updated_at <= local.updated_at → giữ local (không update)
+    // `WHERE true` phân biệt INSERT...SELECT với ON CONFLICT clause (SQLite parser).
     tx.execute(
-        "INSERT OR IGNORE INTO main.manual_entries
+        "INSERT INTO main.manual_entries
          (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
           override_clicks, override_spend, override_cpc, override_orders, override_commission,
           notes, created_at, updated_at)
          SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
                 override_clicks, override_spend, override_cpc, override_orders, override_commission,
                 notes, created_at, updated_at
-         FROM remote.manual_entries",
+         FROM remote.manual_entries WHERE true
+         ON CONFLICT(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date) DO UPDATE SET
+           display_name        = excluded.display_name,
+           override_clicks     = excluded.override_clicks,
+           override_spend      = excluded.override_spend,
+           override_cpc        = excluded.override_cpc,
+           override_orders     = excluded.override_orders,
+           override_commission = excluded.override_commission,
+           notes               = excluded.notes,
+           updated_at          = excluded.updated_at
+         WHERE excluded.updated_at > manual_entries.updated_at",
         [],
     )?;
 

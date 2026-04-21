@@ -35,4 +35,5 @@ base64 = "0.22"
 md-5 = "0.10"
 machine-uid = "0.5"
 hex = "0.4"
+flate2 = "1"
 

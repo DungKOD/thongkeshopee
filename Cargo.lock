@@ -4464,6 +4464,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "flate2",
  "futures-util",
  "hex",
  "machine-uid",

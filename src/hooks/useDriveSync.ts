@@ -21,6 +21,10 @@ export type SyncPhase = "downloading" | "merging" | "uploading" | null;
 
 interface SyncStateDto {
   dirty: boolean;
+  /** Counter mutation — = 0 nghĩa là DB fresh (chưa edit gì từ install này).
+   *  Dùng detect reinstall-scenario để tránh upload DB rỗng đè remote. */
+  changeId: number;
+  lastUploadedChangeId: number;
   last_synced_at_ms: number | null;
   last_synced_remote_mtime_ms: number | null;
   last_error: string | null;
@@ -138,11 +142,29 @@ export function useDriveSync({
       const remoteChanged =
         (metadata.exists ?? false) && remoteMtime > storedRemoteMtime;
       const differentMachine = remoteFp === null ? true : remoteFp !== localFp;
-      const needMerge = remoteChanged && differentMachine;
+      // Fresh install: local chưa có mutation nào (changeId=0) + Drive đã có
+      // data → BẮT BUỘC pull-merge-push bất kể fingerprint. Không dùng upload
+      // vì sẽ đè DB rỗng lên remote (Rust-side cũng reject, đây là defensive
+      // FE để UX tốt hơn: chạy merge thẳng thay vì fail error).
+      const localFresh =
+        beforeSync.changeId === 0 && beforeSync.lastUploadedChangeId === 0;
+      const freshWithRemote = localFresh && (metadata.exists ?? false);
+      const needMerge = freshWithRemote || (remoteChanged && differentMachine);
+      console.log("[sync] doSync decision:", {
+        localFresh,
+        "metadata.exists": metadata.exists,
+        freshWithRemote,
+        remoteChanged,
+        differentMachine,
+        needMerge,
+        action: needMerge ? "drivePullMergePush" : "driveUploadDb",
+        changeId: beforeSync.changeId,
+        lastUploadedChangeId: beforeSync.lastUploadedChangeId,
+      });
 
       const res = needMerge
         ? await drivePullMergePush(idToken)
-        : await driveUploadDb(idToken);
+        : await driveUploadDb(idToken, metadata.exists ?? false);
       setLastSyncAt(new Date(res.last_modified_ms));
 
       const state = await refreshSyncState();
@@ -217,6 +239,7 @@ export function useDriveSync({
 
       // Case 1: remote chưa tồn tại → doSync sẽ skip pull + upload lần đầu.
       if (!remote.exists) {
+        console.log("[sync] startupCheck: remote không tồn tại → doSync (upload init)");
         await doSync();
         return;
       }
@@ -229,6 +252,16 @@ export function useDriveSync({
       const differentMachine =
         remoteFp === null ? true : remoteFp !== localFp;
 
+      console.log("[sync] doStartupCheck state:", {
+        "remote.exists": remote.exists,
+        dirty: syncState.dirty,
+        changeId: syncState.changeId,
+        lastUploadedChangeId: syncState.lastUploadedChangeId,
+        remoteChanged,
+        differentMachine,
+        willSync: syncState.dirty || (remoteChanged && differentMachine),
+      });
+
       // Case 2: dirty local HOẶC remote mới từ máy khác → pull-merge-push.
       if (syncState.dirty || (remoteChanged && differentMachine)) {
         await doSync();
@@ -236,6 +269,7 @@ export function useDriveSync({
       }
 
       // Case 3: đã đồng bộ, không cần làm gì.
+      console.log("[sync] startupCheck: không cần sync (đã đồng bộ)");
       retryAttemptRef.current = 0;
       setStatus("idle");
     } catch (e) {

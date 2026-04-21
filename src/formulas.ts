@@ -7,6 +7,46 @@ import {
 
 const safeDiv = (a: number, b: number) => (b === 0 ? 0 : a / b);
 
+/**
+ * Nguồn data muốn aggregate:
+ * - `all`: tất cả row (FB + Shopee)
+ * - `shopee_only`: chỉ row có Shopee data (hasShopeeOrders || hasShopeeClicks)
+ *
+ * Công thức profit KHÔNG đổi theo source — chỉ filter rows vào aggregate.
+ */
+export type SourceFilter = "all" | "shopee_only";
+
+/** Predicate: row có thuộc source filter không. */
+export function rowMatchesSource(row: UiRow, source: SourceFilter): boolean {
+  if (source === "all") return true;
+  if (source === "shopee_only") return row.hasShopeeOrders || row.hasShopeeClicks;
+  return true;
+}
+
+/** Aggregate tổng cho nhiều ngày — mở rộng DayTotals thêm GMV + counters. */
+export type OverviewTotals = DayTotals & {
+  orderValueTotal: number;
+  netCommission: number;
+  daysCount: number;
+  rowsCount: number;
+};
+
+/** 1 sản phẩm sau khi aggregate qua nhiều ngày (key = sub_id tuple). */
+export type AggregatedProductRow = {
+  subIds: readonly string[];
+  displayName: string;
+  adsClicks: number;
+  shopeeClicks: number;
+  totalSpend: number;
+  ordersCount: number;
+  commissionTotal: number;
+  orderValueTotal: number;
+  netCommission: number;
+  profit: number;
+  /** Số ngày sản phẩm có data trong khoảng. */
+  daysActive: number;
+};
+
 /** Row identity dạng string để dùng làm key trong Set/Map. */
 export function uiRowKey(dayDate: string, subIds: readonly string[]): string {
   return `${dayDate}|${subIds.join("\x1f")}`;
@@ -40,31 +80,132 @@ export function computeUiRow(
   return { cpc, conversionRate, orderValue, netCommission, profit, profitMargin };
 }
 
+/**
+ * DayTotals cho 1 ngày = wrapper của `computeOverviewTotals` với input 1 day.
+ * Giữ signature cũ để không đụng callsite DayBlock / VideoRow, nhưng logic
+ * thực chạy qua Overview — sửa công thức 1 chỗ đúng cho tất cả.
+ */
 export function computeUiDayTotals(
   day: UiDay,
   clickSources: Record<string, boolean>,
   fees: ProfitFees,
 ): DayTotals {
+  const t = computeOverviewTotals([day], clickSources, fees, "all");
+  return {
+    clicks: t.clicks,
+    shopeeClicks: t.shopeeClicks,
+    totalSpend: t.totalSpend,
+    orders: t.orders,
+    commission: t.commission,
+    profit: t.profit,
+  };
+}
+
+/**
+ * Aggregate tổng cho nhiều UiDay. Cùng công thức với `computeUiDayTotals`
+ * khi source='all' (đảm bảo Overview = Σ DayBlock totals).
+ *
+ * Source filter:
+ * - `all`: dùng cả ads (spend, clicks) + shopee → profit = net_commission - spend
+ * - `shopee_only`: chỉ row có Shopee data; **bỏ hoàn toàn ads** (spend=0,
+ *   adsClicks=0) → profit = net_commission (thuần hoa hồng affiliate)
+ *
+ * Dùng CHUNG cho: Overview tab, DayBlock totals (1-day wrapper), test validator.
+ */
+export function computeOverviewTotals(
+  days: readonly UiDay[],
+  clickSources: Record<string, boolean>,
+  fees: ProfitFees,
+  source: SourceFilter = "all",
+): OverviewTotals {
   const ratio = netCommissionRatio(fees);
-  return day.rows.reduce<DayTotals>(
-    (acc, r) => {
-      acc.clicks += r.adsClicks ?? 0;
+  const includeAds = source === "all";
+  const acc: OverviewTotals = {
+    clicks: 0,
+    shopeeClicks: 0,
+    totalSpend: 0,
+    orders: 0,
+    commission: 0,
+    profit: 0,
+    orderValueTotal: 0,
+    netCommission: 0,
+    daysCount: 0,
+    rowsCount: 0,
+  };
+  for (const day of days) {
+    let dayContributed = false;
+    for (const r of day.rows) {
+      if (!rowMatchesSource(r, source)) continue;
+      const spend = includeAds ? r.totalSpend ?? 0 : 0;
+      const adsClicks = includeAds ? r.adsClicks ?? 0 : 0;
+      const net = r.commissionTotal * ratio;
+      acc.clicks += adsClicks;
       acc.shopeeClicks += sumFiltered(r.shopeeClicksByReferrer, clickSources);
-      acc.totalSpend += r.totalSpend ?? 0;
+      acc.totalSpend += spend;
       acc.orders += r.ordersCount;
       acc.commission += r.commissionTotal;
-      acc.profit += r.commissionTotal * ratio - (r.totalSpend ?? 0);
-      return acc;
-    },
-    {
-      clicks: 0,
-      shopeeClicks: 0,
-      totalSpend: 0,
-      orders: 0,
-      commission: 0,
-      profit: 0,
-    },
-  );
+      acc.netCommission += net;
+      acc.profit += net - spend;
+      acc.orderValueTotal += r.orderValueTotal;
+      acc.rowsCount += 1;
+      dayContributed = true;
+    }
+    if (dayContributed) acc.daysCount += 1;
+  }
+  return acc;
+}
+
+/**
+ * Aggregate rows theo sub_id tuple qua nhiều ngày. Key = sub_ids joined.
+ * Source filter giống `computeOverviewTotals`: 'shopee_only' → bỏ ads
+ * (spend=0, adsClicks=0) → profit = net_commission.
+ */
+export function aggregateProductRows(
+  days: readonly UiDay[],
+  clickSources: Record<string, boolean>,
+  fees: ProfitFees,
+  source: SourceFilter = "all",
+): AggregatedProductRow[] {
+  const ratio = netCommissionRatio(fees);
+  const includeAds = source === "all";
+  const map = new Map<string, AggregatedProductRow>();
+  for (const day of days) {
+    for (const r of day.rows) {
+      if (!rowMatchesSource(r, source)) continue;
+      const key = r.subIds.join("\x1f");
+      let agg = map.get(key);
+      if (!agg) {
+        agg = {
+          subIds: r.subIds,
+          displayName: r.displayName,
+          adsClicks: 0,
+          shopeeClicks: 0,
+          totalSpend: 0,
+          ordersCount: 0,
+          commissionTotal: 0,
+          orderValueTotal: 0,
+          netCommission: 0,
+          profit: 0,
+          daysActive: 0,
+        };
+        map.set(key, agg);
+      }
+      if (!agg.displayName && r.displayName) agg.displayName = r.displayName;
+      const spend = includeAds ? r.totalSpend ?? 0 : 0;
+      const adsClicks = includeAds ? r.adsClicks ?? 0 : 0;
+      const net = r.commissionTotal * ratio;
+      agg.adsClicks += adsClicks;
+      agg.shopeeClicks += sumFiltered(r.shopeeClicksByReferrer, clickSources);
+      agg.totalSpend += spend;
+      agg.ordersCount += r.ordersCount;
+      agg.commissionTotal += r.commissionTotal;
+      agg.orderValueTotal += r.orderValueTotal;
+      agg.netCommission += net;
+      agg.profit += net - spend;
+      agg.daysActive += 1;
+    }
+  }
+  return Array.from(map.values());
 }
 
 export const fmtVnd = (n: number) =>

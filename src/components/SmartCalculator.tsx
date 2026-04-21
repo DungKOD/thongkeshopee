@@ -166,6 +166,45 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
     }
   }, [isOpen]);
 
+  /** Đưa caret về cuối input + scroll ngang tới cuối — gọi sau mỗi thao tác
+   * programmatic (keypad, ctrl+click, recall) để user luôn thấy chữ số vừa
+   * nhập bên phải. Không áp dụng khi user gõ trực tiếp (browser tự xử lý). */
+  const focusEnd = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.focus();
+    const len = el.value.length;
+    try {
+      el.setSelectionRange(len, len);
+    } catch {
+      /* một số browser reject setSelectionRange cho type=text; ignore */
+    }
+    el.scrollLeft = el.scrollWidth;
+  }, []);
+
+  // Sau mỗi lần expression đổi (kể cả keypad/ctrl+click), schedule scroll
+  // sau render commit để scrollWidth đã cập nhật theo DOM mới.
+  useEffect(() => {
+    if (!isOpen) return;
+    const el = inputRef.current;
+    if (!el) return;
+    // 2×RAF: sau paint để lấy scrollWidth chuẩn.
+    const id1 = requestAnimationFrame(() => {
+      const id2 = requestAnimationFrame(() => {
+        if (inputRef.current) {
+          inputRef.current.scrollLeft = inputRef.current.scrollWidth;
+        }
+      });
+      // Lưu id để có thể cancel trong cleanup
+      (window as unknown as { __sc_raf2?: number }).__sc_raf2 = id2;
+    });
+    return () => {
+      cancelAnimationFrame(id1);
+      const id2 = (window as unknown as { __sc_raf2?: number }).__sc_raf2;
+      if (id2) cancelAnimationFrame(id2);
+    };
+  }, [expression, isOpen]);
+
   // Global mouse tracking cho drag. Chỉ active khi dragState set.
   useEffect(() => {
     if (!dragState) return;
@@ -214,12 +253,12 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
       e.preventDefault();
       e.stopPropagation();
       setExpression((prev) => prev + num);
-      // Visual pulse: focus input để user thấy ngay giá trị đã chèn.
-      inputRef.current?.focus();
+      // Focus + caret end để user thấy số vừa chèn bên phải.
+      focusEnd();
     };
     window.addEventListener("click", handler, true);
     return () => window.removeEventListener("click", handler, true);
-  }, [isOpen]);
+  }, [isOpen, focusEnd]);
 
   const startDrag = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -251,19 +290,19 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
 
   const append = (s: string) => {
     setExpression((e) => e + s);
-    inputRef.current?.focus();
+    focusEnd();
   };
   const clear = () => {
     setExpression("");
-    inputRef.current?.focus();
+    focusEnd();
   };
   const backspace = () => {
     setExpression((e) => e.slice(0, -1));
-    inputRef.current?.focus();
+    focusEnd();
   };
   const recall = (item: HistoryItem) => {
     setExpression(item.expression);
-    inputRef.current?.focus();
+    focusEnd();
   };
   const [confirmClearHistory, setConfirmClearHistory] = useState(false);
   const clearHistory = () => {
@@ -341,10 +380,10 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
                     className="group w-full rounded-md px-2 py-1 text-right transition-colors hover:bg-surface-2/60"
                     title="Click để tính lại"
                   >
-                    <div className="truncate text-[11px] text-white/40 group-hover:text-white/60">
+                    <div className="truncate text-xs text-white/40 group-hover:text-white/60">
                       {h.expression}
                     </div>
-                    <div className="truncate text-sm font-semibold text-shopee-300">
+                    <div className="num-glow truncate text-base font-bold tabular-nums text-shopee-300">
                       = {h.result}
                     </div>
                   </button>
@@ -382,9 +421,9 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
             autoComplete="off"
             inputMode="decimal"
           />
-          <div className="mt-1 flex min-h-[20px] items-center justify-end px-2 text-right">
+          <div className="mt-1 flex min-h-[22px] items-center justify-end px-2 text-right">
             {liveResult && (
-              <span className="text-sm font-semibold text-shopee-300 tabular-nums">
+              <span className="num-hover text-base font-bold tabular-nums text-shopee-300">
                 = {liveResult}
               </span>
             )}

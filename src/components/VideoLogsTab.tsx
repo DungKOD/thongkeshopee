@@ -21,6 +21,55 @@ interface SelectedUser {
   email: string;
 }
 
+// ============================================================
+// Auto-fetch chỉ 1 lần per app session:
+//  - `hasFetchedUsersOnce`: đã fetch user list chưa (mỗi app launch reset).
+//  - `hasFetchedLogsOnce`: set of localPart đã fetch log rồi trong session này.
+// Tab switch / select user lại → chỉ đọc cache DB, KHÔNG gọi backend nữa.
+// User muốn fresh → bấm nút "Tải lại" manual.
+// ============================================================
+let hasFetchedUsersOnce = false;
+const hasFetchedLogsOnce = new Set<string>();
+
+// ============================================================
+// Dedup fetch ở tầng module → chuyển qua lại tab mount/unmount nhiều lần
+// chỉ gọi backend 1 lần cho mỗi resource đang in-flight. Mọi caller đồng
+// thời `await` CÙNG 1 promise → không spam Google Sheet / Apps Script.
+// ============================================================
+
+let inflightUsersFetch: Promise<UserListEntry[]> | null = null;
+const inflightLogFetches = new Map<string, Promise<void>>();
+
+async function dedupedFetchUsers(idToken: string): Promise<UserListEntry[]> {
+  if (inflightUsersFetch) return inflightUsersFetch;
+  inflightUsersFetch = (async () => {
+    try {
+      const fresh = await adminFetchUserList(idToken);
+      return JSON.parse(fresh.users_json) as UserListEntry[];
+    } finally {
+      inflightUsersFetch = null;
+    }
+  })();
+  return inflightUsersFetch;
+}
+
+async function dedupedFetchUserLog(
+  idToken: string,
+  localPart: string,
+): Promise<void> {
+  const existing = inflightLogFetches.get(localPart);
+  if (existing) return existing;
+  const p = (async () => {
+    try {
+      await adminFetchUserLogSheet(idToken, localPart);
+    } finally {
+      inflightLogFetches.delete(localPart);
+    }
+  })();
+  inflightLogFetches.set(localPart, p);
+  return p;
+}
+
 function fmtFetchedAt(ms: number): string {
   const d = new Date(ms);
   const pad = (n: number) => n.toString().padStart(2, "0");
@@ -49,44 +98,69 @@ export function VideoLogsTab() {
 
   const sentinelRef = useRef<HTMLDivElement | null>(null);
 
-  // Stale-while-revalidate: đọc cache DB trước (render ngay nếu có),
-  // sau đó fetch fresh từ AS qua background → replace cache → re-render.
-  const loadUsers = useCallback(async () => {
+  // Unmount guard — tab switch trong khi in-flight không setState trên dead instance.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // 1) Cache DB — đọc instant, không delay. Render được gì hiển nấy.
+  const loadUsersCache = useCallback(async () => {
+    try {
+      const cached = await adminReadUserListCache();
+      if (cached && mountedRef.current) {
+        const list: UserListEntry[] = JSON.parse(cached.users_json);
+        setUsers(list.filter((u) => u.localPart));
+      }
+    } catch {
+      /* cache miss/parse OK — caller tự fetch fresh nếu cần */
+    }
+  }, []);
+
+  // 2) Fetch fresh từ AS (deduped). Manual refresh button gọi thẳng hàm này.
+  const loadUsersFresh = useCallback(async () => {
     const current = auth.currentUser;
     if (!current) {
       setUsersError("Chưa đăng nhập");
       return;
     }
-
-    // 1. Cache first — render instant nếu đã từng fetch.
-    try {
-      const cached = await adminReadUserListCache();
-      if (cached) {
-        const list: UserListEntry[] = JSON.parse(cached.users_json);
-        setUsers(list.filter((u) => u.localPart));
-      }
-    } catch {
-      /* cache miss/parse OK — tiếp tục fetch */
+    if (mountedRef.current) {
+      setUsersLoading(true);
+      setUsersError(null);
     }
-
-    // 2. Fetch fresh background → update cache + UI.
-    setUsersLoading(true);
-    setUsersError(null);
     try {
       const idToken = await current.getIdToken(false);
-      const fresh = await adminFetchUserList(idToken);
-      const list: UserListEntry[] = JSON.parse(fresh.users_json);
-      setUsers(list.filter((u) => u.localPart));
+      const list = await dedupedFetchUsers(idToken);
+      if (mountedRef.current) {
+        setUsers(list.filter((u) => u.localPart));
+      }
     } catch (e) {
-      setUsersError((e as Error).message);
+      if (mountedRef.current) setUsersError((e as Error).message);
     } finally {
-      setUsersLoading(false);
+      if (mountedRef.current) setUsersLoading(false);
     }
   }, []);
 
+  // Manual refresh (button "Tải lại danh sách user") — fire ngay.
+  const loadUsers = useCallback(async () => {
+    await loadUsersCache();
+    hasFetchedUsersOnce = true;
+    await loadUsersFresh();
+  }, [loadUsersCache, loadUsersFresh]);
+
+  // Auto-load khi mount: cache đọc ngay. Fresh fetch CHỈ lần đầu tiên mỗi
+  // app session — tab switch ra vào không gây fetch lại. User muốn fresh →
+  // bấm nút refresh.
   useEffect(() => {
-    void loadUsers();
-  }, [loadUsers]);
+    void loadUsersCache();
+    if (!hasFetchedUsersOnce) {
+      hasFetchedUsersOnce = true;
+      void loadUsersFresh();
+    }
+  }, [loadUsersCache, loadUsersFresh]);
 
   const filteredUsers = useMemo(() => {
     if (!users) return [];
@@ -111,21 +185,24 @@ export function VideoLogsTab() {
     return rows.length;
   }, []);
 
-  // Fetch Sheet → replace cache → đọc lại trang đầu.
+  // Fetch Sheet (deduped per localPart) → replace cache → đọc lại trang đầu.
+  // Nếu cùng 1 user đang fetch từ instance trước → reuse promise, không spam.
   const fetchFromSheet = useCallback(
     async (localPart: string) => {
       const current = auth.currentUser;
       if (!current) return;
-      setFetching(true);
-      setFetchError(null);
+      if (mountedRef.current) {
+        setFetching(true);
+        setFetchError(null);
+      }
       try {
         const idToken = await current.getIdToken(false);
-        await adminFetchUserLogSheet(idToken, localPart);
-        await readCacheFirstPage(localPart);
+        await dedupedFetchUserLog(idToken, localPart);
+        if (mountedRef.current) await readCacheFirstPage(localPart);
       } catch (e) {
-        setFetchError((e as Error).message);
+        if (mountedRef.current) setFetchError((e as Error).message);
       } finally {
-        setFetching(false);
+        if (mountedRef.current) setFetching(false);
       }
     },
     [readCacheFirstPage],
@@ -145,7 +222,7 @@ export function VideoLogsTab() {
       setLogsError(null);
       setFetchError(null);
 
-      // 1. Cache DB trước — render ngay (dù có hay không).
+      // 1. Cache DB — render ngay.
       setInitialLoading(true);
       try {
         await readCacheFirstPage(u.localPart);
@@ -155,15 +232,21 @@ export function VideoLogsTab() {
         setInitialLoading(false);
       }
 
-      // 2. Luôn fetch Sheet background → update cache + re-render.
-      // (Không còn phụ thuộc cache rỗng — mỗi lần select đều revalidate.)
-      void fetchFromSheet(u.localPart);
+      // 2. Auto-fetch từ Sheet CHỈ lần đầu tiên cho user này trong app session.
+      // Chọn lại user cũ → không fetch lại. User muốn fresh → bấm "Tải lại".
+      if (!hasFetchedLogsOnce.has(u.localPart)) {
+        hasFetchedLogsOnce.add(u.localPart);
+        void fetchFromSheet(u.localPart);
+      }
     },
     [readCacheFirstPage, fetchFromSheet],
   );
 
+  // Manual reload button — fire thẳng, đánh dấu đã fetch để select lại
+  // không auto-fetch dư.
   const refetch = useCallback(() => {
     if (!selected) return;
+    hasFetchedLogsOnce.add(selected.localPart);
     void fetchFromSheet(selected.localPart);
   }, [selected, fetchFromSheet]);
 
@@ -357,7 +440,12 @@ export function VideoLogsTab() {
               </span>
             </div>
           ) : usersError ? (
-            <div className="p-3 text-xs text-red-300">{usersError}</div>
+            <div
+              className="truncate p-3 text-xs text-red-300"
+              title={usersError}
+            >
+              {usersError}
+            </div>
           ) : filteredUsers.length === 0 ? (
             <div className="p-3 text-center text-xs text-white/50">
               {users === null
@@ -386,12 +474,12 @@ export function VideoLogsTab() {
                       </span>
                       <div className="min-w-0 flex-1">
                         <div
-                          className="truncate text-white/90"
+                          className="truncate whitespace-nowrap text-white/90"
                           title={u.email ?? ""}
                         >
                           {u.email ?? u.localPart}
                         </div>
-                        <div className="flex items-center gap-1 text-[10px] text-white/40">
+                        <div className="flex items-center gap-1 whitespace-nowrap text-[10px] text-white/40">
                           {u.premium && (
                             <span className="rounded bg-green-900/40 px-1 text-green-300">
                               premium

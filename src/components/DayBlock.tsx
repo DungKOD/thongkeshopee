@@ -1,14 +1,19 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { UiDay, UiRow } from "../types";
 import { computeUiDayTotals, fmtDate, fmtInt, fmtVnd, uiRowKey } from "../formulas";
 import { useSettings } from "../hooks/useSettings";
+import {
+  captureElementToBlob,
+  prefetchFontEmbedCSS,
+} from "../lib/screenshot";
 import { VideoRow } from "./VideoRow";
 import { ProductDetailDialog } from "./ProductDetailDialog";
+import { DayScreenshotDialog } from "./DayScreenshotDialog";
 
 interface DayBlockProps {
   day: UiDay;
-  pendingDayDeletes: Set<string>;
-  pendingRowDeletes: Set<string>;
+  pendingDayDeletes: ReadonlySet<string>;
+  pendingRowDeletes: ReadonlyMap<string, unknown>;
   onToggleDayDelete: (date: string) => void;
   onToggleRowDelete: (row: UiRow) => void;
   onEditRow: (row: UiRow) => void;
@@ -24,6 +29,7 @@ const ROI_TOOLTIP =
   "VD: -50% nghĩa là lỗ một nửa số tiền đã chi.";
 
 const HEADERS: Array<{ label: string; tooltip?: string }> = [
+  { label: "#" },
   { label: "Sản phẩm" },
   { label: "Click ADS", tooltip: "Tổng click quảng cáo FB (link_clicks)" },
   {
@@ -67,7 +73,33 @@ export function DayBlock({
   readOnly = false,
 }: DayBlockProps) {
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
+  const [capturing, setCapturing] = useState(false);
+  const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
+  const sectionRef = useRef<HTMLElement>(null);
   const { settings } = useSettings();
+
+  const handleScreenshot = async () => {
+    if (!sectionRef.current || capturing) return;
+    setCapturing(true);
+    try {
+      const blob = await captureElementToBlob(sectionRef.current, {
+        pixelRatio: 2,
+        backgroundColor: "#121212",
+      });
+      setScreenshotBlob(blob);
+    } catch (e) {
+      console.error("screenshot failed", e);
+      alert(`Chụp ảnh thất bại: ${String(e)}`);
+    } finally {
+      setCapturing(false);
+    }
+  };
+
+  const handleScreenshotClose = () => {
+    // Clear blob ref — trình duyệt GC giải phóng bộ nhớ ngay; dialog sẽ tự
+    // revoke objectURL trong cleanup effect của nó.
+    setScreenshotBlob(null);
+  };
 
   const totals = computeUiDayTotals(
     day,
@@ -94,9 +126,10 @@ export function DayBlock({
 
   return (
     <section
+      ref={sectionRef}
       className={`mb-6 overflow-hidden rounded-xl shadow-elev-2 transition-shadow hover:shadow-elev-4 ${
         effectiveDayPending ? "bg-surface-2/60" : "bg-surface-2"
-      }`}
+      } ${capturing ? "capture-mode" : ""}`}
     >
       <header className="flex items-center justify-between border-b border-surface-8 px-5 py-3">
         <div className="flex items-center gap-3">
@@ -131,22 +164,43 @@ export function DayBlock({
             </span>
           )}
         </div>
-        {!readOnly && (
+        <div className="capture-hide flex items-center gap-1">
           <button
-            onClick={() => onToggleDayDelete(day.date)}
-            className={`btn-ripple flex h-9 w-9 items-center justify-center rounded-full ${
-              dayPending
-                ? "text-amber-400 hover:bg-amber-500/10"
-                : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
-            }`}
-            title={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
-            aria-label={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
+            onClick={handleScreenshot}
+            onMouseEnter={prefetchFontEmbedCSS}
+            onFocus={prefetchFontEmbedCSS}
+            disabled={capturing || day.rows.length === 0}
+            className="btn-ripple flex h-9 w-9 items-center justify-center rounded-full text-white/60 hover:bg-shopee-500/10 hover:text-shopee-400 disabled:cursor-not-allowed disabled:opacity-40"
+            title={
+              day.rows.length === 0
+                ? "Ngày chưa có dòng"
+                : capturing
+                ? "Đang chụp..."
+                : "Chụp ảnh ngày"
+            }
+            aria-label="Chụp ảnh ngày"
           >
             <span className="material-symbols-rounded">
-              {dayPending ? "undo" : "delete"}
+              {capturing ? "hourglass_empty" : "photo_camera"}
             </span>
           </button>
-        )}
+          {!readOnly && (
+            <button
+              onClick={() => onToggleDayDelete(day.date)}
+              className={`btn-ripple flex h-9 w-9 items-center justify-center rounded-full ${
+                dayPending
+                  ? "text-amber-400 hover:bg-amber-500/10"
+                  : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
+              }`}
+              title={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
+              aria-label={dayPending ? "Khôi phục ngày" : "Đánh dấu xóa ngày"}
+            >
+              <span className="material-symbols-rounded">
+                {dayPending ? "undo" : "delete"}
+              </span>
+            </button>
+          )}
+        </div>
       </header>
 
       <div className="overflow-x-auto">
@@ -154,16 +208,21 @@ export function DayBlock({
           <thead>
             <tr className="border-b-2 border-shopee-500/50 bg-gradient-to-b from-shopee-900/35 to-shopee-900/15 text-shopee-100">
               {HEADERS.map((h, i) => {
-                const isProduct = i === 0;
+                const isIndex = i === 0;
+                const isProduct = i === 1;
+                const isAction = i === HEADERS.length - 1;
+                const alignCls = isIndex
+                  ? "w-12 px-2 text-center"
+                  : isProduct
+                  ? "min-w-[220px] px-4 text-left"
+                  : "px-3 text-center";
                 return (
                   <th
                     key={i}
                     title={h.tooltip}
-                    className={`py-3.5 text-xs font-bold uppercase tracking-wider whitespace-nowrap ${
-                      isProduct
-                        ? "min-w-[220px] px-4 text-left"
-                        : "px-3 text-center"
-                    } ${h.tooltip ? "cursor-help" : ""}`}
+                    className={`py-3.5 text-xs font-bold uppercase tracking-wider whitespace-nowrap ${alignCls} ${
+                      h.tooltip ? "cursor-help" : ""
+                    } ${isAction ? "col-actions" : ""}`}
                   >
                     <span className="inline-flex items-center gap-1">
                       <span>{h.label}</span>
@@ -189,11 +248,12 @@ export function DayBlock({
                 </td>
               </tr>
             ) : (
-              day.rows.map((r) => {
+              day.rows.map((r, i) => {
                 const key = uiRowKey(r.dayDate, r.subIds);
                 return (
                   <VideoRow
                     key={key}
+                    index={i + 1}
                     row={r}
                     pending={effectiveDayPending || pendingRowDeletes.has(key)}
                     onEdit={() => onEditRow(r)}
@@ -221,6 +281,7 @@ export function DayBlock({
           {day.rows.length > 0 && (
             <tfoot>
               <tr className="border-t-2 border-shopee-500 bg-shopee-900/25 text-base font-bold text-white">
+                <td />
                 <td className="px-4 py-4 text-left text-sm uppercase tracking-wider text-shopee-300">
                   Tổng
                 </td>
@@ -248,7 +309,7 @@ export function DayBlock({
                   {fmtVnd(totals.profit)}
                 </td>
                 <td />
-                <td />
+                <td className="col-actions" />
               </tr>
             </tfoot>
           )}
@@ -256,7 +317,7 @@ export function DayBlock({
       </div>
 
       {!readOnly && (
-        <div className="border-t border-surface-8 bg-surface-1 px-5 py-2">
+        <div className="capture-hide border-t border-surface-8 bg-surface-1 px-5 py-2">
           <button
             onClick={() => {
               if (!effectiveDayPending) onEditDay(day.date);
@@ -281,6 +342,14 @@ export function DayBlock({
         isOpen={!!detailRow}
         row={detailRow}
         onClose={() => setDetailRow(null)}
+      />
+
+      <DayScreenshotDialog
+        isOpen={!!screenshotBlob}
+        blob={screenshotBlob}
+        date={day.date}
+        dateLabel={fmtDate(day.date)}
+        onClose={handleScreenshotClose}
       />
     </section>
   );

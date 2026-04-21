@@ -4,6 +4,7 @@ import { sumFiltered, useSettings } from "../hooks/useSettings";
 
 interface CampaignRowProps {
   row: UiRow;
+  index: number;
   pending: boolean;
   onEdit: () => void;
   onToggleDelete: () => void;
@@ -25,6 +26,7 @@ function fmtOrNa(
 
 export function VideoRow({
   row,
+  index,
   pending,
   onEdit,
   onToggleDelete,
@@ -63,13 +65,20 @@ export function VideoRow({
   return (
     <tr
       onClick={handleRowClick}
-      className={`border-b border-surface-8 text-white/80 transition-colors ${
+      // h-[52px] ép chiều cao cố định = py-2.5 (20px) + button h-8 (32px) — giữ
+      // nguyên khi readOnly / capture mode ẩn cột action, tránh row bị co lại.
+      className={`h-[52px] border-b border-surface-8 text-white/80 transition-colors ${
         pending
           ? "bg-surface-2/50"
           : "cursor-pointer hover:bg-shopee-500/15 hover:shadow-[inset_3px_0_0_0] hover:shadow-shopee-500"
       }`}
       title={row.displayName}
     >
+      <td
+        className={`w-12 px-2 py-2.5 text-center text-sm tabular-nums text-white/50 ${dataCellPending}`}
+      >
+        {index}
+      </td>
       <td
         className={`max-w-[280px] truncate px-4 py-2.5 text-left text-sm font-semibold text-white ${dataCellPending}`}
         title={row.displayName}
@@ -148,7 +157,7 @@ export function VideoRow({
           ? fmtPct(c.profitMargin)
           : "—"}
       </td>
-      <td className={cellCls}>
+      <td className={`${cellCls} col-actions`}>
         {!readOnly && (
           <div className="flex justify-center gap-0.5">
             <button

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DayBlock } from "./components/DayBlock";
+import { OverviewTab } from "./components/OverviewTab";
 import { SubIdTimelineBlock } from "./components/SubIdTimelineBlock";
 import { ManualEntryDialog } from "./components/ManualEntryDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -7,7 +8,12 @@ import { RulesDialog } from "./components/RulesDialog";
 import { PendingChangesBar } from "./components/PendingChangesBar";
 import { ImportPreviewDialog } from "./components/ImportPreviewDialog";
 import { DownloadVideoPage } from "./components/DownloadVideoPage";
-import { useDbStats, todayIso } from "./hooks/useDbStats";
+import { useDbStats, todayIso, type DaysFilter } from "./hooks/useDbStats";
+import {
+  LOAD_MORE_STEP,
+  prevMonthRange,
+  useFilterMode,
+} from "./hooks/useFilterMode";
 import { SettingsProvider, useSettings } from "./hooks/useSettings";
 import { useToast } from "./components/ToastProvider";
 import { commitCsvBatch, previewCsvBatch } from "./lib/dbImport";
@@ -30,85 +36,52 @@ import { SmartCalculator } from "./components/SmartCalculator";
 import { VideoLogsTab } from "./components/VideoLogsTab";
 import "./App.css";
 
-// =========================================================
-// Filter state: recent N days (default + infinite scroll) OR explicit range
-// =========================================================
-
-/**
- * Filter mode:
- * - `recent` có `canExpand`:
- *   - `canExpand=true`  → mặc định paginated 7, scroll xuống load more 7 ngày.
- *   - `canExpand=false` → shortcut khóa cứng N ngày, scroll không load thêm.
- * - `range`: khoảng ngày explicit (date picker hoặc shortcut "Tháng trước").
- * - `all`: hiện toàn bộ data ("Từ trước đến nay").
- */
-type FilterMode =
-  | { type: "recent"; count: number; canExpand: boolean }
-  | { type: "range"; from: string; to: string }
-  | { type: "all" };
-
-/** Đầu + cuối của tháng trước so với today local. Trả YYYY-MM-DD. */
-function prevMonthRange(): { from: string; to: string } {
-  const now = new Date();
-  // Day 0 của month hiện tại = last day của previous month.
-  const end = new Date(now.getFullYear(), now.getMonth(), 0);
-  const start = new Date(end.getFullYear(), end.getMonth(), 1);
-  const fmt = (d: Date) => {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    return `${y}-${m}-${day}`;
-  };
-  return { from: fmt(start), to: fmt(end) };
-}
-
-const DEFAULT_RECENT = 7;
-const LOAD_MORE_STEP = 7;
-const FILTER_STORAGE_KEY = "thongkeshopee.filter.v2";
-
-const DEFAULT_MODE: FilterMode = {
-  type: "recent",
-  count: DEFAULT_RECENT,
-  canExpand: true,
-};
-
-function loadFilterMode(): FilterMode {
-  try {
-    const raw = localStorage.getItem(FILTER_STORAGE_KEY);
-    if (!raw) return DEFAULT_MODE;
-    const parsed = JSON.parse(raw);
-    if (parsed?.type === "recent" && Number.isFinite(parsed.count)) {
-      return {
-        type: "recent",
-        count: Math.max(1, Math.floor(parsed.count)),
-        canExpand: !!parsed.canExpand,
-      };
-    }
-    if (parsed?.type === "range" && typeof parsed.from === "string") {
-      return {
-        type: "range",
-        from: parsed.from,
-        to: typeof parsed.to === "string" ? parsed.to : "",
-      };
-    }
-    if (parsed?.type === "all") return { type: "all" };
-  } catch {
-    // ignore
-  }
-  return DEFAULT_MODE;
-}
-
-function saveFilterMode(m: FilterMode) {
-  try {
-    localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(m));
-  } catch {
-    // ignore
-  }
-}
-
 function AppInner() {
+  // Khai báo sớm để filter có thể derive theo tab.
+  const [activeTab, setActiveTab] = useState<
+    "stats" | "overview" | "download" | "video-logs"
+  >("stats");
+
+  // Mỗi tab giữ filter riêng — cùng logic (useFilterMode), chỉ khác state
+  // instance + localStorage scope. Active hook chọn theo `activeTab`.
+  const statsFilter = useFilterMode("stats");
+  const overviewFilter = useFilterMode("overview");
+  const activeFilter = activeTab === "overview" ? overviewFilter : statsFilter;
+
+  // Alias để không đụng call sites hiện có trong component.
+  const filterMode = activeFilter.mode;
+  const setFilterMode = activeFilter.setMode;
+  const setRecentDays = activeFilter.setRecent;
+  const setPrevMonth = activeFilter.setPrevMonth;
+  const setAllTime = activeFilter.setAllTime;
+  const clearFilter = activeFilter.clear;
+  const setDateFrom = activeFilter.setDateFrom;
+  const setDateTo = activeFilter.setDateTo;
+
+  const [subIdQuery, setSubIdQuery] = useState("");
+  const [selectedSubId, setSelectedSubId] = useState<string | null>(null);
+
+  // Filter args gửi xuống Rust. BE nhận từ_date/to_date/limit → trả slice days,
+  // và sub_id_filter → subset match trên display_name (xem Rust `display_name_subset_match`).
+  const effectiveFilter = useMemo<DaysFilter>(() => {
+    const base: DaysFilter = (() => {
+      if (filterMode.type === "recent") return { limit: filterMode.count };
+      if (filterMode.type === "range") {
+        const { from, to } = filterMode;
+        if (!from && !to) return {};
+        const a = from || to;
+        const b = to || from;
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        return { fromDate: lo, toDate: hi };
+      }
+      return {}; // all
+    })();
+    return selectedSubId ? { ...base, subIdFilter: selectedSubId } : base;
+  }, [filterMode, selectedSubId]);
+
   const {
     days,
+    overview,
     referrers,
     loading,
     error,
@@ -123,7 +96,7 @@ function AppInner() {
     pendingCount,
     mutationVersion,
     markMutation,
-  } = useDbStats();
+  } = useDbStats({ filter: effectiveFilter });
 
   const { view: adminView, busy: adminBusy, exit: adminExit } = useAdminView();
   const inAdminView = adminView !== null;
@@ -178,14 +151,6 @@ function AppInner() {
       /* quota */
     }
   }, [calcOpen]);
-  const [activeTab, setActiveTab] = useState<
-    "stats" | "download" | "video-logs"
-  >("stats");
-  const [filterMode, setFilterMode] = useState<FilterMode>(() =>
-    loadFilterMode(),
-  );
-  const [subIdQuery, setSubIdQuery] = useState("");
-  const [selectedSubId, setSelectedSubId] = useState<string | null>(null);
   const [subIdFocused, setSubIdFocused] = useState(false);
   const subIdInputRef = useRef<HTMLInputElement>(null);
   const [entryDialog, setEntryDialog] = useState<{
@@ -256,58 +221,17 @@ function AppInner() {
     }
   }, [commitPending, showToast]);
 
-  const productsCount = useMemo(
-    () => days.reduce((a, d) => a + d.rows.length, 0),
-    [days],
-  );
+  // BE đã filter theo effectiveFilter → `days` chính là slice cần render.
+  // `overview.totalDaysCount` là tổng ngày trong DB, dùng cho pagination UI.
+  const totalDaysInDb = overview.totalDaysCount;
 
-  // Persist filter mode vào localStorage mỗi khi đổi.
-  useEffect(() => {
-    saveFilterMode(filterMode);
-  }, [filterMode]);
-
-  /**
-   * Áp filter vào `days`:
-   * - `recent`: take N dòng đầu (data sorted DESC) — infinite scroll tăng N thêm.
-   * - `range`: lọc trong `[min(from,to), max(from,to)]`.
-   * - `all`: toàn bộ data.
-   */
-  const filteredDays = useMemo(() => {
-    if (filterMode.type === "all") return days;
-    if (filterMode.type === "recent") {
-      return days.slice(0, filterMode.count);
-    }
-    const { from, to } = filterMode;
-    if (!from && !to) return days;
-    const a = from || to;
-    const b = to || from;
-    const [lo, hi] = a <= b ? [a, b] : [b, a];
-    return days.filter((d) => d.date >= lo && d.date <= hi);
-  }, [days, filterMode]);
-
-  // Chỉ default-paginated mode mới expand khi scroll.
+  // Chỉ default-paginated mode mới expand khi scroll. So sánh count đang show
+  // với total ngày trong DB (không phải `days.length` vì BE có thể trả ít hơn
+  // limit khi data thưa).
   const canLoadMore =
     filterMode.type === "recent" &&
     filterMode.canExpand &&
-    filterMode.count < days.length;
-
-  const clearFilter = () => setFilterMode(DEFAULT_MODE);
-
-  const setRecentDays = useCallback(
-    (n: number) =>
-      setFilterMode({ type: "recent", count: n, canExpand: false }),
-    [],
-  );
-
-  const setPrevMonth = useCallback(() => {
-    const r = prevMonthRange();
-    setFilterMode({ type: "range", from: r.from, to: r.to });
-  }, []);
-
-  const setAllTime = useCallback(
-    () => setFilterMode({ type: "all" }),
-    [],
-  );
+    filterMode.count < totalDaysInDb;
 
   // Detect active cho highlight shortcut "Tháng trước".
   const prevMonth = useMemo(() => prevMonthRange(), []);
@@ -316,120 +240,47 @@ function AppInner() {
     filterMode.from === prevMonth.from &&
     filterMode.to === prevMonth.to;
 
-  const setDateFrom = (v: string) => {
-    setFilterMode((m) => ({
-      type: "range",
-      from: v,
-      to: m.type === "range" ? m.to : "",
-    }));
-  };
-  const setDateTo = (v: string) => {
-    setFilterMode((m) => ({
-      type: "range",
-      from: m.type === "range" ? m.from : "",
-      to: v,
-    }));
-  };
-
   // Hiển thị dates trong picker:
   // - range mode → lưu trực tiếp trong filterMode.
-  // - shortcut recent (!canExpand) → derive từ filteredDays.
-  // - all → derive từ toàn bộ days nếu có.
+  // - shortcut recent (!canExpand) → derive từ `days` (BE đã cắt đúng slice).
+  // - all → derive từ overview.oldest/newest (bounds toàn DB, không cần scan FE).
   // - default paginated → để trống (chưa chọn range cụ thể).
   const { dateFrom, dateTo } = useMemo<{ dateFrom: string; dateTo: string }>(() => {
     if (filterMode.type === "range") {
       return { dateFrom: filterMode.from, dateTo: filterMode.to };
     }
-    if (filterMode.type === "all" && days.length > 0) {
+    if (filterMode.type === "all") {
       return {
-        dateFrom: days[days.length - 1].date,
-        dateTo: days[0].date,
+        dateFrom: overview.oldestDate ?? "",
+        dateTo: overview.newestDate ?? "",
       };
     }
     if (
       filterMode.type === "recent" &&
       !filterMode.canExpand &&
-      filteredDays.length > 0
+      days.length > 0
     ) {
       return {
-        dateFrom: filteredDays[filteredDays.length - 1].date,
-        dateTo: filteredDays[0].date,
+        dateFrom: days[days.length - 1].date,
+        dateTo: days[0].date,
       };
     }
     return { dateFrom: "", dateTo: "" };
-  }, [filterMode, filteredDays, days]);
+  }, [filterMode, days, overview.oldestDate, overview.newestDate]);
 
-  // ============================================================
-  // Search theo sub_id (displayName). Gợi ý gồm cả displayName đầy đủ lẫn
-  // các prefix hierarchy (split by "-") để user chọn level thích hợp.
-  // Ví dụ row "dammaxi-0416" → suggestions có "dammaxi" + "dammaxi-0416".
-  // Chọn "dammaxi" → prefix-match → bắt được cả "dammaxi", "dammaxi-0412",
-  // "dammaxi-0416"... dù chúng xuất hiện trên các ngày khác nhau.
-  // ============================================================
-  const allSubIds = useMemo(() => {
-    const set = new Set<string>();
-    for (const d of days) {
-      for (const r of d.rows) {
-        const name = r.displayName;
-        if (!name) continue;
-        set.add(name);
-        const parts = name.split("-").filter((p) => p);
-        // Prefix levels để user chọn theo cây.
-        for (let i = 1; i < parts.length; i++) {
-          set.add(parts.slice(0, i).join("-"));
-        }
-        // Từng part riêng để user search ngang (VD "dammaxi" match cả
-        // "dammaxi-0410" lẫn "MuseStudio-dammaxi" khi naming không nhất quán).
-        for (const p of parts) set.add(p);
-      }
-    }
-    return Array.from(set).sort();
-  }, [days]);
-
-  /**
-   * Suggestions filter:
-   * - Rỗng → show toàn bộ sub_id (sorted), dropdown scroll nội bộ nếu nhiều.
-   * - Có query → match theo **startsWith** tại bất kỳ part nào của suggestion.
-   *   VD query "damma" → match "dammaxi", "dammaxi-0412", "MuseStudio-dammaxi"
-   *   vì part "dammaxi" startsWith("damma"). Tránh noise từ substring giữa part.
-   */
+  // Suggestions dropdown: filter `overview.allSubIds` theo query. Dataset từ
+  // overview (toàn DB) nên user chọn được cả sub_id từ ngày không trong slice.
+  // Match = startsWith tại bất kỳ part nào — tránh noise substring giữa part.
   const suggestions = useMemo(() => {
     const q = subIdQuery.toLowerCase().trim();
-    if (!q) return allSubIds;
-    return allSubIds.filter((s) =>
+    if (!q) return overview.allSubIds;
+    return overview.allSubIds.filter((s) =>
       s
         .toLowerCase()
         .split("-")
         .some((part) => part.startsWith(q)),
     );
-  }, [allSubIds, subIdQuery]);
-
-  /**
-   * row displayName match "selected" khi **mọi part của selected đều có trong row parts**
-   * (subset của set parts sau khi split "-"). Ví dụ:
-   * - selected "dammaxi" match "dammaxi", "dammaxi-0410", "MuseStudio-dammaxi"
-   * - selected "dammaxi-0412" match "dammaxi-0412", "dammaxi-0412-v1",
-   *   "MuseStudio-dammaxi-0412" (vì cả "dammaxi" và "0412" đều có)
-   * - selected "MuseStudio-dammaxi" match "MuseStudio-dammaxi", "MuseStudio-dammaxi-0412"
-   *   nhưng KHÔNG match "dammaxi-0410" (thiếu "MuseStudio" part)
-   */
-  const matchSubId = (rowDisplayName: string, selected: string) => {
-    if (!selected) return true;
-    const rowParts = new Set(rowDisplayName.split("-").filter((p) => p));
-    const selParts = selected.split("-").filter((p) => p);
-    return selParts.every((p) => rowParts.has(p));
-  };
-
-  // Combined filter: date filter → sub_id filter (prefix-compatible).
-  const finalDays = useMemo(() => {
-    if (!selectedSubId) return filteredDays;
-    return filteredDays
-      .map((d) => ({
-        ...d,
-        rows: d.rows.filter((r) => matchSubId(r.displayName, selectedSubId)),
-      }))
-      .filter((d) => d.rows.length > 0);
-  }, [filteredDays, selectedSubId]);
+  }, [overview.allSubIds, subIdQuery]);
 
   const clearSubId = () => {
     setSelectedSubId(null);
@@ -571,6 +422,12 @@ function AppInner() {
             label="Thống kê"
           />
           <TabButton
+            active={activeTab === "overview"}
+            onClick={() => setActiveTab("overview")}
+            icon="insights"
+            label="Tổng quan"
+          />
+          <TabButton
             active={activeTab === "download"}
             onClick={() => setActiveTab("download")}
             icon="download"
@@ -615,7 +472,7 @@ function AppInner() {
               Thử lại
             </button>
           </div>
-        ) : days.length === 0 ? (
+        ) : totalDaysInDb === 0 ? (
           <div className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-2xl border border-surface-8 bg-surface-1 p-12 text-center shadow-elev-1">
             <span className="material-symbols-rounded text-6xl text-shopee-400">
               calendar_month
@@ -779,6 +636,21 @@ function AppInner() {
                     onBlur={() =>
                       setTimeout(() => setSubIdFocused(false), 150)
                     }
+                    onKeyDown={(e) => {
+                      // Enter: chọn suggestion đầu tiên (nếu có), fallback: giữ nguyên query làm sub_id filter.
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        const pick = suggestions[0] ?? subIdQuery.trim();
+                        if (!pick) return;
+                        setSelectedSubId(pick);
+                        setSubIdQuery("");
+                        setSubIdFocused(false);
+                        subIdInputRef.current?.blur();
+                      } else if (e.key === "Escape") {
+                        setSubIdFocused(false);
+                        subIdInputRef.current?.blur();
+                      }
+                    }}
                     placeholder="Tìm Sub_id..."
                     className="w-full min-w-0 rounded-md border border-surface-8 bg-surface-1 px-2.5 py-1 text-sm text-white/90 placeholder:text-white/30 focus:border-shopee-500 focus:outline-none focus:ring-1 focus:ring-shopee-500"
                   />
@@ -795,9 +667,9 @@ function AppInner() {
                   )}
                   <span
                     className="shrink-0 whitespace-nowrap rounded-full bg-surface-6 px-2 py-0.5 text-[11px] font-medium text-white/55"
-                    title={`Tổng ${allSubIds.length} sub_id trong DB`}
+                    title={`Tổng ${overview.allSubIds.length} sub_id trong DB`}
                   >
-                    {allSubIds.length}
+                    {overview.allSubIds.length}
                   </span>
                   {subIdFocused && suggestions.length > 0 && (
                     <ul className="absolute left-6 right-0 top-full z-30 mt-1 max-h-[400px] overflow-y-auto rounded-lg border border-surface-8 bg-surface-4 shadow-elev-16">
@@ -827,13 +699,20 @@ function AppInner() {
                 {/* Right anchor: badge counter, luôn bám phải */}
                 <div className="flex shrink-0 items-center gap-2 pt-1">
                   <span className="whitespace-nowrap rounded-full bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-300">
-                    {finalDays.length} / {days.length} ngày
+                    {days.length} / {totalDaysInDb} ngày
                     {canLoadMore && " · scroll để xem thêm"}
                   </span>
                 </div>
               </div>
             </div>
-            {finalDays.length === 0 ? (
+            {activeTab === "overview" ? (
+              <OverviewTab
+                days={days}
+                dateFrom={dateFrom}
+                dateTo={dateTo}
+                totalDaysInDb={totalDaysInDb}
+              />
+            ) : days.length === 0 ? (
               <div className="mx-auto max-w-xl rounded-2xl border border-dashed border-surface-8 bg-surface-1 p-12 text-center text-white/60">
                 <span className="material-symbols-rounded text-5xl text-white/30">
                   search_off
@@ -849,7 +728,7 @@ function AppInner() {
                 {selectedSubId ? (
                   <SubIdTimelineBlock
                     subId={selectedSubId}
-                    days={finalDays}
+                    days={days}
                     pendingRowDeletes={pendingRowDeletes}
                     onToggleRowDelete={(r) =>
                       toggleRowPending(r.dayDate, r.subIds)
@@ -860,7 +739,7 @@ function AppInner() {
                     readOnly={inAdminView}
                   />
                 ) : (
-                  finalDays.map((day) => (
+                  days.map((day) => (
                     <DayBlock
                       key={day.date}
                       day={day}
@@ -898,8 +777,8 @@ function AppInner() {
       <SettingsDialog
         isOpen={settingsOpen}
         settings={settings}
-        daysCount={days.length}
-        productsCount={productsCount}
+        daysCount={overview.totalDaysCount}
+        productsCount={overview.totalRowsCount}
         onToggleClickSource={setClickSource}
         onSetProfitFee={setProfitFee}
         onClose={() => setSettingsOpen(false)}

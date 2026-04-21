@@ -53,10 +53,17 @@ export function driveMetadata(idToken: string): Promise<DriveMetadataResult> {
   });
 }
 
-export function driveUploadDb(idToken: string): Promise<DriveUploadResult> {
+/** Upload local DB lên Drive. `remoteExists` (từ drive_metadata) dùng cho
+ *  guard server-side: reject nếu local fresh (change_id=0) + remote đã có
+ *  data → tránh đè mất backup cũ khi reinstall. */
+export function driveUploadDb(
+  idToken: string,
+  remoteExists: boolean,
+): Promise<DriveUploadResult> {
   return invoke<DriveUploadResult>("drive_upload_db", {
     appsScriptUrl: url(),
     idToken,
+    remoteExists,
   });
 }
 

@@ -1,0 +1,214 @@
+[
+  {
+    "kind": "shopee_clicks",
+    "dayDate": "2026-04-17",
+    "filenames": [
+      "WebsiteClickReport202604181656.csv"
+    ],
+    "rowCount": 4595,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 4595,
+    "byReferrer": {
+      "Facebook": 3668,
+      "Others": 927
+    },
+    "sumSpendCents": "0",
+    "sumImpressions": 0,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  },
+  {
+    "kind": "shopee_clicks",
+    "dayDate": "2026-04-16",
+    "filenames": [
+      "WebsiteClickReport202604190306.csv"
+    ],
+    "rowCount": 3956,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 3956,
+    "byReferrer": {
+      "Others": 819,
+      "Facebook": 3137
+    },
+    "sumSpendCents": "0",
+    "sumImpressions": 0,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  },
+  {
+    "kind": "shopee_clicks",
+    "dayDate": "2026-04-18",
+    "filenames": [
+      "WebsiteClickReport202604190906.csv"
+    ],
+    "rowCount": 136,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 136,
+    "byReferrer": {
+      "Facebook": 113,
+      "Others": 23
+    },
+    "sumSpendCents": "0",
+    "sumImpressions": 0,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  },
+  {
+    "kind": "shopee_commission",
+    "dayDate": "2026-04-17",
+    "filenames": [
+      "AffiliateCommissionReport202604181725.csv"
+    ],
+    "rowCount": 175,
+    "sumNetCommissionCents": "228412558",
+    "sumOrderValueCents": "1770992200",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "0",
+    "sumImpressions": 0,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 127,
+    "distinctCheckoutItemCount": 175
+  },
+  {
+    "kind": "shopee_commission",
+    "dayDate": "2026-04-16",
+    "filenames": [
+      "AffiliateCommissionReport202604190306.csv"
+    ],
+    "rowCount": 157,
+    "sumNetCommissionCents": "219003263",
+    "sumOrderValueCents": "1699434400",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "0",
+    "sumImpressions": 0,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 130,
+    "distinctCheckoutItemCount": 157
+  },
+  {
+    "kind": "shopee_commission",
+    "dayDate": "2026-04-18",
+    "filenames": [
+      "AffiliateCommissionReport202604190906.csv",
+      "AffiliateCommissionReport202604191544.csv"
+    ],
+    "rowCount": 507,
+    "sumNetCommissionCents": "727929736",
+    "sumOrderValueCents": "7463229057",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "0",
+    "sumImpressions": 0,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 383,
+    "distinctCheckoutItemCount": 507
+  },
+  {
+    "kind": "fb_campaign",
+    "dayDate": "2026-04-16",
+    "filenames": [
+      "ACC---Dũng-Chiến-dịch-16-Tháng-4-2026-16-Tháng-4-2026.csv",
+      "Phạm-Mai-Chiến-dịch-16-Tháng-4-2026-16-Tháng-4-2026.csv"
+    ],
+    "rowCount": 34,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "105791900",
+    "sumImpressions": 33771,
+    "sumLinkClicks": 824,
+    "sumAllClicks": 1191,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  },
+  {
+    "kind": "fb_campaign",
+    "dayDate": "2026-04-18",
+    "filenames": [
+      "ACC---Dũng-Chiến-dịch-18-Tháng-4-2026-18-Tháng-4-2026.csv",
+      "Phạm-Mai-Chiến-dịch-18-Tháng-4-2026-18-Tháng-4-2026.csv",
+      "van-ru-y-3-Chiến-dịch-18-Tháng-4-2026-18-Tháng-4-2026.csv"
+    ],
+    "rowCount": 202,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "153812100",
+    "sumImpressions": 46913,
+    "sumLinkClicks": 2359,
+    "sumAllClicks": 3102,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  },
+  {
+    "kind": "fb_ad_group",
+    "dayDate": "2026-04-17",
+    "filenames": [
+      "ACC---Dũng-Nhóm-quảng-cáo-17-Tháng-4-2026-17-Tháng-4-2026.csv"
+    ],
+    "rowCount": 24,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "47745700",
+    "sumImpressions": 15211,
+    "sumLinkClicks": 878,
+    "sumAllClicks": 1248,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  },
+  {
+    "kind": "fb_campaign",
+    "dayDate": "2026-04-17",
+    "filenames": [
+      "Nguyễn-Văn-Dũng-Chiến-dịch-17-Tháng-4-2026-17-Tháng-4-2026.csv",
+      "Phạm-Mai-Chiến-dịch-17-Tháng-4-2026-17-Tháng-4-2026.csv"
+    ],
+    "rowCount": 5,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "163607300",
+    "sumImpressions": 68645,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  },
+  {
+    "kind": "fb_ad_group",
+    "dayDate": "2026-04-16",
+    "filenames": [
+      "Nguyễn-Văn-Dũng-Nhóm-quảng-cáo-16-Tháng-4-2026-16-Tháng-4-2026.csv"
+    ],
+    "rowCount": 3,
+    "sumNetCommissionCents": "0",
+    "sumOrderValueCents": "0",
+    "sumClicks": 0,
+    "byReferrer": {},
+    "sumSpendCents": "110584200",
+    "sumImpressions": 40512,
+    "sumLinkClicks": 0,
+    "sumAllClicks": 0,
+    "distinctOrderIdCount": 0,
+    "distinctCheckoutItemCount": 0
+  }
+]

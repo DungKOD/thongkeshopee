@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { OrderItemDetail, UiRow } from "../types";
 import {
@@ -11,6 +11,11 @@ import {
 } from "../formulas";
 import { sumFiltered, useSettings } from "../hooks/useSettings";
 import { invoke } from "../lib/tauri";
+import {
+  captureElementToBlob,
+  prefetchFontEmbedCSS,
+} from "../lib/screenshot";
+import { DayScreenshotDialog } from "./DayScreenshotDialog";
 
 interface ProductDetailDialogProps {
   isOpen: boolean;
@@ -26,15 +31,44 @@ export function ProductDetailDialog({
   const { settings } = useSettings();
   const [items, setItems] = useState<OrderItemDetail[]>([]);
   const [loadingItems, setLoadingItems] = useState(false);
+  const [capturing, setCapturing] = useState(false);
+  const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  const handleScreenshot = async () => {
+    if (!dialogRef.current || capturing) return;
+    setCapturing(true);
+    try {
+      const blob = await captureElementToBlob(dialogRef.current, {
+        pixelRatio: 2,
+        backgroundColor: "#121212",
+      });
+      setScreenshotBlob(blob);
+    } catch (e) {
+      console.error("screenshot failed", e);
+      alert(`Chụp ảnh thất bại: ${String(e)}`);
+    } finally {
+      setCapturing(false);
+    }
+  };
 
   useEffect(() => {
     if (!isOpen) return;
+    // Khi dialog ảnh đang mở — nó tự handle Esc. Không đăng ký listener ở đây
+    // để 1 lần Esc chỉ đóng dialog ảnh, cần Esc lần 2 mới đóng detail.
+    if (screenshotBlob) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, screenshotBlob]);
+
+  // Khi detail đóng → clear blob (dù người dùng đóng bằng backdrop/Đóng/Esc)
+  // để lần mở detail kế tiếp không tự bật lại dialog ảnh từ state cũ.
+  useEffect(() => {
+    if (!isOpen) setScreenshotBlob(null);
+  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen || !row) {
@@ -122,7 +156,10 @@ export function ProductDetailDialog({
       onMouseDown={handleBackdropMouseDown}
     >
       <div
-        className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-surface-2 shadow-elev-24"
+        ref={dialogRef}
+        className={`flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-surface-2 shadow-elev-24 ${
+          capturing ? "capture-mode" : ""
+        }`}
         role="dialog"
         aria-modal="true"
         aria-labelledby="product-detail-dialog-title"
@@ -168,6 +205,22 @@ export function ProductDetailDialog({
                 <span className="italic">Chưa có nguồn</span>
               )}
             </div>
+          </div>
+          <div className="capture-hide flex shrink-0 items-center">
+            <button
+              type="button"
+              onClick={handleScreenshot}
+              onMouseEnter={prefetchFontEmbedCSS}
+              onFocus={prefetchFontEmbedCSS}
+              disabled={capturing}
+              className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white/80 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"
+              title={capturing ? "Đang chụp..." : "Chụp ảnh chi tiết"}
+              aria-label="Chụp ảnh chi tiết"
+            >
+              <span className="material-symbols-rounded">
+                {capturing ? "hourglass_empty" : "photo_camera"}
+              </span>
+            </button>
           </div>
         </header>
 
@@ -336,7 +389,7 @@ export function ProductDetailDialog({
                       <span className="text-xs font-medium text-white/60">
                         {ref}
                       </span>
-                      <span className="text-sm font-semibold tabular-nums text-shopee-300">
+                      <span className="num-hover text-base font-bold tabular-nums text-shopee-300">
                         {fmtInt(n)}
                       </span>
                     </div>
@@ -495,7 +548,8 @@ export function ProductDetailDialog({
                               {it.quantity ?? "—"}
                             </td>
                             <td
-                              className={`px-3 py-2 text-center ${statusCls}`}
+                              className={`max-w-[140px] truncate whitespace-nowrap px-3 py-2 text-center ${statusCls}`}
+                              title={it.orderStatus ?? ""}
                             >
                               {it.orderStatus ?? "—"}
                             </td>
@@ -552,7 +606,7 @@ export function ProductDetailDialog({
           </Section>
         </div>
 
-        <footer className="flex shrink-0 justify-end gap-2 border-t border-surface-8 bg-surface-1 px-6 py-3">
+        <footer className="capture-hide flex shrink-0 justify-end gap-2 border-t border-surface-8 bg-surface-1 px-6 py-3">
           <button
             type="button"
             onClick={onClose}
@@ -562,6 +616,16 @@ export function ProductDetailDialog({
           </button>
         </footer>
       </div>
+
+      <DayScreenshotDialog
+        isOpen={!!screenshotBlob}
+        blob={screenshotBlob}
+        date={row.dayDate}
+        dateLabel={fmtDate(row.dayDate)}
+        title={`Chi tiết — ${row.displayName || "(chưa đặt tên)"} · ${fmtDate(row.dayDate)}`}
+        defaultFileName={`thongkee-chi-tiet-${row.dayDate}.png`}
+        onClose={() => setScreenshotBlob(null)}
+      />
     </div>,
     document.body,
   );
@@ -638,7 +702,7 @@ function KpiCard({
         </p>
       </div>
       <p
-        className={`mt-1.5 truncate text-2xl font-bold tabular-nums ${toneMap[tone]}`}
+        className={`num-glow mt-1.5 truncate text-2xl font-bold tabular-nums ${toneMap[tone]}`}
         title={value}
       >
         {value}
@@ -662,14 +726,14 @@ function MetricRow({
   tooltip?: string;
 }) {
   return (
-    <div className="flex items-baseline justify-between gap-2 border-b border-dashed border-surface-6 py-1 last:border-b-0">
+    <div className="detail-row -mx-2 flex items-baseline justify-between gap-2 rounded-md border-b border-dashed border-surface-6 px-2 py-1 last:border-b-0">
       <span
-        className={`text-sm text-white/60 ${tooltip ? "cursor-help" : ""}`}
+        className={`detail-row-label text-sm text-white/60 ${tooltip ? "cursor-help" : ""}`}
         title={tooltip}
       >
         {label}
       </span>
-      <span className="text-sm font-semibold tabular-nums text-white/95">
+      <span className="detail-row-value text-base font-bold tabular-nums text-white/95">
         {value}
       </span>
     </div>
@@ -680,7 +744,7 @@ function BreakdownRow({
   label,
   value,
   labelClass = "text-sm text-white/65",
-  valueClass = "text-sm tabular-nums text-white/90",
+  valueClass = "text-base font-semibold tabular-nums text-white/90",
 }: {
   label: string;
   value: string;
@@ -688,9 +752,9 @@ function BreakdownRow({
   valueClass?: string;
 }) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-1">
-      <span className={labelClass}>{label}</span>
-      <span className={valueClass}>{value}</span>
+    <div className="detail-row -mx-2 flex items-baseline justify-between gap-3 rounded-md px-2 py-1">
+      <span className={`detail-row-label ${labelClass}`}>{label}</span>
+      <span className={`detail-row-value ${valueClass}`}>{value}</span>
     </div>
   );
 }

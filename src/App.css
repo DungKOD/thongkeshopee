@@ -110,22 +110,105 @@ input[type="number"] {
 }
 
 /* ========================================================
- * Hover zoom + glow cho số trong bảng Thống kê.
- * Áp dụng mọi <td class="tabular-nums"> trong <tbody> — số zoom nhẹ +
- * sáng + text-shadow để user hover vào là đọc rõ ngay. Không affect
- * calculator panel (không dùng <table>) hay các vị trí khác.
+ * Hover zoom + glow cho số.
+ *  - Auto apply cho mọi <td class="tabular-nums"> trong <tbody> (bảng Thống kê).
+ *    Scale nhỏ (1.06) để không tràn ra khỏi table wrapper `overflow-x-auto`.
+ *  - Opt-in `.num-hover`: số bên ngoài table (referrer chip, live calc…).
+ *  - Opt-in `.num-glow`: cho chỗ đã `truncate` (KpiCard, Calc history) —
+ *    chỉ sáng + text-shadow, KHÔNG scale để tránh text bị clip bởi truncate.
  * ======================================================== */
-tbody td.tabular-nums {
+tbody td.tabular-nums,
+.num-hover {
   transition: transform 150ms ease-out, color 150ms ease-out,
     text-shadow 150ms ease-out;
   transform-origin: center;
 }
 
-tbody td.tabular-nums:hover {
-  transform: scale(1.12);
+.num-glow {
+  transition: color 150ms ease-out, text-shadow 150ms ease-out;
+}
+
+tbody td.tabular-nums:hover,
+.num-hover:hover {
+  transform: scale(1.06);
   color: rgb(255 255 255);
   text-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
   z-index: 10;
   position: relative;
   cursor: default;
+}
+
+.num-glow:hover {
+  color: rgb(255 255 255);
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
+  cursor: default;
+}
+
+/* ========================================================
+ * Row-level hover cho các dòng metric trong DetailDialog.
+ * Wrap class `.detail-row` lên container (div flex), kèm
+ * `.detail-row-label` + `.detail-row-value` lên 2 span.
+ * Hover row: scale 1.03, background tint, label/value sáng lên,
+ * value thêm text-shadow glow. Transform-origin left để không
+ * xô layout sang phải của grid cell.
+ * ======================================================== */
+.detail-row {
+  transition: transform 150ms ease-out, background-color 150ms ease-out;
+  transform-origin: left center;
+}
+.detail-row-label,
+.detail-row-value {
+  transition: color 150ms ease-out, text-shadow 150ms ease-out;
+}
+.detail-row:hover {
+  transform: scale(1.02);
+  background-color: rgba(238, 77, 45, 0.1);
+  z-index: 10;
+  position: relative;
+}
+.detail-row:hover .detail-row-label {
+  color: rgba(255, 255, 255, 0.9);
+}
+.detail-row:hover .detail-row-value {
+  color: rgb(255 255 255);
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
+}
+
+/* ========================================================
+ * Capture mode — áp dụng cho <section> DayBlock trước khi chụp ảnh
+ * (html-to-image). Ẩn tất cả UI action (nút chụp/xóa/thêm dòng + cột
+ * edit/delete cuối table) và clean các visual indicator chỉ có ý nghĩa
+ * khi tương tác (gạch ngang + mờ pending delete, hover zoom).
+ * ======================================================== */
+.capture-mode .capture-hide,
+.capture-mode .col-actions {
+  display: none !important;
+}
+.capture-mode .line-through {
+  text-decoration: none !important;
+}
+.capture-mode .opacity-50 {
+  opacity: 1 !important;
+}
+/* Disable hover zoom để ảnh chụp không bị dịch do con trỏ hover. */
+.capture-mode tbody td.tabular-nums:hover {
+  transform: none;
+  color: inherit;
+  text-shadow: none;
+}
+/* Bỏ scrollbar ngang của table wrapper khi chụp — tránh thanh scroll hiện trong ảnh. */
+.capture-mode .overflow-x-auto {
+  overflow: visible !important;
+}
+.capture-mode ::-webkit-scrollbar {
+  display: none;
+}
+/* ProductDetailDialog: unset max-height + overflow-y-auto để chụp được toàn
+ * bộ nội dung kể cả phần đang bị scroll che khuất. */
+.capture-mode {
+  max-height: none !important;
+}
+.capture-mode .overflow-y-auto {
+  overflow: visible !important;
+  max-height: none !important;
 }

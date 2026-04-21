@@ -18,7 +18,7 @@ import { ProductDetailDialog } from "./ProductDetailDialog";
 interface SubIdTimelineBlockProps {
   subId: string;
   days: UiDay[];
-  pendingRowDeletes: Set<string>;
+  pendingRowDeletes: ReadonlyMap<string, unknown>;
   onToggleRowDelete: (row: UiRow) => void;
   onEditRow: (row: UiRow) => void;
   readOnly?: boolean;
