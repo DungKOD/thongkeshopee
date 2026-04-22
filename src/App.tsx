@@ -506,8 +506,11 @@ function AppInner() {
         ) : activeTab === "video-logs" && isAdmin ? (
           <VideoLogsTab />
         ) : loading ? (
-          <div className="mx-auto max-w-xl py-12 text-center text-white/60">
-            Đang tải...
+          <div className="mx-auto flex max-w-xl flex-col items-center gap-3 py-16 text-center text-white/60">
+            <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">
+              progress_activity
+            </span>
+            <span className="text-sm">Đang tải data...</span>
           </div>
         ) : error ? (
           <div className="mx-auto max-w-xl rounded-lg border border-red-500/50 bg-red-900/30 p-6 text-red-200">

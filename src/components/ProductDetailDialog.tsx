@@ -491,7 +491,7 @@ export function ProductDetailDialog({
               </div>
             ) : (
               <div className="overflow-hidden rounded-xl border border-surface-8 bg-surface-2 shadow-elev-1">
-                <div className="overflow-x-auto">
+                <div>
                   <table className="w-full border-collapse text-xs">
                     <thead>
                       <tr className="bg-surface-4 text-shopee-200">
