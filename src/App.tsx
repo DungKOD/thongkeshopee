@@ -473,6 +473,14 @@ function AppInner() {
               </span>
               Quy tắc
             </button>
+            {!inAdminView && (
+              <SyncBadge
+                status={syncStatus}
+                lastSyncAt={lastSyncAt}
+                error={syncError}
+                onForce={forceSync}
+              />
+            )}
             {isAdmin && (
               <button
                 onClick={() => setUserListOpen(true)}
@@ -506,14 +514,6 @@ function AppInner() {
               <span className="material-symbols-rounded">settings</span>
             </button>
             <UserMenu />
-            {!inAdminView && (
-              <SyncBadge
-                status={syncStatus}
-                lastSyncAt={lastSyncAt}
-                error={syncError}
-                onForce={forceSync}
-              />
-            )}
             {activeTab === "stats" && !inAdminView && (
               <button
                 onClick={handleImportClick}
