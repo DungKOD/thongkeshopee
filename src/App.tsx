@@ -462,6 +462,14 @@ function AppInner() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {!inAdminView && (
+              <SyncBadge
+                status={syncStatus}
+                lastSyncAt={lastSyncAt}
+                error={syncError}
+                onForce={forceSync}
+              />
+            )}
             <button
               onClick={() => setRulesOpen(true)}
               className="btn-ripple flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
@@ -473,14 +481,6 @@ function AppInner() {
               </span>
               Quy tắc
             </button>
-            {!inAdminView && (
-              <SyncBadge
-                status={syncStatus}
-                lastSyncAt={lastSyncAt}
-                error={syncError}
-                onForce={forceSync}
-              />
-            )}
             {isAdmin && (
               <button
                 onClick={() => setUserListOpen(true)}
