@@ -161,6 +161,10 @@ function AppInner() {
   useEffect(() => {
     forceSyncRef.current = forceSync;
   }, [forceSync]);
+  // Flag "cho phép đóng bỏ qua guard" — user đã xác nhận trong dialog
+  // (sync xong hoặc tắt luôn). Handler thấy flag = true → return, không
+  // preventDefault → Tauri close binh thường.
+  const bypassCloseGuardRef = useRef(false);
 
   useEffect(() => {
     // Admin view: dirty của DB khác, không warn (sync bị disable rồi).
@@ -170,8 +174,11 @@ function AppInner() {
     // Sync handler — async có thể gây Tauri race với preventDefault. Sync an toàn.
     getCurrentWindow()
       .onCloseRequested((event) => {
+        if (bypassCloseGuardRef.current) {
+          // User đã confirm trong dialog → cho đóng luôn, bỏ qua mọi check.
+          return;
+        }
         const s = syncStatusRef.current;
-        console.log("[close] onCloseRequested, status =", s);
         if (s !== "dirty" && s !== "error") {
           // Clean → không preventDefault → Tauri close window như bình thường.
           return;
@@ -194,18 +201,23 @@ function AppInner() {
     setCloseSyncing(true);
     try {
       await forceSyncRef.current();
-    } catch {
-      // ignore — fallback user chọn tắt luôn hoặc huỷ.
-    } finally {
+    } catch (e) {
+      console.error("[close] forceSync failed:", e);
+      // Sync fail → không tự đóng, để user thấy error + chọn lại (tắt luôn).
       setCloseSyncing(false);
+      return;
     }
+    setCloseSyncing(false);
     setCloseWarningOpen(false);
-    await getCurrentWindow().destroy();
+    // Bypass flag trước khi close() → handler thấy true → return → close OK.
+    bypassCloseGuardRef.current = true;
+    await getCurrentWindow().close();
   }, []);
 
   const handleCloseAnyway = useCallback(async () => {
     setCloseWarningOpen(false);
-    await getCurrentWindow().destroy();
+    bypassCloseGuardRef.current = true;
+    await getCurrentWindow().close();
   }, []);
 
   const handleCancelClose = useCallback(() => {
