@@ -497,14 +497,6 @@ function AppInner() {
             >
               <span className="material-symbols-rounded">calculate</span>
             </button>
-            {!inAdminView && (
-              <SyncBadge
-                status={syncStatus}
-                lastSyncAt={lastSyncAt}
-                error={syncError}
-                onForce={forceSync}
-              />
-            )}
             <button
               onClick={() => setSettingsOpen(true)}
               className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
@@ -514,6 +506,14 @@ function AppInner() {
               <span className="material-symbols-rounded">settings</span>
             </button>
             <UserMenu />
+            {!inAdminView && (
+              <SyncBadge
+                status={syncStatus}
+                lastSyncAt={lastSyncAt}
+                error={syncError}
+                onForce={forceSync}
+              />
+            )}
             {activeTab === "stats" && !inAdminView && (
               <button
                 onClick={handleImportClick}
