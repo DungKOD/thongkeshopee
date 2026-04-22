@@ -167,10 +167,15 @@ function AppInner() {
     if (inAdminView) return;
     let unlisten: (() => void) | null = null;
     let disposed = false;
+    // Sync handler — async có thể gây Tauri race với preventDefault. Sync an toàn.
     getCurrentWindow()
-      .onCloseRequested(async (event) => {
+      .onCloseRequested((event) => {
         const s = syncStatusRef.current;
-        if (s !== "dirty" && s !== "error") return; // clean, cho đóng
+        console.log("[close] onCloseRequested, status =", s);
+        if (s !== "dirty" && s !== "error") {
+          // Clean → không preventDefault → Tauri close window như bình thường.
+          return;
+        }
         event.preventDefault();
         setCloseWarningOpen(true);
       })
