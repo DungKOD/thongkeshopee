@@ -248,6 +248,73 @@ export const fmtDate = (iso: string) => {
   return `${d}/${m}/${y}`;
 };
 
+/// TSV (tab-separated) string cho 1 UiDay — user copy + paste vào Google
+/// Sheet / Excel. Số hiển thị raw (Number, không có " đ" hay "%") để spreadsheet
+/// format được. Format decimal với DOT (en-US) để Google Sheets parse đúng —
+/// dấu phẩy Việt dễ bị hiểu nhầm là thousand separator.
+///
+/// Shape: header row + data rows + totals row.
+/// Columns: Sản phẩm | Click ADS | Click Shopee | CPC | Spend | Đơn | CR |
+///          GMV | Hoa hồng | Lợi nhuận | ROI
+export function buildDayTsv(
+  day: UiDay,
+  clickSources: Record<string, boolean>,
+  fees: ProfitFees,
+): string {
+  const round0 = (n: number) => Math.round(n).toString();
+  const round2 = (n: number) => n.toFixed(2);
+  const empty = "";
+
+  const header = [
+    "Sản phẩm",
+    "Click ADS",
+    "Click Shopee",
+    "CPC",
+    "Tổng tiền chạy",
+    "Số đơn",
+    "CR (%)",
+    "GMV TB",
+    "Hoa hồng",
+    "Lợi nhuận",
+    "ROI (%)",
+  ];
+
+  const rowLines = day.rows.map((r) => {
+    const shopeeClicks = sumFiltered(r.shopeeClicksByReferrer, clickSources);
+    const c = computeUiRow(r, fees, shopeeClicks);
+    return [
+      r.displayName || "(chưa đặt tên)",
+      r.adsClicks != null ? round0(r.adsClicks) : empty,
+      round0(shopeeClicks),
+      c.cpc > 0 ? round0(c.cpc) : empty,
+      r.totalSpend != null ? round0(r.totalSpend) : empty,
+      round0(r.ordersCount),
+      shopeeClicks > 0 ? round2(c.conversionRate) : empty,
+      r.ordersCount > 0 ? round0(c.orderValue) : empty,
+      round0(r.commissionTotal),
+      round0(c.profit),
+      r.totalSpend && r.totalSpend > 0 ? round2(c.profitMargin) : empty,
+    ].join("\t");
+  });
+
+  const totals = computeUiDayTotals(day, clickSources, fees);
+  const totalLine = [
+    "Tổng",
+    round0(totals.clicks),
+    round0(totals.shopeeClicks),
+    empty,
+    round0(totals.totalSpend),
+    round0(totals.orders),
+    empty,
+    empty,
+    round0(totals.commission),
+    round0(totals.profit),
+    empty,
+  ].join("\t");
+
+  return [header.join("\t"), ...rowLines, totalLine].join("\n");
+}
+
 /**
  * Khoảng cách giữa 2 mốc datetime (format ISO hoặc "YYYY-MM-DD HH:MM:SS").
  * Trả chuỗi rút gọn, "" nếu thiếu hoặc parse lỗi.

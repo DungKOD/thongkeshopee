@@ -1,6 +1,13 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { UiDay, UiRow } from "../types";
-import { computeUiDayTotals, fmtDate, fmtInt, fmtVnd, uiRowKey } from "../formulas";
+import {
+  buildDayTsv,
+  computeUiDayTotals,
+  fmtDate,
+  fmtInt,
+  fmtVnd,
+  uiRowKey,
+} from "../formulas";
 import { useSettings } from "../hooks/useSettings";
 import {
   captureElementToBlob,
@@ -77,6 +84,27 @@ export function DayBlock({
   const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
   const sectionRef = useRef<HTMLElement>(null);
   const { settings } = useSettings();
+
+  // Copy TSV → clipboard. Hiện icon "done" 1.5s rồi revert.
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(t);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    const tsv = buildDayTsv(day, settings.clickSources, settings.profitFees);
+    try {
+      await navigator.clipboard.writeText(tsv);
+      setCopied(true);
+    } catch (e) {
+      console.error("clipboard write failed", e);
+      alert(
+        "Copy thất bại — browser có thể đã chặn clipboard. Thử refresh app.",
+      );
+    }
+  };
 
   const handleScreenshot = async () => {
     if (!sectionRef.current || capturing) return;
@@ -165,6 +193,27 @@ export function DayBlock({
           )}
         </div>
         <div className="capture-hide flex items-center gap-1">
+          <button
+            onClick={handleCopy}
+            disabled={day.rows.length === 0}
+            className={`btn-ripple flex h-9 w-9 items-center justify-center rounded-full disabled:cursor-not-allowed disabled:opacity-40 ${
+              copied
+                ? "text-green-400"
+                : "text-white/60 hover:bg-shopee-500/10 hover:text-shopee-400"
+            }`}
+            title={
+              day.rows.length === 0
+                ? "Ngày chưa có dòng"
+                : copied
+                ? "Đã copy (TSV — paste vào Google Sheets/Excel)"
+                : "Copy bảng (TSV)"
+            }
+            aria-label="Copy bảng"
+          >
+            <span className="material-symbols-rounded">
+              {copied ? "done" : "content_copy"}
+            </span>
+          </button>
           <button
             onClick={handleScreenshot}
             onMouseEnter={prefetchFontEmbedCSS}
