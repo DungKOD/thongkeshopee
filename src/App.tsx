@@ -32,6 +32,9 @@ import { ImportAccountPickerDialog } from "./components/ImportAccountPickerDialo
 import { ScrollToTopButton } from "./components/ScrollToTopButton";
 import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
+import { SyncBadge } from "./components/SyncBadge";
+import { CloseWarningDialog } from "./components/CloseWarningDialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LoginScreen } from "./components/LoginScreen";
 import { PaywallScreen } from "./components/PaywallScreen";
 import { UserListDialog } from "./components/UserListDialog";
@@ -126,7 +129,14 @@ function AppInner() {
   //
   // Khi admin đang xem DB của user khác → disable sync (dirty của DB khác không
   // được upload lên Drive của admin).
-  const { isStartupPhase, syncPhase } = useCloudSync({
+  const {
+    status: syncStatus,
+    isStartupPhase,
+    syncPhase,
+    lastSyncAt,
+    error: syncError,
+    forceSync,
+  } = useCloudSync({
     mutationVersion,
     enabled: !inAdminView,
     onRemoteApplied: refetch,
@@ -139,6 +149,63 @@ function AppInner() {
     void refetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adminView?.uid]);
+
+  // Intercept Tauri close event — nếu DB dirty, chặn đóng app, show dialog
+  // cảnh báo. User chọn sync+tắt, tắt luôn, hoặc huỷ.
+  // Ref để handler luôn đọc status mới nhất (closure trong listener persist).
+  const syncStatusRef = useRef(syncStatus);
+  useEffect(() => {
+    syncStatusRef.current = syncStatus;
+  }, [syncStatus]);
+  const forceSyncRef = useRef(forceSync);
+  useEffect(() => {
+    forceSyncRef.current = forceSync;
+  }, [forceSync]);
+
+  useEffect(() => {
+    // Admin view: dirty của DB khác, không warn (sync bị disable rồi).
+    if (inAdminView) return;
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        const s = syncStatusRef.current;
+        if (s !== "dirty" && s !== "error") return; // clean, cho đóng
+        event.preventDefault();
+        setCloseWarningOpen(true);
+      })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((e) => console.error("[close] listener setup failed:", e));
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, [inAdminView]);
+
+  const handleSyncAndClose = useCallback(async () => {
+    setCloseSyncing(true);
+    try {
+      await forceSyncRef.current();
+    } catch {
+      // ignore — fallback user chọn tắt luôn hoặc huỷ.
+    } finally {
+      setCloseSyncing(false);
+    }
+    setCloseWarningOpen(false);
+    await getCurrentWindow().destroy();
+  }, []);
+
+  const handleCloseAnyway = useCallback(async () => {
+    setCloseWarningOpen(false);
+    await getCurrentWindow().destroy();
+  }, []);
+
+  const handleCancelClose = useCallback(() => {
+    setCloseWarningOpen(false);
+  }, []);
 
   const { showToast } = useToast();
   const { settings, setClickSource, registerSources, setProfitFee } =
@@ -156,6 +223,9 @@ function AppInner() {
   const [rulesOpen, setRulesOpen] = useState(false);
   const [userListOpen, setUserListOpen] = useState(false);
   const [accountMgrOpen, setAccountMgrOpen] = useState(false);
+  // Close warning: Tauri intercept event, show dialog nếu dirty.
+  const [closeWarningOpen, setCloseWarningOpen] = useState(false);
+  const [closeSyncing, setCloseSyncing] = useState(false);
   // Máy tính — open state lift lên App để header button toggle được.
   const [calcOpen, setCalcOpen] = useState<boolean>(() => {
     try {
@@ -427,6 +497,14 @@ function AppInner() {
             >
               <span className="material-symbols-rounded">calculate</span>
             </button>
+            {!inAdminView && (
+              <SyncBadge
+                status={syncStatus}
+                lastSyncAt={lastSyncAt}
+                error={syncError}
+                onForce={forceSync}
+              />
+            )}
             <button
               onClick={() => setSettingsOpen(true)}
               className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
@@ -883,6 +961,14 @@ function AppInner() {
 
       {/* FAB — hiện khi scroll sâu, click về đầu page */}
       <ScrollToTopButton />
+
+      <CloseWarningDialog
+        isOpen={closeWarningOpen}
+        syncing={closeSyncing}
+        onSyncAndClose={handleSyncAndClose}
+        onCloseAnyway={handleCloseAnyway}
+        onCancel={handleCancelClose}
+      />
 
       <PendingChangesBar
         count={pendingCount}

@@ -82,12 +82,20 @@ export function SyncBadge({
   const display = getDisplay(status, lastSyncAt);
   const canForce = status === "idle" || status === "dirty" || status === "error";
 
+  // Dirty/error → highlight container (ring + subtle pulse) để user thấy
+  // rõ DB chưa sync, khuyến khích click "Sync ngay" hoặc đợi auto.
+  const needsAttention = status === "dirty" || status === "error";
+
   return (
     <div className="relative">
       <button
         type="button"
         onClick={() => setShowMenu((v) => !v)}
-        className="btn-ripple flex max-w-[180px] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-white hover:bg-white/10"
+        className={`btn-ripple flex max-w-[180px] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-white transition-all ${
+          needsAttention
+            ? "bg-amber-500/15 ring-1 ring-amber-400/60 animate-pulse hover:bg-amber-500/25 hover:ring-amber-400"
+            : "hover:bg-white/10"
+        }`}
         title={
           error ??
           (lastSyncAt ? `Sync lần cuối: ${lastSyncAt.toLocaleString("vi-VN")}` : "")
