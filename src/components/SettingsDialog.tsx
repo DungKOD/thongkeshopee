@@ -57,10 +57,19 @@ export function SettingsDialog({
           </span>
           <h2
             id="settings-dialog-title"
-            className="text-lg font-semibold text-white/90"
+            className="flex-1 text-lg font-semibold text-white/90"
           >
             Cài đặt
           </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn-ripple flex h-9 w-9 items-center justify-center rounded-full text-white/70 hover:bg-white/10 hover:text-white"
+            title="Đóng (Esc)"
+            aria-label="Đóng"
+          >
+            <span className="material-symbols-rounded">close</span>
+          </button>
         </header>
 
         <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-5">
@@ -191,16 +200,6 @@ export function SettingsDialog({
           </section>
 
         </div>
-
-        <footer className="flex shrink-0 justify-end border-t border-surface-8 bg-surface-1 px-6 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn-ripple rounded-lg bg-shopee-500 px-5 py-2 text-sm font-medium text-white shadow-elev-2 hover:bg-shopee-600 hover:shadow-elev-4"
-          >
-            Đóng
-          </button>
-        </footer>
       </div>
     </div>,
     document.body,

@@ -232,7 +232,7 @@ export function AggregateProductDialog({
               </span>
             </div>
           </div>
-          <div className="capture-hide flex shrink-0 items-center">
+          <div className="capture-hide flex shrink-0 items-center gap-1">
             <button
               type="button"
               onClick={handleScreenshot}
@@ -246,6 +246,15 @@ export function AggregateProductDialog({
               <span className="material-symbols-rounded">
                 {capturing ? "hourglass_empty" : "photo_camera"}
               </span>
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white/80 hover:bg-white/15"
+              title="Đóng (Esc)"
+              aria-label="Đóng"
+            >
+              <span className="material-symbols-rounded">close</span>
             </button>
           </div>
         </header>
@@ -511,19 +520,9 @@ export function AggregateProductDialog({
           </Section>
         </div>
 
-        <footer className="capture-hide flex shrink-0 justify-end gap-2 border-t border-surface-8 bg-surface-1 px-6 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn-ripple rounded-lg bg-shopee-500 px-6 py-2 text-sm font-medium text-white shadow-elev-2 hover:bg-shopee-600 hover:shadow-elev-4"
-          >
-            Đóng
-          </button>
-        </footer>
-
         <ScrollToTopButton
           targetRef={scrollRef}
-          className="absolute bottom-20 right-6"
+          className="absolute bottom-6 right-6"
         />
       </div>
 
