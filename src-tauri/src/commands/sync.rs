@@ -1,11 +1,15 @@
-//! Google Drive sync commands qua Apps Script Web App proxy.
+//! DB sync commands — backup SQLite lên Cloudflare R2 qua Worker proxy.
 //!
-//! Frontend lấy Firebase ID token từ JS SDK, pass vào các command dưới đây.
-//! Apps Script verify token → thao tác Drive dưới tài khoản owner.
+//! Transport layer trong `sync_client`. File này giữ business logic:
+//! - Tauri command handlers (`sync_*`, `admin_*`)
+//! - sync_state CRUD (dirty flag, change_id, last_synced_*)
+//! - Snapshot tạo bằng `VACUUM INTO` (consistent, không đụng WAL)
+//! - gzip compress/decompress với backward-compat cho SQLite raw cũ
+//! - Pull-merge-push flow (cross-device safe, tombstones CASCADE)
+//! - Guard: fresh-install + remote có data → reject upload, route sang merge
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -14,30 +18,28 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use md5::{Digest, Md5};
 use rusqlite::params;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::fs;
 
+use super::sync_client::{self, UserListEntry};
 use super::{CmdError, CmdResult};
 use crate::db::DbState;
 
-/// Magic bytes đầu file SQLite — "SQLite format 3\0". Dùng cho backward compat
-/// detection khi download: file cũ (uncompressed) bắt đầu bằng magic này,
-/// file mới (gzipped) bắt đầu bằng `1f 8b`.
+/// Magic bytes đầu file SQLite — "SQLite format 3\0". Backward-compat detection:
+/// file cũ (uncompressed) bắt đầu bằng magic này, file mới (gzipped) bằng `1f 8b`.
 const SQLITE_MAGIC: [u8; 6] = [0x53, 0x51, 0x4C, 0x69, 0x74, 0x65];
-/// Magic bytes đầu file gzip.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
-/// Gzip compress với level 3 (fast) — cân bằng CPU/ratio. SQLite có nhiều
-/// repetition (sub_ids, index padding, schema text) → nén tỉ lệ ~3-4×.
+/// Gzip compress level 3 — fast, SQLite (nhiều repetition) nén ~3-4× là đủ.
 fn gzip_compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::with_capacity(input.len() / 3), Compression::new(3));
     encoder.write_all(input)?;
     encoder.finish()
 }
 
-/// Detect magic + decompress nếu cần. Trả raw SQLite bytes.
-/// Backward compat: bản DB cũ trên Drive (uncompressed) vẫn đọc được.
+/// Detect magic + decompress nếu cần. Backward compat: bản DB cũ (raw SQLite
+/// chưa gzip) upload lên Drive thời kỳ đầu vẫn restore được.
 fn gunzip_if_needed(input: &[u8]) -> CmdResult<Vec<u8>> {
     if input.len() >= 2 && input[0..2] == GZIP_MAGIC {
         let mut decoder = GzDecoder::new(input);
@@ -50,8 +52,6 @@ fn gunzip_if_needed(input: &[u8]) -> CmdResult<Vec<u8>> {
     if input.len() >= SQLITE_MAGIC.len() && input[0..SQLITE_MAGIC.len()] == SQLITE_MAGIC {
         return Ok(input.to_vec());
     }
-    // Dump 16 bytes đầu dưới dạng hex để debug — nguồn gốc có thể là file
-    // truncate, base64 partial, hoặc Apps Script trả wrapper lạ.
     let head_hex: String = input
         .iter()
         .take(16)
@@ -65,130 +65,8 @@ fn gunzip_if_needed(input: &[u8]) -> CmdResult<Vec<u8>> {
     )))
 }
 
-/// Timeout mặc định cho mọi HTTP call tới Apps Script.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AppsScriptRequest<'a> {
-    action: &'a str,
-    #[serde(rename = "idToken")]
-    id_token: &'a str,
-    #[serde(rename = "base64Data", skip_serializing_if = "Option::is_none")]
-    base64_data: Option<String>,
-    #[serde(rename = "mtimeMs", skip_serializing_if = "Option::is_none")]
-    mtime_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fingerprint: Option<String>,
-    #[serde(rename = "targetLocalPart", skip_serializing_if = "Option::is_none")]
-    target_local_part: Option<String>,
-
-    // Video log fields — dùng cho `logVideoDownload` / `readUserVideoLog`.
-    #[serde(rename = "videoUrl", skip_serializing_if = "Option::is_none")]
-    video_url: Option<&'a str>,
-    #[serde(rename = "videoStatus", skip_serializing_if = "Option::is_none")]
-    video_status: Option<&'a str>,
-    #[serde(rename = "videoTimestamp", skip_serializing_if = "Option::is_none")]
-    video_timestamp: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    offset: Option<i64>,
-}
-
-impl<'a> AppsScriptRequest<'a> {
-    /// Build request mới với tất cả optional fields = None.
-    fn new(action: &'a str, id_token: &'a str) -> Self {
-        Self {
-            action,
-            id_token,
-            base64_data: None,
-            mtime_ms: None,
-            fingerprint: None,
-            target_local_part: None,
-            video_url: None,
-            video_status: None,
-            video_timestamp: None,
-            limit: None,
-            offset: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct AppsScriptResponse {
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    code: Option<u16>,
-
-    #[serde(default, rename = "fileId")]
-    file_id: Option<String>,
-    #[serde(default, rename = "sizeBytes")]
-    size_bytes: Option<u64>,
-    #[serde(default, rename = "lastModified")]
-    last_modified: Option<i64>,
-    #[serde(default)]
-    existed: Option<bool>,
-    #[serde(default)]
-    exists: Option<bool>,
-    #[serde(default, rename = "base64Data")]
-    base64_data: Option<String>,
-    #[serde(default)]
-    users: Option<Vec<UserListEntry>>,
-    #[serde(default)]
-    fingerprint: Option<String>,
-
-    #[serde(default, rename = "videoLogs")]
-    video_logs: Option<Vec<VideoLogRow>>,
-}
-
-/// Row từ Google Sheet — trả về cho admin khi xem log của user khác.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VideoLogRow {
-    pub timestamp: String,
-    pub url: String,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct UserListEntry {
-    pub uid: String,
-    pub email: Option<String>,
-    #[serde(rename = "localPart")]
-    pub local_part: Option<String>,
-    #[serde(default)]
-    pub premium: bool,
-    #[serde(default)]
-    pub admin: bool,
-    #[serde(rename = "expiredAt")]
-    pub expired_at: Option<String>,
-    #[serde(rename = "createdAt")]
-    pub created_at: Option<String>,
-    pub file: Option<UserListFileMeta>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct UserListFileMeta {
-    #[serde(rename = "fileId")]
-    pub file_id: String,
-    #[serde(rename = "sizeBytes")]
-    pub size_bytes: u64,
-    #[serde(rename = "lastModified")]
-    pub last_modified: i64,
-}
-
 #[derive(Debug, Serialize)]
-pub struct DriveCheckResult {
-    pub existed: bool,
-    pub file_id: String,
-    pub size_bytes: u64,
-    pub last_modified_ms: i64,
-    pub fingerprint: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DriveMetadataResult {
+pub struct SyncMetadataResult {
     pub exists: bool,
     pub file_id: Option<String>,
     pub size_bytes: Option<u64>,
@@ -197,11 +75,18 @@ pub struct DriveMetadataResult {
 }
 
 #[derive(Debug, Serialize)]
-pub struct DriveUploadResult {
+pub struct SyncUploadResult {
     pub file_id: String,
     pub size_bytes: u64,
     pub last_modified_ms: i64,
     pub fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncDownloadResult {
+    pub target_path: String,
+    pub size_bytes: u64,
+    pub last_modified_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,53 +102,10 @@ pub struct SyncState {
     pub last_synced_at_ms: Option<i64>,
     pub last_synced_remote_mtime_ms: Option<i64>,
     pub last_error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DriveDownloadResult {
-    pub target_path: String,
-    pub size_bytes: u64,
-    pub last_modified_ms: i64,
-}
-
-/// Gọi Apps Script Web App với action + id_token, trả về response đã parse.
-/// Raise lỗi nếu HTTP non-2xx hoặc `ok: false`.
-async fn call_apps_script(
-    url: &str,
-    req: AppsScriptRequest<'_>,
-) -> CmdResult<AppsScriptResponse> {
-    let client = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(CmdError::from)?;
-
-    let res = client
-        .post(url)
-        .json(&req)
-        .send()
-        .await
-        .map_err(CmdError::from)?;
-
-    let status = res.status();
-    let text = res.text().await.map_err(CmdError::from)?;
-
-    if !status.is_success() {
-        return Err(CmdError::msg(format!(
-            "Apps Script HTTP {}: {}",
-            status.as_u16(),
-            text
-        )));
-    }
-
-    let parsed: AppsScriptResponse = serde_json::from_str(&text)
-        .map_err(|e| CmdError::msg(format!("parse response: {e} — body: {text}")))?;
-
-    if !parsed.ok {
-        let code = parsed.code.unwrap_or(500);
-        let msg = parsed.error.unwrap_or_else(|| "unknown".into());
-        return Err(CmdError::msg(format!("Apps Script {}: {}", code, msg)));
-    }
-    Ok(parsed)
+    /// Firebase UID cuối cùng sở hữu/sync DB này. Null = DB vừa init chưa có
+    /// user (pre-migration). FE compare với current user — khác = wipe.
+    #[serde(rename = "ownerUid")]
+    pub owner_uid: Option<String>,
 }
 
 /// Compute machine fingerprint: MD5(os | hostname | machine-uid) → hex string.
@@ -278,7 +120,6 @@ pub fn machine_fingerprint_raw() -> String {
 }
 
 fn whoami_hostname() -> Option<String> {
-    // std::env không có hostname API cross-platform. Thử HOSTNAME / COMPUTERNAME.
     std::env::var("COMPUTERNAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -290,47 +131,20 @@ pub fn machine_fingerprint() -> String {
     machine_fingerprint_raw()
 }
 
-/// Kiểm tra DB file của user có trên Drive chưa. Nếu chưa, tạo empty file.
+/// Metadata-only check (HEAD object trên R2). Không tạo gì cả — R2 lazy-create
+/// khi upload, không cần endpoint "checkOrCreate" như Drive cũ.
 #[tauri::command]
-pub async fn drive_check_or_create(
-    apps_script_url: String,
+pub async fn sync_metadata(
+    sync_api_url: String,
     id_token: String,
-) -> CmdResult<DriveCheckResult> {
-    let res = call_apps_script(
-        &apps_script_url,
-        AppsScriptRequest::new("checkOrCreate", &id_token),
-    )
-    .await?;
-
-    Ok(DriveCheckResult {
-        existed: res.existed.unwrap_or(false),
-        file_id: res
-            .file_id
-            .ok_or_else(|| CmdError::msg("missing fileId"))?,
-        size_bytes: res.size_bytes.unwrap_or(0),
-        last_modified_ms: res.last_modified.unwrap_or(0),
-        fingerprint: res.fingerprint,
-    })
-}
-
-/// Metadata-only check: có file chưa, kích thước, mtime. Không tạo mới.
-#[tauri::command]
-pub async fn drive_metadata(
-    apps_script_url: String,
-    id_token: String,
-) -> CmdResult<DriveMetadataResult> {
-    let res = call_apps_script(
-        &apps_script_url,
-        AppsScriptRequest::new("metadata", &id_token),
-    )
-    .await?;
-
-    Ok(DriveMetadataResult {
-        exists: res.exists.unwrap_or(false),
-        file_id: res.file_id,
-        size_bytes: res.size_bytes,
-        last_modified_ms: res.last_modified,
-        fingerprint: res.fingerprint,
+) -> CmdResult<SyncMetadataResult> {
+    let m = sync_client::metadata(&sync_api_url, &id_token).await?;
+    Ok(SyncMetadataResult {
+        exists: m.exists,
+        file_id: m.file_id,
+        size_bytes: m.size_bytes,
+        last_modified_ms: m.last_modified,
+        fingerprint: m.fingerprint,
     })
 }
 
@@ -340,7 +154,7 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
     let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let row = conn.query_row(
         "SELECT dirty, change_id, last_uploaded_change_id,
-                last_synced_at_ms, last_synced_remote_mtime_ms, last_error
+                last_synced_at_ms, last_synced_remote_mtime_ms, last_error, owner_uid
          FROM sync_state WHERE id = 1",
         [],
         |r| {
@@ -351,6 +165,7 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, Option<i64>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         },
     )?;
@@ -361,7 +176,84 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
         last_synced_at_ms: row.3,
         last_synced_remote_mtime_ms: row.4,
         last_error: row.5,
+        owner_uid: row.6,
     })
+}
+
+/// Multi-tenant guard — wipe local DB nếu owner_uid != new_uid (khác user
+/// đang login so với lần trước). Idempotent: cùng user → no-op, chỉ stamp
+/// owner_uid nếu chưa có.
+///
+/// Flow: FE gọi NGAY SAU khi Firebase auth ready (trước mọi sync) với
+/// `new_uid = currentUser.uid`. Nếu return `true` = DB đã wipe, FE refetch
+/// sync_state + trigger pull-merge-push (R2 sẽ restore data nếu user mới có
+/// backup, hoặc DB ở trạng thái empty clean nếu chưa có).
+#[tauri::command]
+pub async fn sync_reset_for_new_user(
+    db: State<'_, DbState>,
+    new_uid: String,
+) -> CmdResult<bool> {
+    if new_uid.is_empty() {
+        return Err(CmdError::msg("new_uid rỗng — phải là Firebase UID hợp lệ"));
+    }
+    let mut conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let current_owner: Option<String> = conn
+        .query_row(
+            "SELECT owner_uid FROM sync_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+
+    // Same user → chỉ đảm bảo owner stamped (pre-migration DB có thể null).
+    if current_owner.as_deref() == Some(new_uid.as_str()) {
+        return Ok(false);
+    }
+
+    let need_wipe = current_owner.is_some();
+
+    if need_wipe {
+        eprintln!(
+            "[sync_reset] owner change: {} → {} — wipe local DB",
+            current_owner.as_deref().unwrap_or("<none>"),
+            new_uid,
+        );
+        let tx = conn.transaction().map_err(CmdError::from)?;
+        // Thứ tự DELETE: leaf tables trước (triggers tăng change_id nhưng ta
+        // sẽ reset về 0 ở UPDATE sync_state cuối). `days` DELETE CASCADE xóa
+        // imported_files, raw_*, manual_entries — nhưng triggers chạy sao chắc,
+        // ta explicit DELETE từng bảng để không dính FK issue.
+        tx.execute("DELETE FROM raw_shopee_clicks", [])?;
+        tx.execute("DELETE FROM raw_shopee_order_items", [])?;
+        tx.execute("DELETE FROM raw_fb_ads", [])?;
+        tx.execute("DELETE FROM manual_entries", [])?;
+        tx.execute("DELETE FROM imported_files", [])?;
+        tx.execute("DELETE FROM days", [])?;
+        tx.execute("DELETE FROM tombstones", [])?;
+        // Reset sync_state — change_id bị trigger tăng vì DELETE ở trên, ta
+        // force về 0 + stamp owner mới.
+        tx.execute(
+            "UPDATE sync_state SET
+                dirty = 1,
+                change_id = 0,
+                last_uploaded_change_id = 0,
+                last_synced_at_ms = NULL,
+                last_synced_remote_mtime_ms = NULL,
+                last_error = NULL,
+                owner_uid = ?1
+             WHERE id = 1",
+            params![new_uid],
+        )?;
+        tx.commit().map_err(CmdError::from)?;
+    } else {
+        // Pre-migration DB / fresh install — chỉ stamp owner, không wipe.
+        conn.execute(
+            "UPDATE sync_state SET owner_uid = ?1 WHERE id = 1",
+            params![new_uid],
+        )?;
+    }
+
+    Ok(need_wipe)
 }
 
 /// Ghi lỗi sync vào sync_state.last_error (không đổi dirty). Dùng khi upload fail.
@@ -378,16 +270,19 @@ pub async fn sync_state_record_error(
     Ok(())
 }
 
-/// Upload snapshot DB lên Drive. Dùng VACUUM INTO để tạo file consistent
-/// (không đụng WAL của DB đang live).
+/// Upload snapshot DB lên R2. VACUUM INTO tạo file consistent (không đụng WAL).
+///
+/// DEFENSIVE GUARD: nếu `change_id = 0 AND last_uploaded_change_id = 0`, DB là
+/// fresh (reinstall chưa có mutation) → reject upload để không đè data có sẵn
+/// trên R2. FE có trách nhiệm route sang `sync_pull_merge_push`.
 #[tauri::command]
-pub async fn drive_upload_db(
+pub async fn sync_upload_db(
     app: AppHandle,
     db: State<'_, DbState>,
-    apps_script_url: String,
+    sync_api_url: String,
     id_token: String,
     remote_exists: bool,
-) -> CmdResult<DriveUploadResult> {
+) -> CmdResult<SyncUploadResult> {
     let _ = app.emit("sync-phase", "uploading");
     let snapshot_path = app
         .path()
@@ -395,14 +290,8 @@ pub async fn drive_upload_db(
         .map_err(|e| CmdError::msg(format!("app_data_dir: {e}")))?
         .join("thongkeshopee.backup.db");
 
-    // Xóa snapshot cũ nếu còn lại từ lần trước thất bại.
     let _ = fs::remove_file(&snapshot_path).await;
 
-    // VACUUM INTO — SQLite tạo clean copy không có WAL.
-    // Đồng thời đọc change_id tại thời điểm snapshot để CAS sau upload.
-    // DEFENSIVE GUARD: nếu `change_id = 0 AND last_uploaded_change_id = 0`,
-    // DB là fresh (reinstall chưa có mutation) → reject upload để không đè
-    // data có sẵn trên Drive. FE có trách nhiệm route sang pull-merge-push.
     let change_id_at_snapshot: i64 = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         let (change_id, last_uploaded): (i64, i64) = conn.query_row(
@@ -411,12 +300,11 @@ pub async fn drive_upload_db(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         // Chặn case duy nhất gây mất data: local fresh (chưa có mutation nào
-        // từ install này) + remote ĐÃ có data trên Drive → upload sẽ đè mất
-        // backup cũ. User mới hoàn toàn (remote_exists=false) vẫn upload được
-        // để khởi tạo file trên Drive.
+        // từ install này) + remote ĐÃ có data → upload sẽ đè mất backup cũ.
+        // User mới hoàn toàn (remote_exists=false) vẫn upload được để khởi tạo.
         if change_id == 0 && last_uploaded == 0 && remote_exists {
             return Err(CmdError::msg(
-                "DB fresh + Drive đã có data — route sang drive_pull_merge_push để restore, tránh đè.",
+                "DB fresh + R2 đã có data — route sang sync_pull_merge_push để restore, tránh đè.",
             ));
         }
         let path_str = snapshot_path
@@ -432,37 +320,24 @@ pub async fn drive_upload_db(
     let mtime_ms = now_ms();
     let fingerprint = machine_fingerprint_raw();
 
-    // Gzip trước khi base64 — SQLite nén ~3-4× → giảm request payload qua
-    // Apps Script (giới hạn 50MB/request). Level 3 = fast, lợi nhất cho DB.
     let gzipped = gzip_compress(&bytes)
         .map_err(|e| CmdError::msg(format!("gzip: {e}")))?;
     eprintln!(
-        "drive upload: raw={} KB → gzipped={} KB ({:.1}%)",
+        "sync upload: raw={} KB → gzipped={} KB ({:.1}%)",
         raw_len / 1024,
         gzipped.len() / 1024,
         (gzipped.len() as f64 / raw_len.max(1) as f64) * 100.0,
     );
     let base64 = BASE64.encode(&gzipped);
 
-    let res = call_apps_script(
-        &apps_script_url,
-        AppsScriptRequest {
-            base64_data: Some(base64),
-            mtime_ms: Some(mtime_ms),
-            fingerprint: Some(fingerprint.clone()),
-            ..AppsScriptRequest::new("upload", &id_token)
-        },
-    )
-    .await?;
+    let res = sync_client::upload(&sync_api_url, &id_token, &base64, mtime_ms, &fingerprint)
+        .await?;
 
-    // Cleanup snapshot sau khi upload xong.
     let _ = fs::remove_file(&snapshot_path).await;
+    let remote_mtime = res.last_modified;
 
-    let remote_mtime = res.last_modified.unwrap_or(mtime_ms);
-
-    // Upload thành công → CAS clear dirty CHỈ KHI change_id chưa tăng từ snapshot.
-    // Nếu mutation xảy ra trong lúc upload → change_id > snapshot → dirty giữ = 1
-    // để lần upload tiếp theo xử lý. Tránh race: upload cũ KHÔNG chứa mutation sau snapshot.
+    // CAS clear dirty CHỈ KHI change_id chưa tăng từ snapshot — tránh race với
+    // mutation xảy ra trong lúc upload.
     {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         conn.execute(
@@ -477,42 +352,31 @@ pub async fn drive_upload_db(
         )?;
     }
 
-    Ok(DriveUploadResult {
-        file_id: res
-            .file_id
-            .ok_or_else(|| CmdError::msg("missing fileId"))?,
-        size_bytes: res.size_bytes.unwrap_or(bytes.len() as u64),
+    Ok(SyncUploadResult {
+        file_id: res.file_id,
+        size_bytes: res.size_bytes,
         last_modified_ms: remote_mtime,
-        fingerprint: res.fingerprint.unwrap_or(fingerprint),
+        fingerprint: res.fingerprint,
     })
 }
 
-/// Download DB file từ Drive, ghi vào `pending_db_path` trong app_data_dir.
-/// KHÔNG ghi đè DB đang live — frontend phải prompt user restart app để apply.
+/// Download DB từ R2, ghi vào `pending_db_path` trong app_data_dir.
+/// KHÔNG ghi đè DB đang live — FE phải prompt user restart app để apply.
 #[tauri::command]
-pub async fn drive_download_db(
+pub async fn sync_download_db(
     app: AppHandle,
-    apps_script_url: String,
+    sync_api_url: String,
     id_token: String,
-) -> CmdResult<DriveDownloadResult> {
-    let res = call_apps_script(
-        &apps_script_url,
-        AppsScriptRequest::new("download", &id_token),
-    )
-    .await?;
+) -> CmdResult<SyncDownloadResult> {
+    let dl = sync_client::download(&sync_api_url, &id_token).await?;
 
-    let base64 = res
-        .base64_data
-        .ok_or_else(|| CmdError::msg("missing base64Data"))?;
     let raw_payload = BASE64
-        .decode(base64.as_bytes())
+        .decode(dl.base64_data.as_bytes())
         .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
 
-    // Auto-detect gzip vs uncompressed (backward compat cho backup cũ chưa
-    // nén trên Drive). Trả raw SQLite bytes để ghi pending file.
     let bytes = gunzip_if_needed(&raw_payload)?;
     eprintln!(
-        "drive_download_db: payload={} KB → sqlite={} KB",
+        "sync_download_db: payload={} KB → sqlite={} KB",
         raw_payload.len() / 1024,
         bytes.len() / 1024,
     );
@@ -523,17 +387,16 @@ pub async fn drive_download_db(
     }
     fs::write(&target, &bytes).await.map_err(CmdError::from)?;
 
-    Ok(DriveDownloadResult {
+    Ok(SyncDownloadResult {
         target_path: target.to_string_lossy().into_owned(),
         size_bytes: bytes.len() as u64,
-        last_modified_ms: res.last_modified.unwrap_or_else(now_ms),
+        last_modified_ms: dl.last_modified,
     })
 }
 
-/// Apply pending DB file (từ `drive_download_db`) — rename thành DB chính.
-/// Gọi khi app đang ở trạng thái an toàn (startup trước khi init DB).
+/// Apply pending DB file (từ `sync_download_db`) — rename thành DB chính.
 #[tauri::command]
-pub async fn drive_apply_pending(app: AppHandle) -> CmdResult<bool> {
+pub async fn sync_apply_pending(app: AppHandle) -> CmdResult<bool> {
     apply_pending_sync(&app).map_err(|e| CmdError::msg(e.to_string()))
 }
 
@@ -554,7 +417,6 @@ pub fn apply_pending_sync(app: &AppHandle) -> anyhow::Result<bool> {
 
     // Validate pending DB integrity TRƯỚC khi swap — tránh file corrupt
     // (download dở, gzip partial, disk error) làm app crash ở startup.
-    // Nếu fail → xóa pending, giữ live DB cũ, báo lỗi.
     {
         let conn = Connection::open(&pending)
             .map_err(|e| anyhow::anyhow!("mở pending DB thất bại: {e}"))?;
@@ -568,7 +430,7 @@ pub fn apply_pending_sync(app: &AppHandle) -> anyhow::Result<bool> {
                 result
             );
         }
-    } // drop connection trước rename
+    }
 
     let live = crate::db::resolve_db_path(app)?;
 
@@ -579,159 +441,31 @@ pub fn apply_pending_sync(app: &AppHandle) -> anyhow::Result<bool> {
         std_fs::rename(&live, &backup)?;
     }
 
-    // WAL và SHM cũ (nếu có) không còn hợp lệ với DB mới → xóa.
+    // WAL và SHM cũ không còn hợp lệ với DB mới → xóa.
     for ext in &["db-wal", "db-shm"] {
         let aux = live.with_extension(ext);
-        let _ = std_fs::remove_file(&aux);
+        let _ = std_fs::remove_file(aux);
     }
 
     std_fs::rename(&pending, &live)?;
     Ok(true)
 }
 
-/// Restart app — dùng sau khi `drive_download_db` ghi file pending.
-/// `apply_pending_sync` chạy trong `setup()` trước `db::init_db` sẽ swap pending → live,
-/// đảm bảo DB mới đã load xong trước khi UI render.
+/// Restart app — dùng sau khi `sync_download_db` ghi file pending.
+/// `apply_pending_sync` chạy trong `setup()` trước `db::init_db` sẽ swap pending → live.
 #[tauri::command]
 pub fn restart_app(app: AppHandle) {
     app.restart();
 }
 
-/// Admin-only: list toàn bộ users + metadata file trong Drive.
-/// Verify admin server-side trong Apps Script qua Firestore rules.
+/// Admin-only: list toàn bộ users + metadata file trên R2.
+/// Worker verify admin qua `ADMIN_UIDS` secret.
 #[tauri::command]
-pub async fn drive_list_users(
-    apps_script_url: String,
+pub async fn admin_list_users(
+    sync_api_url: String,
     id_token: String,
 ) -> CmdResult<Vec<UserListEntry>> {
-    as_list_users(&apps_script_url, &id_token).await
-}
-
-/// Helper crate-internal: gọi AS `listUsers` trả về danh sách user.
-/// Dùng bởi `drive_list_users` (tauri command) + `admin_fetch_user_list`
-/// (cache to DB flow).
-pub(crate) async fn as_list_users(
-    apps_script_url: &str,
-    id_token: &str,
-) -> CmdResult<Vec<UserListEntry>> {
-    let res = call_apps_script(
-        apps_script_url,
-        AppsScriptRequest::new("listUsers", id_token),
-    )
-    .await?;
-    Ok(res.users.unwrap_or_default())
-}
-
-/// Best-effort post log video download vào Google Sheet qua Apps Script.
-/// Apps Script verify token → derive local_part từ email → append row vào tab cùng tên.
-/// `status` bắt buộc là `"success"` hoặc `"failed"` (Apps Script map sang tiếng Việt).
-/// `timestamp` định dạng `HH:MM:SS DD/MM/YYYY` (BE format theo local time máy user).
-pub(crate) async fn as_log_video_download(
-    apps_script_url: &str,
-    id_token: &str,
-    url: &str,
-    status: &str,
-    timestamp: &str,
-) -> CmdResult<()> {
-    call_apps_script(
-        apps_script_url,
-        AppsScriptRequest {
-            video_url: Some(url),
-            video_status: Some(status),
-            video_timestamp: Some(timestamp),
-            ..AppsScriptRequest::new("logVideoDownload", id_token)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Admin-only: xóa 1 row cụ thể trong sheet tab của target user.
-/// Match qua tuple (timestamp, url, status) — AS scan toàn sheet tìm first match.
-pub(crate) async fn as_delete_user_video_log_row(
-    apps_script_url: &str,
-    id_token: &str,
-    target_local_part: &str,
-    timestamp: &str,
-    url: &str,
-    status: &str,
-) -> CmdResult<()> {
-    call_apps_script(
-        apps_script_url,
-        AppsScriptRequest {
-            target_local_part: Some(target_local_part.to_string()),
-            video_url: Some(url),
-            video_status: Some(status),
-            video_timestamp: Some(timestamp),
-            ..AppsScriptRequest::new("deleteUserVideoLogRow", id_token)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Admin-only: xóa toàn bộ sheet tab của target user (`ss.deleteSheet`).
-pub(crate) async fn as_delete_user_video_log_sheet(
-    apps_script_url: &str,
-    id_token: &str,
-    target_local_part: &str,
-) -> CmdResult<()> {
-    call_apps_script(
-        apps_script_url,
-        AppsScriptRequest {
-            target_local_part: Some(target_local_part.to_string()),
-            ..AppsScriptRequest::new("deleteUserVideoLogSheet", id_token)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Helper crate-internal: gọi AS `downloadForUser` — admin tải DB của user
-/// khác. Trả về `(base64Data, sizeBytes, lastModifiedMs)`. AS verify admin
-/// server-side qua Firestore, 403 nếu caller không phải admin.
-pub(crate) async fn as_download_for_user(
-    apps_script_url: &str,
-    id_token: &str,
-    target_local_part: &str,
-) -> CmdResult<(String, u64, i64)> {
-    let res = call_apps_script(
-        apps_script_url,
-        AppsScriptRequest {
-            target_local_part: Some(target_local_part.to_string()),
-            ..AppsScriptRequest::new("downloadForUser", id_token)
-        },
-    )
-    .await?;
-
-    let base64 = res
-        .base64_data
-        .ok_or_else(|| CmdError::msg("missing base64Data"))?;
-    let size = res.size_bytes.unwrap_or(0);
-    let mtime = res.last_modified.unwrap_or_else(now_ms);
-    Ok((base64, size, mtime))
-}
-
-/// Helper crate-internal: gọi AS `readUserVideoLog` 1 trang. Admin check chạy
-/// trong AS (verify Firestore). Caller tự lo xem phân trang / loop.
-pub(crate) async fn as_read_user_video_log(
-    apps_script_url: &str,
-    id_token: &str,
-    target_local_part: &str,
-    limit: i64,
-    offset: i64,
-) -> CmdResult<Vec<VideoLogRow>> {
-    let res = call_apps_script(
-        apps_script_url,
-        AppsScriptRequest {
-            target_local_part: Some(target_local_part.to_string()),
-            limit: Some(limit),
-            offset: Some(offset),
-            ..AppsScriptRequest::new("readUserVideoLog", id_token)
-        },
-    )
-    .await?;
-    Ok(res.video_logs.unwrap_or_default())
+    sync_client::admin_list_users(&sync_api_url, &id_token).await
 }
 
 fn pending_db_path(app: &AppHandle) -> CmdResult<PathBuf> {
@@ -753,33 +487,28 @@ fn now_ms() -> i64 {
 // =============================================================
 // Pull + Merge + Push flow (sync v2).
 //
-// 1. Download remote DB (nếu tồn tại) → file temp cùng app_data_dir.
-// 2. ATTACH temp DB → merge theo rule local-win (INSERT OR IGNORE).
-// 3. Apply tombstones (local + từ remote) → xóa row đã bị đánh dấu xóa.
-// 4. DETACH, xóa file temp.
-// 5. VACUUM INTO snapshot → upload lên Drive → update `sync_state`.
+// 1. Metadata check. Nếu remote chưa tồn tại → skip pull, upload thẳng.
+// 2. Download remote → file temp cùng app_data_dir.
+// 3. ATTACH temp DB → merge theo rule local-win (INSERT OR IGNORE).
+// 4. Apply tombstones (local + từ remote) → xóa row đã bị đánh dấu xóa.
+// 5. DETACH, xóa file temp.
+// 6. VACUUM INTO snapshot → upload → update `sync_state`.
 //
-// Re-map source_file_id: AUTO_INCREMENT id giữa 2 DB có thể khác,
-// phải JOIN qua `imported_files.file_hash` để tìm id local tương ứng.
+// Re-map source_file_id: AUTO_INCREMENT id giữa 2 DB có thể khác, phải JOIN
+// qua `imported_files.file_hash` để tìm id local tương ứng.
 // =============================================================
 
-/// Command chính cho flow pull-merge-push. Dùng thay thế `drive_upload_db`
-/// khi muốn đồng bộ an toàn cross-device (không overwrite data máy khác).
 #[tauri::command]
-pub async fn drive_pull_merge_push(
+pub async fn sync_pull_merge_push(
     app: AppHandle,
     db: State<'_, DbState>,
-    apps_script_url: String,
+    sync_api_url: String,
     id_token: String,
-) -> CmdResult<DriveUploadResult> {
-    eprintln!("=== drive_pull_merge_push: START ===");
-    // 1. Metadata check. Nếu remote chưa tồn tại → skip pull, chỉ upload.
-    let meta = call_apps_script(
-        &apps_script_url,
-        AppsScriptRequest::new("metadata", &id_token),
-    )
-    .await?;
-    let remote_exists = meta.exists.unwrap_or(false);
+) -> CmdResult<SyncUploadResult> {
+    eprintln!("=== sync_pull_merge_push: START ===");
+    // 1. Metadata check.
+    let meta = sync_client::metadata(&sync_api_url, &id_token).await?;
+    let remote_exists = meta.exists;
     eprintln!(
         "  metadata: exists={}, size={:?}, mtime={:?}",
         remote_exists, meta.size_bytes, meta.last_modified
@@ -788,18 +517,10 @@ pub async fn drive_pull_merge_push(
     // 2. Download remote → temp path (nếu tồn tại).
     let temp_path_opt: Option<PathBuf> = if remote_exists {
         let _ = app.emit("sync-phase", "downloading");
-        let dl = call_apps_script(
-            &apps_script_url,
-            AppsScriptRequest::new("download", &id_token),
-        )
-        .await?;
-        let base64 = dl
-            .base64_data
-            .ok_or_else(|| CmdError::msg("missing base64Data"))?;
+        let dl = sync_client::download(&sync_api_url, &id_token).await?;
         let raw_payload = BASE64
-            .decode(base64.as_bytes())
+            .decode(dl.base64_data.as_bytes())
             .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
-        // Auto-detect gzip vs uncompressed (backward compat với backup cũ).
         let bytes = gunzip_if_needed(&raw_payload)?;
         eprintln!(
             "  download: payload={} KB → sqlite={} KB",
@@ -812,7 +533,6 @@ pub async fn drive_pull_merge_push(
             .map_err(|e| CmdError::msg(format!("app_data_dir: {e}")))?
             .join("thongkeshopee.merge.db");
         let _ = fs::remove_file(&temp_path).await;
-        // WAL/SHM cũ nếu còn → xóa để SQLite không đọc nhầm.
         for ext in &["db-wal", "db-shm"] {
             let _ = fs::remove_file(temp_path.with_extension(ext)).await;
         }
@@ -839,13 +559,10 @@ pub async fn drive_pull_merge_push(
                 .to_str()
                 .ok_or_else(|| CmdError::msg("remote path không UTF-8"))?;
 
-            // ATTACH phải chạy ngoài transaction.
             conn.execute("ATTACH DATABASE ?1 AS remote", params![path_str])
                 .map_err(CmdError::from)?;
 
-            // Merge + apply tombstones trong 1 transaction. DETACH sau khi commit/rollback.
             let merge_res: Result<(), CmdError> = (|| {
-                // Count trước merge — để biết mức độ trống của main.
                 let before_days: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM main.days",
                     [],
@@ -889,7 +606,6 @@ pub async fn drive_pull_merge_push(
                 let tx = conn.transaction().map_err(CmdError::from)?;
                 merge_remote_into_local(&tx)?;
                 apply_tombstones(&tx)?;
-                // Cleanup days orphan (không còn raw/manual) — UI sẽ không hiển thị.
                 tx.execute(
                     "DELETE FROM days WHERE date NOT IN (
                         SELECT day_date FROM raw_shopee_clicks UNION
@@ -902,7 +618,6 @@ pub async fn drive_pull_merge_push(
                 .map_err(CmdError::from)?;
                 tx.commit().map_err(CmdError::from)?;
 
-                // Count sau merge + apply_tombstones.
                 let after_days: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM main.days",
                     [],
@@ -935,20 +650,16 @@ pub async fn drive_pull_merge_push(
                 Ok(())
             })();
 
-            // DETACH bất kể merge thành/bại để không leak handle.
             let _ = conn.execute("DETACH DATABASE remote", []);
-
             merge_res?;
         }
 
-        // Đọc change_id tại thời điểm snapshot để CAS clear dirty sau upload.
         let change_id: i64 = conn.query_row(
             "SELECT change_id FROM sync_state WHERE id = 1",
             [],
             |r| r.get::<_, i64>(0),
         )?;
 
-        // VACUUM INTO snapshot — clean copy không có WAL.
         let snap_str = snapshot_path
             .to_str()
             .ok_or_else(|| CmdError::msg("snapshot path không UTF-8"))?;
@@ -958,45 +669,32 @@ pub async fn drive_pull_merge_push(
         change_id
     };
 
-    // 4. Cleanup file temp sau khi DETACH + snapshot xong.
     if let Some(temp) = temp_path_opt.as_ref() {
         let _ = fs::remove_file(temp).await;
     }
 
-    // 5. Upload snapshot.
     let _ = app.emit("sync-phase", "uploading");
     let bytes = fs::read(&snapshot_path).await.map_err(CmdError::from)?;
     let raw_len = bytes.len();
     let mtime_ms = now_ms();
     let fingerprint = machine_fingerprint_raw();
 
-    // Gzip trước khi base64 — SQLite nén ~3-4× → giảm request payload qua
-    // Apps Script (giới hạn 50MB/request). Level 3 = fast, lợi nhất cho DB.
     let gzipped = gzip_compress(&bytes)
         .map_err(|e| CmdError::msg(format!("gzip: {e}")))?;
     eprintln!(
-        "drive upload: raw={} KB → gzipped={} KB ({:.1}%)",
+        "sync upload: raw={} KB → gzipped={} KB ({:.1}%)",
         raw_len / 1024,
         gzipped.len() / 1024,
         (gzipped.len() as f64 / raw_len.max(1) as f64) * 100.0,
     );
     let base64 = BASE64.encode(&gzipped);
 
-    let res = call_apps_script(
-        &apps_script_url,
-        AppsScriptRequest {
-            base64_data: Some(base64),
-            mtime_ms: Some(mtime_ms),
-            fingerprint: Some(fingerprint.clone()),
-            ..AppsScriptRequest::new("upload", &id_token)
-        },
-    )
-    .await?;
+    let res = sync_client::upload(&sync_api_url, &id_token, &base64, mtime_ms, &fingerprint)
+        .await?;
 
     let _ = fs::remove_file(&snapshot_path).await;
-    let remote_mtime = res.last_modified.unwrap_or(mtime_ms);
+    let remote_mtime = res.last_modified;
 
-    // 6. Update sync_state (CAS clear dirty nếu change_id không tăng trong lúc merge+upload).
     {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         conn.execute(
@@ -1011,13 +709,11 @@ pub async fn drive_pull_merge_push(
         )?;
     }
 
-    Ok(DriveUploadResult {
-        file_id: res
-            .file_id
-            .ok_or_else(|| CmdError::msg("missing fileId"))?,
-        size_bytes: res.size_bytes.unwrap_or(bytes.len() as u64),
+    Ok(SyncUploadResult {
+        file_id: res.file_id,
+        size_bytes: res.size_bytes,
         last_modified_ms: remote_mtime,
-        fingerprint: res.fingerprint.unwrap_or(fingerprint),
+        fingerprint: res.fingerprint,
     })
 }
 
@@ -1054,7 +750,7 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
         [],
     )?;
 
-    // 4. raw_shopee_order_items — UNIQUE (checkout_id, item_id, model_id). Re-map source_file_id.
+    // 4. raw_shopee_order_items — UNIQUE (checkout_id, item_id, model_id).
     tx.execute(
         "INSERT OR IGNORE INTO main.raw_shopee_order_items
          (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
@@ -1071,7 +767,7 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
         [],
     )?;
 
-    // 5. raw_fb_ads — UNIQUE (day_date, level, name). Re-map source_file_id.
+    // 5. raw_fb_ads — UNIQUE (day_date, level, name).
     tx.execute(
         "INSERT OR IGNORE INTO main.raw_fb_ads
          (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
@@ -1086,11 +782,8 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
         [],
     )?;
 
-    // 6. manual_entries — UNIQUE(sub_ids, day_date). UPSERT với last-write-wins
-    // theo `updated_at` (ISO8601 → string compare đúng trình tự). Khi cùng key:
-    //   - remote.updated_at > local.updated_at → override fields từ remote
-    //   - remote.updated_at <= local.updated_at → giữ local (không update)
-    // `WHERE true` phân biệt INSERT...SELECT với ON CONFLICT clause (SQLite parser).
+    // 6. manual_entries — UNIQUE(sub_ids, day_date). UPSERT last-write-wins
+    // theo `updated_at` (ISO8601 → string compare đúng trình tự).
     tx.execute(
         "INSERT INTO main.manual_entries
          (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
@@ -1113,18 +806,9 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
         [],
     )?;
 
-    // 7. video_downloads — không có UNIQUE → dedup by (url, downloaded_at_ms) qua NOT EXISTS.
-    tx.execute(
-        "INSERT INTO main.video_downloads (url, downloaded_at_ms, status)
-         SELECT r.url, r.downloaded_at_ms, r.status FROM remote.video_downloads r
-         WHERE NOT EXISTS (
-            SELECT 1 FROM main.video_downloads m
-            WHERE m.url = r.url AND m.downloaded_at_ms = r.downloaded_at_ms
-         )",
-        [],
-    )?;
-
-    // 8. tombstones — UNIQUE(entity_type, entity_key).
+    // 7. tombstones — UNIQUE(entity_type, entity_key).
+    // (video_downloads đã move sang video_logs.db ở migration v4 — không merge
+    // trong flow DB sync, video log đồng bộ qua Apps Script Google Sheet riêng.)
     tx.execute(
         "INSERT OR IGNORE INTO main.tombstones (entity_type, entity_key, deleted_at)
          SELECT entity_type, entity_key, deleted_at FROM remote.tombstones",
@@ -1179,7 +863,6 @@ fn apply_tombstones(tx: &rusqlite::Transaction) -> CmdResult<()> {
             continue;
         };
 
-        // Xóa manual_entries exact match.
         tx.execute(
             "DELETE FROM manual_entries
              WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
@@ -1187,7 +870,6 @@ fn apply_tombstones(tx: &rusqlite::Transaction) -> CmdResult<()> {
             params![sub_ids[0], sub_ids[1], sub_ids[2], sub_ids[3], sub_ids[4], day],
         )?;
 
-        // Xóa raw rows prefix-compatible (target = canonical của tuple trong tombstone).
         let target = to_canonical(sub_ids);
         for table in ["raw_fb_ads", "raw_shopee_clicks", "raw_shopee_order_items"] {
             let select_sql = format!(
@@ -1231,7 +913,6 @@ fn apply_tombstones(tx: &rusqlite::Transaction) -> CmdResult<()> {
 }
 
 /// Parse tombstone `entity_key` format `{day}|{s1}|{s2}|{s3}|{s4}|{s5}`.
-/// Trả None nếu sai format (skip tombstone đó thay vì panic).
 fn parse_tombstone_sub_key(key: &str) -> Option<(String, [String; 5])> {
     let parts: Vec<&str> = key.split('|').collect();
     if parts.len() != 6 {

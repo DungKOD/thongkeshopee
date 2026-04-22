@@ -3,11 +3,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { auth } from "../lib/firebase";
 import { invoke } from "../lib/tauri";
 import {
-  driveMetadata,
-  drivePullMergePush,
-  driveUploadDb,
   machineFingerprint,
-} from "../lib/drive";
+  syncMetadata,
+  syncPullMergePush,
+  syncUploadDb,
+} from "../lib/sync";
 
 export type SyncStatus =
   | "checking"
@@ -28,9 +28,10 @@ interface SyncStateDto {
   last_synced_at_ms: number | null;
   last_synced_remote_mtime_ms: number | null;
   last_error: string | null;
+  ownerUid: string | null;
 }
 
-interface UseDriveSyncResult {
+interface UseCloudSyncResult {
   status: SyncStatus;
   /// True từ lúc hook được mount đến khi startup check hoàn tất lần đầu.
   /// App.tsx dùng để chặn UI splash suốt startup kể cả khi status chuyển "syncing".
@@ -43,7 +44,7 @@ interface UseDriveSyncResult {
   forceSync: () => Promise<void>;
 }
 
-interface UseDriveSyncOptions {
+interface UseCloudSyncOptions {
   mutationVersion: number;
   enabled: boolean;
   /// Gọi sau mỗi lần sync thành công (merge có thể đã thêm row từ remote
@@ -64,11 +65,11 @@ function backoffFor(attempt: number): number {
 
 const ACTIVITY_EVENTS = ["mousedown", "keydown", "wheel", "touchstart"] as const;
 
-export function useDriveSync({
+export function useCloudSync({
   mutationVersion,
   enabled,
   onRemoteApplied,
-}: UseDriveSyncOptions): UseDriveSyncResult {
+}: UseCloudSyncOptions): UseCloudSyncResult {
   const [status, setStatus] = useState<SyncStatus>(() =>
     typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "checking",
   );
@@ -131,7 +132,7 @@ export function useDriveSync({
     try {
       const idToken = await current.getIdToken(false);
       const [metadata, localFp, beforeSync] = await Promise.all([
-        driveMetadata(idToken),
+        syncMetadata(idToken),
         machineFingerprint(),
         refreshSyncState(),
       ]);
@@ -142,7 +143,7 @@ export function useDriveSync({
       const remoteChanged =
         (metadata.exists ?? false) && remoteMtime > storedRemoteMtime;
       const differentMachine = remoteFp === null ? true : remoteFp !== localFp;
-      // Fresh install: local chưa có mutation nào (changeId=0) + Drive đã có
+      // Fresh install: local chưa có mutation nào (changeId=0) + R2 đã có
       // data → BẮT BUỘC pull-merge-push bất kể fingerprint. Không dùng upload
       // vì sẽ đè DB rỗng lên remote (Rust-side cũng reject, đây là defensive
       // FE để UX tốt hơn: chạy merge thẳng thay vì fail error).
@@ -157,14 +158,14 @@ export function useDriveSync({
         remoteChanged,
         differentMachine,
         needMerge,
-        action: needMerge ? "drivePullMergePush" : "driveUploadDb",
+        action: needMerge ? "syncPullMergePush" : "syncUploadDb",
         changeId: beforeSync.changeId,
         lastUploadedChangeId: beforeSync.lastUploadedChangeId,
       });
 
       const res = needMerge
-        ? await drivePullMergePush(idToken)
-        : await driveUploadDb(idToken, metadata.exists ?? false);
+        ? await syncPullMergePush(idToken)
+        : await syncUploadDb(idToken, metadata.exists ?? false);
       setLastSyncAt(new Date(res.last_modified_ms));
 
       const state = await refreshSyncState();
@@ -216,9 +217,9 @@ export function useDriveSync({
     debounceRef.current = timerId;
   }, [doSync]);
 
-  /// Startup check: kiểm tra metadata Drive → nếu có dirty local HOẶC
-  /// remote mới + khác máy → chạy doSync (pull-merge-push). Merge chạy trong
-  /// cùng connection nên không cần restart.
+  /// Startup check: kiểm tra metadata R2 → nếu có dirty local HOẶC remote mới
+  /// + khác máy → chạy doSync (pull-merge-push). Merge chạy trong cùng
+  /// connection nên không cần restart.
   const doStartupCheck = useCallback(async (): Promise<void> => {
     const current = auth.currentUser;
     if (!current) return;
@@ -233,7 +234,7 @@ export function useDriveSync({
         current.getIdToken(false),
         machineFingerprint(),
       ]);
-      const remote = await driveMetadata(idToken);
+      const remote = await syncMetadata(idToken);
 
       const syncState = await refreshSyncState();
 
@@ -251,19 +252,36 @@ export function useDriveSync({
       const remoteChanged = remoteMtime > storedRemoteMtime;
       const differentMachine =
         remoteFp === null ? true : remoteFp !== localFp;
+      // Local fresh = changeId=0 + lastUploadedChangeId=0 → DB chưa có mutation
+      // nào từ install này (reinstall, clear DB, fresh login). BẮT BUỘC pull khi
+      // remote có data — nếu không, user sẽ thấy UI rỗng và mutation kế sẽ đè
+      // mất R2 backup (change_id > 0 sau mutation → Rust-side guard không trigger).
+      // Trước đây chỉ check (remoteChanged && differentMachine) → miss khi same
+      // machine reinstall (fingerprint giống) → data loss.
+      const localFresh =
+        syncState.changeId === 0 && syncState.lastUploadedChangeId === 0;
 
       console.log("[sync] doStartupCheck state:", {
         "remote.exists": remote.exists,
         dirty: syncState.dirty,
         changeId: syncState.changeId,
         lastUploadedChangeId: syncState.lastUploadedChangeId,
+        localFresh,
         remoteChanged,
         differentMachine,
-        willSync: syncState.dirty || (remoteChanged && differentMachine),
+        willSync:
+          syncState.dirty || localFresh || (remoteChanged && differentMachine),
       });
 
-      // Case 2: dirty local HOẶC remote mới từ máy khác → pull-merge-push.
-      if (syncState.dirty || (remoteChanged && differentMachine)) {
+      // Case 2: fresh install + remote có data (reinstall, cùng máy)
+      //         HOẶC dirty local
+      //         HOẶC remote mới từ máy khác
+      //         → pull-merge-push.
+      if (
+        syncState.dirty ||
+        localFresh ||
+        (remoteChanged && differentMachine)
+      ) {
         await doSync();
         return;
       }
@@ -285,19 +303,53 @@ export function useDriveSync({
     }
   }, [doSync, refreshSyncState]);
 
-  // Startup check — chạy 1 lần khi enabled chuyển true.
+  // Track Firebase auth UID — logout/login cùng app session phải trigger
+  // startup check lại (nếu không → flow "logout → xóa DB → login" miss sync).
+  const [authUid, setAuthUid] = useState<string | null>(
+    auth.currentUser?.uid ?? null,
+  );
+  useEffect(() => {
+    const unsub = auth.onAuthStateChanged((user) => {
+      setAuthUid(user?.uid ?? null);
+    });
+    return () => unsub();
+  }, []);
+
+  // Startup check — chạy MỖI LẦN login (kể cả cùng user, sau logout).
+  // Reset ref trên logout → login tiếp theo re-run.
+  //
+  // CRITICAL: trước khi sync, gọi `sync_reset_for_new_user(authUid)` để đảm
+  // bảo local DB thuộc về user hiện tại. Nếu DB của user khác → wipe + refetch
+  // sync_state. Tránh leak data user A sang UI user B + tránh upload DB của A
+  // lên R2 path users/{uid_B}/.
   useEffect(() => {
     if (!enabled) return;
+    if (!authUid) {
+      startupDoneRef.current = false;
+      setIsStartupPhase(true);
+      return;
+    }
     if (startupDoneRef.current) return;
     startupDoneRef.current = true;
     void (async () => {
       try {
+        const wiped = await invoke<boolean>("sync_reset_for_new_user", {
+          newUid: authUid,
+        });
+        if (wiped) {
+          console.log("[sync] owner change detected → local DB wiped");
+          try {
+            await onRemoteAppliedRef.current?.();
+          } catch {
+            // ignore — UI sẽ refresh sau startup check.
+          }
+        }
         await doStartupCheck();
       } finally {
         setIsStartupPhase(false);
       }
     })();
-  }, [enabled, doStartupCheck]);
+  }, [enabled, authUid, doStartupCheck]);
 
   // Listen sync-phase events từ Rust backend — update syncPhase để UI render text đúng.
   useEffect(() => {

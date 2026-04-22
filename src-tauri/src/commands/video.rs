@@ -762,6 +762,178 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+// ============================================================
+// Apps Script transport (CHỈ dùng cho video log Google Sheet).
+//
+// DB sync đã migrate sang Cloudflare Worker/R2 (`sync_client.rs`). Video log
+// vẫn dùng Google Sheet qua Apps Script — giữ helper ở đây thay vì file riêng
+// để grep `call_apps_script` → trả ra video.rs là đủ trace.
+// ============================================================
+
+const APPS_SCRIPT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoLogRow {
+    pub timestamp: String,
+    pub url: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AppsScriptRequest<'a> {
+    action: &'a str,
+    #[serde(rename = "idToken")]
+    id_token: &'a str,
+    #[serde(rename = "targetLocalPart", skip_serializing_if = "Option::is_none")]
+    target_local_part: Option<String>,
+    #[serde(rename = "videoUrl", skip_serializing_if = "Option::is_none")]
+    video_url: Option<&'a str>,
+    #[serde(rename = "videoStatus", skip_serializing_if = "Option::is_none")]
+    video_status: Option<&'a str>,
+    #[serde(rename = "videoTimestamp", skip_serializing_if = "Option::is_none")]
+    video_timestamp: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<i64>,
+}
+
+impl<'a> AppsScriptRequest<'a> {
+    fn new(action: &'a str, id_token: &'a str) -> Self {
+        Self {
+            action,
+            id_token,
+            target_local_part: None,
+            video_url: None,
+            video_status: None,
+            video_timestamp: None,
+            limit: None,
+            offset: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AppsScriptResponse {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    code: Option<u16>,
+    #[serde(default, rename = "videoLogs")]
+    video_logs: Option<Vec<VideoLogRow>>,
+}
+
+async fn call_apps_script(
+    url: &str,
+    req: AppsScriptRequest<'_>,
+) -> CmdResult<AppsScriptResponse> {
+    let client = reqwest::Client::builder()
+        .timeout(APPS_SCRIPT_HTTP_TIMEOUT)
+        .build()
+        .map_err(CmdError::from)?;
+
+    let res = client.post(url).json(&req).send().await.map_err(CmdError::from)?;
+    let status = res.status();
+    let text = res.text().await.map_err(CmdError::from)?;
+
+    if !status.is_success() {
+        return Err(CmdError::msg(format!(
+            "Apps Script HTTP {}: {}",
+            status.as_u16(),
+            text
+        )));
+    }
+
+    let parsed: AppsScriptResponse = serde_json::from_str(&text)
+        .map_err(|e| CmdError::msg(format!("parse response: {e} — body: {text}")))?;
+
+    if !parsed.ok {
+        let code = parsed.code.unwrap_or(500);
+        let msg = parsed.error.unwrap_or_else(|| "unknown".into());
+        return Err(CmdError::msg(format!("Apps Script {}: {}", code, msg)));
+    }
+    Ok(parsed)
+}
+
+async fn as_log_video_download(
+    apps_script_url: &str,
+    id_token: &str,
+    url: &str,
+    status: &str,
+    timestamp: &str,
+) -> CmdResult<()> {
+    call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            video_url: Some(url),
+            video_status: Some(status),
+            video_timestamp: Some(timestamp),
+            ..AppsScriptRequest::new("logVideoDownload", id_token)
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn as_delete_user_video_log_row(
+    apps_script_url: &str,
+    id_token: &str,
+    target_local_part: &str,
+    timestamp: &str,
+    url: &str,
+    status: &str,
+) -> CmdResult<()> {
+    call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            target_local_part: Some(target_local_part.to_string()),
+            video_url: Some(url),
+            video_status: Some(status),
+            video_timestamp: Some(timestamp),
+            ..AppsScriptRequest::new("deleteUserVideoLogRow", id_token)
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn as_delete_user_video_log_sheet(
+    apps_script_url: &str,
+    id_token: &str,
+    target_local_part: &str,
+) -> CmdResult<()> {
+    call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            target_local_part: Some(target_local_part.to_string()),
+            ..AppsScriptRequest::new("deleteUserVideoLogSheet", id_token)
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn as_read_user_video_log(
+    apps_script_url: &str,
+    id_token: &str,
+    target_local_part: &str,
+    limit: i64,
+    offset: i64,
+) -> CmdResult<Vec<VideoLogRow>> {
+    let res = call_apps_script(
+        apps_script_url,
+        AppsScriptRequest {
+            target_local_part: Some(target_local_part.to_string()),
+            limit: Some(limit),
+            offset: Some(offset),
+            ..AppsScriptRequest::new("readUserVideoLog", id_token)
+        },
+    )
+    .await?;
+    Ok(res.video_logs.unwrap_or_default())
+}
+
 /// Log 1 lần download video. Ghi vào local `video_logs.db` (always) + best-effort
 /// post lên Google Sheet qua Apps Script. Nếu Sheet call fail → swallow lỗi, local vẫn OK.
 /// Timestamp format ở BE theo local time của máy user (`HH:MM:SS DD/MM/YYYY`).
@@ -798,7 +970,7 @@ pub async fn log_video_download(
     let timestamp = chrono::Local::now()
         .format("%H:%M:%S %d/%m/%Y")
         .to_string();
-    if let Err(e) = super::drive::as_log_video_download(
+    if let Err(e) = as_log_video_download(
         &apps_script_url,
         &id_token,
         &clean_url,
@@ -873,10 +1045,10 @@ pub async fn admin_fetch_user_log_sheet(
     target_local_part: String,
 ) -> CmdResult<i64> {
     // Loop fetch từng trang đến hết.
-    let mut all: Vec<super::drive::VideoLogRow> = Vec::new();
+    let mut all: Vec<VideoLogRow> = Vec::new();
     let mut offset = 0i64;
     loop {
-        let page = super::drive::as_read_user_video_log(
+        let page = as_read_user_video_log(
             &apps_script_url,
             &id_token,
             &target_local_part,
@@ -972,7 +1144,7 @@ pub async fn admin_delete_user_log_row(
     url: String,
     status: String,
 ) -> CmdResult<()> {
-    super::drive::as_delete_user_video_log_row(
+    as_delete_user_video_log_row(
         &apps_script_url,
         &id_token,
         &target_local_part,
@@ -1008,7 +1180,7 @@ pub async fn admin_delete_user_log_sheet(
     id_token: String,
     target_local_part: String,
 ) -> CmdResult<()> {
-    super::drive::as_delete_user_video_log_sheet(
+    as_delete_user_video_log_sheet(
         &apps_script_url,
         &id_token,
         &target_local_part,
@@ -1057,15 +1229,16 @@ pub async fn admin_read_user_list_cache(
         .ok())
 }
 
-/// Fetch user list từ AS → save cache singleton → trả về. Admin check chạy
-/// trong AS. FE gọi background sau khi render cache.
+/// Fetch user list từ Worker → save cache singleton → trả về. Admin check chạy
+/// trong Worker (whitelist UID qua `ADMIN_UIDS` secret). FE gọi background sau
+/// khi render cache.
 #[tauri::command]
 pub async fn admin_fetch_user_list(
     video_db: State<'_, VideoDbState>,
-    apps_script_url: String,
+    sync_api_url: String,
     id_token: String,
 ) -> CmdResult<AdminUserListCache> {
-    let users = super::drive::as_list_users(&apps_script_url, &id_token).await?;
+    let users = super::sync_client::admin_list_users(&sync_api_url, &id_token).await?;
     let users_json = serde_json::to_string(&users)
         .map_err(|e| CmdError::msg(format!("serialize users: {e}")))?;
     let now = now_ms();

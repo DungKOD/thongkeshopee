@@ -26,7 +26,7 @@ import {
   useAdminView,
 } from "./contexts/AdminViewContext";
 import { usePremium, useIsAdmin } from "./hooks/usePremium";
-import { useDriveSync, type SyncPhase } from "./hooks/useDriveSync";
+import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
 import { LoginScreen } from "./components/LoginScreen";
 import { PaywallScreen } from "./components/PaywallScreen";
 import { UserListDialog } from "./components/UserListDialog";
@@ -107,7 +107,7 @@ function AppInner() {
   //
   // Khi admin đang xem DB của user khác → disable sync (dirty của DB khác không
   // được upload lên Drive của admin).
-  const { isStartupPhase, syncPhase } = useDriveSync({
+  const { isStartupPhase, syncPhase } = useCloudSync({
     mutationVersion,
     enabled: !inAdminView,
     onRemoteApplied: refetch,

@@ -117,14 +117,14 @@ fn list_days_with_rows_impl(
 
     let mut out = Vec::with_capacity(days.len());
     for (date, notes) in days {
-        let mut rows = aggregate_rows_for_day(conn, &date)?;
+        let (mut rows, totals) = aggregate_rows_for_day(conn, &date)?;
         if !selected_parts.is_empty() {
             rows.retain(|r| display_name_subset_match(&r.display_name, &selected_parts));
             if rows.is_empty() {
                 continue;
             }
         }
-        out.push(UiDay { date, notes, rows });
+        out.push(UiDay { date, notes, rows, totals });
     }
     Ok(out)
 }
@@ -200,7 +200,10 @@ fn default_name(c: &Canonical) -> String {
     }
 }
 
-fn aggregate_rows_for_day(conn: &Connection, day_date: &str) -> CmdResult<Vec<UiRow>> {
+fn aggregate_rows_for_day(
+    conn: &Connection,
+    day_date: &str,
+) -> CmdResult<(Vec<UiRow>, crate::db::types::UiDayTotals)> {
     // ============================================================
     // Phase 1: load raw data từ 5 nguồn, giữ canonical tuple.
     // ============================================================
@@ -495,8 +498,12 @@ fn aggregate_rows_for_day(conn: &Connection, day_date: &str) -> CmdResult<Vec<Ui
     }
 
     // Convert Accumulator → UiRow + fallback CPC.
+    // Accumulate day-level totals BEFORE row-0 filter — KPI phải đúng 100%
+    // với raw data kể cả khi tuple chỉ có click (không spend/commission) bị
+    // filter khỏi row display.
     let canonicals: Vec<(Canonical, Accumulator)> = map.into_iter().collect();
     let mut rows: Vec<UiRow> = Vec::with_capacity(canonicals.len());
+    let mut day_totals = crate::db::types::UiDayTotals::default();
     for (c, acc) in canonicals {
         let total_spend = acc.spend_cents.map(|c| c as f64 / 100.0);
         let commission_total = acc.commission_cents as f64 / 100.0;
@@ -512,7 +519,23 @@ fn aggregate_rows_for_day(conn: &Connection, day_date: &str) -> CmdResult<Vec<Ui
             }
         });
 
-        // Filter: chỉ giữ row có spend ≠ 0 HOẶC commission ≠ 0.
+        // Accumulate day totals từ MỌI tuple — pre-filter, không miss data.
+        day_totals.ads_clicks += acc.ads_clicks.unwrap_or(0);
+        day_totals.total_spend += total_spend.unwrap_or(0.0);
+        day_totals.impressions += acc.impressions.unwrap_or(0);
+        day_totals.shopee_clicks_total += acc.shopee_clicks_total;
+        for (referrer, count) in &acc.shopee_clicks_by_referrer {
+            *day_totals
+                .shopee_clicks_by_referrer
+                .entry(referrer.clone())
+                .or_insert(0) += count;
+        }
+        day_totals.orders_count += acc.orders_count;
+        day_totals.commission_total += commission_total;
+        day_totals.order_value_total += acc.order_value_cents as f64 / 100.0;
+
+        // Row-0 filter: chỉ giữ row có spend ≠ 0 HOẶC commission ≠ 0 cho UI
+        // display (tránh clutter). Day totals đã tính ở trên → KPI vẫn đúng.
         let has_spend = acc.spend_cents.map(|v| v != 0).unwrap_or(false);
         let has_commission = acc.commission_cents != 0;
         if !has_spend && !has_commission {
@@ -540,7 +563,7 @@ fn aggregate_rows_for_day(conn: &Connection, day_date: &str) -> CmdResult<Vec<Ui
     }
 
     rows.sort_by(|a, b| a.display_name.cmp(&b.display_name));
-    Ok(rows)
+    Ok((rows, day_totals))
 }
 
 #[tauri::command]

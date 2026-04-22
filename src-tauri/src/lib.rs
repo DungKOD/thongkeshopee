@@ -9,9 +9,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // Nếu có file DB pending từ lần download Drive trước → apply trước khi mở DB.
+            // Nếu có file DB pending từ lần download R2 trước → apply trước khi mở DB.
             // Nếu không có pending → noop. Lỗi rename KHÔNG block app start (log + tiếp tục).
-            if let Err(e) = commands::drive::apply_pending_sync(app.handle()) {
+            if let Err(e) = commands::sync::apply_pending_sync(app.handle()) {
                 eprintln!("apply_pending_sync warning: {e}");
             }
             // Init SQLite DB + manage state.
@@ -53,17 +53,17 @@ pub fn run() {
             commands::video::admin_delete_user_log_sheet,
             commands::video::admin_read_user_list_cache,
             commands::video::admin_fetch_user_list,
-            commands::drive::drive_check_or_create,
-            commands::drive::drive_metadata,
-            commands::drive::drive_upload_db,
-            commands::drive::drive_download_db,
-            commands::drive::drive_apply_pending,
-            commands::drive::drive_pull_merge_push,
-            commands::drive::drive_list_users,
-            commands::drive::restart_app,
-            commands::drive::machine_fingerprint,
-            commands::drive::sync_state_get,
-            commands::drive::sync_state_record_error,
+            commands::sync::sync_metadata,
+            commands::sync::sync_upload_db,
+            commands::sync::sync_download_db,
+            commands::sync::sync_apply_pending,
+            commands::sync::sync_pull_merge_push,
+            commands::sync::admin_list_users,
+            commands::sync::restart_app,
+            commands::sync::machine_fingerprint,
+            commands::sync::sync_state_get,
+            commands::sync::sync_state_record_error,
+            commands::sync::sync_reset_for_new_user,
             commands::admin_view::admin_view_user_db,
             commands::admin_view::admin_exit_view_user_db,
             commands::admin_view::admin_view_state_get,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { auth } from "../lib/firebase";
-import { driveListUsers, type UserListEntry } from "../lib/drive";
+import { adminListUsers, type UserListEntry } from "../lib/sync";
 import { useAdminView } from "../contexts/AdminViewContext";
 
 interface UserListDialogProps {
@@ -28,7 +28,7 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
     setError(null);
     try {
       const idToken = await currentUser.getIdToken(false);
-      const list = await driveListUsers(idToken);
+      const list = await adminListUsers(idToken);
       setUsers(list);
     } catch (e) {
       setError((e as Error).message);
