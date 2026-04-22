@@ -150,6 +150,17 @@ function AppInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adminView?.uid]);
 
+  // Khi vào admin view mode: force tab về "stats" nếu đang ở tab bị ẩn
+  // (download / video-logs). Tránh màn trắng vì tab không còn hiển thị.
+  useEffect(() => {
+    if (
+      inAdminView &&
+      (activeTab === "download" || activeTab === "video-logs")
+    ) {
+      setActiveTab("stats");
+    }
+  }, [inAdminView, activeTab]);
+
   // Intercept Tauri close event — nếu DB dirty, chặn đóng app, show dialog
   // cảnh báo. User chọn sync+tắt, tắt luôn, hoặc huỷ.
   // Ref để handler luôn đọc status mới nhất (closure trong listener persist).
@@ -559,13 +570,15 @@ function AppInner() {
             icon="insights"
             label="Tổng quan"
           />
-          <TabButton
-            active={activeTab === "download"}
-            onClick={() => setActiveTab("download")}
-            icon="download"
-            label="Download video"
-          />
-          {isAdmin && (
+          {!inAdminView && (
+            <TabButton
+              active={activeTab === "download"}
+              onClick={() => setActiveTab("download")}
+              icon="download"
+              label="Download video"
+            />
+          )}
+          {isAdmin && !inAdminView && (
             <TabButton
               active={activeTab === "video-logs"}
               onClick={() => setActiveTab("video-logs")}
