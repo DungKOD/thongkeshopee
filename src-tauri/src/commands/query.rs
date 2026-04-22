@@ -49,7 +49,33 @@ pub struct DaysFilter {
     pub to_date: Option<String>,
     pub limit: Option<i64>,
     pub sub_id_filter: Option<String>,
+    /// Account Shopee filter. None hoặc `All` = không filter (behavior cũ).
+    pub account_filter: Option<AccountFilterMode>,
 }
+
+/// Filter mode theo account. Tagged union trùng FE `AccountFilter`.
+/// - `All`: không filter — return everything (backward compat).
+/// - `Account { id }`: Shopee/manual WHERE shopee_account_id = id; FB derive
+///   attribution qua JOIN (day_date, sub_ids) với Shopee data của account đó.
+///   **Account id=1 ("Mặc định")** là bucket catch-all: FB không match account
+///   nào trên cùng ngày cũng rơi vào Mặc định. Logic: Mặc định filter matches
+///   owners.is_empty() OR owners.contains(1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AccountFilterMode {
+    All,
+    Account { id: i64 },
+}
+
+impl Default for AccountFilterMode {
+    fn default() -> Self {
+        AccountFilterMode::All
+    }
+}
+
+/// ID được reserve cho account "Mặc định" — catch-all bucket cho sub_id chưa
+/// gán explicit account nào. Seed trong migration (db/mod.rs).
+const DEFAULT_ACCOUNT_ID: i64 = 1;
 
 #[tauri::command]
 pub fn list_days_with_rows(
@@ -115,14 +141,30 @@ fn list_days_with_rows_impl(
         })
         .unwrap_or_default();
 
+    let account_filter = filter.account_filter.clone().unwrap_or_default();
     let mut out = Vec::with_capacity(days.len());
     for (date, notes) in days {
-        let (mut rows, totals) = aggregate_rows_for_day(conn, &date)?;
-        if !selected_parts.is_empty() {
+        let (mut rows, totals) = aggregate_rows_for_day(conn, &date, &account_filter)?;
+        let sub_id_filter_active = !selected_parts.is_empty();
+        if sub_id_filter_active {
             rows.retain(|r| display_name_subset_match(&r.display_name, &selected_parts));
-            if rows.is_empty() {
-                continue;
-            }
+        }
+        // Khi nào skip ngày:
+        //   - Sub_id filter active + rows rỗng → drop (totals pre-sub_id nên
+        //     không đại diện kết quả filter — hiện KPI sẽ misleading).
+        //   - Không có filter / account filter only, rows rỗng, totals cũng
+        //     rỗng → truly empty, drop.
+        //   - Account filter, rows rỗng, totals CÓ data (vd account X chỉ có
+        //     click không spend/commission, row-0 drop hết) → GIỮ day để
+        //     Overview KPI count được clicks. DayBlock sẽ render bảng rỗng.
+        let has_totals_data = totals.ads_clicks != 0
+            || totals.shopee_clicks_total != 0
+            || totals.orders_count != 0
+            || totals.commission_total != 0.0
+            || totals.total_spend != 0.0
+            || totals.impressions != 0;
+        if rows.is_empty() && (sub_id_filter_active || !has_totals_data) {
+            continue;
         }
         out.push(UiDay { date, notes, rows, totals });
     }
@@ -203,10 +245,41 @@ fn default_name(c: &Canonical) -> String {
 fn aggregate_rows_for_day(
     conn: &Connection,
     day_date: &str,
+    account_filter: &AccountFilterMode,
 ) -> CmdResult<(Vec<UiRow>, crate::db::types::UiDayTotals)> {
+    let account_id_eq: Option<i64> = match account_filter {
+        AccountFilterMode::Account { id } => Some(*id),
+        _ => None,
+    };
     // ============================================================
     // Phase 1: load raw data từ 5 nguồn, giữ canonical tuple.
     // ============================================================
+
+    // Raw owner pairs (canonical, account_id) từ 3 bảng Shopee. Load TẤT CẢ
+    // (không filter account) để owners_for_day đủ info map FB ↔ Shopee. Sau
+    // khi có resolve() mới build owners_for_day với prefix matching.
+    let raw_owner_pairs: Vec<(Canonical, i64)> = {
+        let mut pairs: Vec<(Canonical, i64)> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+             FROM raw_shopee_clicks WHERE day_date = ?1
+             UNION
+             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+             FROM raw_shopee_order_items WHERE day_date = ?1
+             UNION
+             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+             FROM manual_entries WHERE day_date = ?1",
+        )?;
+        let iter = stmt.query_map(params![day_date], |r| {
+            let tuple: [String; 5] = [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
+            let acc: i64 = r.get(5)?;
+            Ok((to_canonical(tuple), acc))
+        })?;
+        for row in iter {
+            pairs.push(row?);
+        }
+        pairs
+    };
 
     // FB ads — unified. Dedup per sub_id_tuple: nếu tuple có row level='ad_group'
     // thì CHỈ dùng ad_group (bỏ campaign); nếu không có → dùng campaign.
@@ -271,14 +344,25 @@ fn aggregate_rows_for_day(
     }
     let mut shopee_clicks: Vec<ShopeeClick> = Vec::new();
     {
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     COALESCE(referrer, '(khác)') AS ref, COUNT(*) AS cnt
              FROM raw_shopee_clicks
-             WHERE day_date = ?
-             GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, ref",
-        )?;
-        let iter = stmt.query_map(params![day_date], |r| {
+             WHERE day_date = ?",
+        );
+        if account_id_eq.is_some() {
+            sql.push_str(" AND shopee_account_id = ?");
+        }
+        sql.push_str(" GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, ref");
+        let mut stmt = conn.prepare(&sql)?;
+        let params_vec: Vec<Box<dyn rusqlite::ToSql>> = if let Some(id) = account_id_eq {
+            vec![Box::new(day_date.to_string()), Box::new(id)]
+        } else {
+            vec![Box::new(day_date.to_string())]
+        };
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+        let iter = stmt.query_map(params_refs.as_slice(), |r| {
             let tuple: [String; 5] =
                 [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
             Ok(ShopeeClick {
@@ -305,16 +389,27 @@ fn aggregate_rows_for_day(
     }
     let mut shopee_orders: Vec<ShopeeOrder> = Vec::new();
     {
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     COUNT(DISTINCT order_id),
                     COALESCE(SUM(CAST(ROUND(net_commission * 100) AS INTEGER)), 0),
                     COALESCE(SUM(CAST(ROUND(order_value * 100) AS INTEGER)), 0)
              FROM raw_shopee_order_items
-             WHERE day_date = ?
-             GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5",
-        )?;
-        let iter = stmt.query_map(params![day_date], |r| {
+             WHERE day_date = ?",
+        );
+        if account_id_eq.is_some() {
+            sql.push_str(" AND shopee_account_id = ?");
+        }
+        sql.push_str(" GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5");
+        let mut stmt = conn.prepare(&sql)?;
+        let params_vec: Vec<Box<dyn rusqlite::ToSql>> = if let Some(id) = account_id_eq {
+            vec![Box::new(day_date.to_string()), Box::new(id)]
+        } else {
+            vec![Box::new(day_date.to_string())]
+        };
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+        let iter = stmt.query_map(params_refs.as_slice(), |r| {
             let tuple: [String; 5] =
                 [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
             Ok(ShopeeOrder {
@@ -341,14 +436,25 @@ fn aggregate_rows_for_day(
     }
     let mut manuals: Vec<Manual> = Vec::new();
     {
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     display_name, override_clicks, override_spend, override_cpc,
                     override_orders, override_commission
              FROM manual_entries
              WHERE day_date = ?",
-        )?;
-        let iter = stmt.query_map(params![day_date], |r| {
+        );
+        if account_id_eq.is_some() {
+            sql.push_str(" AND shopee_account_id = ?");
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let params_vec: Vec<Box<dyn rusqlite::ToSql>> = if let Some(id) = account_id_eq {
+            vec![Box::new(day_date.to_string()), Box::new(id)]
+        } else {
+            vec![Box::new(day_date.to_string())]
+        };
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+        let iter = stmt.query_map(params_refs.as_slice(), |r| {
             let tuple: [String; 5] =
                 [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
             Ok(Manual {
@@ -370,15 +476,59 @@ fn aggregate_rows_for_day(
     // Phase 2: anchors = canonicals từ Shopee orders (hoa hồng).
     // FB/click/manual sẽ merge vào anchor prefix-compatible.
     // Không có anchor compatible → giữ canonical gốc (FB standalone dùng tên camp).
+    //
+    // CRITICAL: anchors lấy TẤT CẢ shopee orders (không apply account filter)
+    // để FB attribution qua resolve() consistent. Nếu chỉ dùng orders của
+    // account đang filter → FB tuple thuộc account khác không có anchor →
+    // resolve về chính nó → mapping FB ↔ Shopee của account khác bị đứt.
     // ============================================================
-    let anchors: Vec<Canonical> = shopee_orders
-        .iter()
-        .map(|r| r.canonical.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
+    let anchors: Vec<Canonical> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+             FROM raw_shopee_order_items WHERE day_date = ?",
+        )?;
+        let iter = stmt.query_map(params![day_date], |r| {
+            let tuple: [String; 5] = [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
+            Ok(to_canonical(tuple))
+        })?;
+        iter.collect::<rusqlite::Result<HashSet<_>>>()?
+            .into_iter()
+            .collect()
+    };
 
     let resolve = |c: &Canonical| representative(c, &anchors);
+
+    // Build owners_for_day dùng resolve() — rep của (canonical, account_id)
+    // từ raw_owner_pairs → set of account_ids.
+    let owners_for_day: HashMap<Canonical, HashSet<i64>> = {
+        let mut map: HashMap<Canonical, HashSet<i64>> = HashMap::new();
+        for (canon, acc_id) in &raw_owner_pairs {
+            map.entry(resolve(canon)).or_default().insert(*acc_id);
+        }
+        map
+    };
+
+    // Filter FB ads theo account mode dùng prefix matching qua resolve.
+    // - All: giữ hết
+    // - Account(X) X != 1: giữ nếu owners[resolve(fb)] chứa X
+    // - Account(1) Mặc định: giữ nếu no owner HOẶC owner chứa 1 (catch-all)
+    fb_ads.retain(|ad| {
+        let rep = resolve(&ad.canonical);
+        let owners = owners_for_day.get(&rep);
+        match account_filter {
+            AccountFilterMode::All => true,
+            AccountFilterMode::Account { id } => {
+                if *id == DEFAULT_ACCOUNT_ID {
+                    match owners {
+                        None => true,
+                        Some(set) => set.is_empty() || set.contains(id),
+                    }
+                } else {
+                    matches!(owners, Some(set) if set.contains(id))
+                }
+            }
+        }
+    });
 
     // ============================================================
     // Phase 3: aggregate vào Accumulator theo representative.
@@ -896,6 +1046,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
+        // Chạy migrations thật — include shopee_accounts + FK columns.
+        crate::db::migrate_for_tests(&conn).unwrap();
         conn
     }
 

@@ -6,6 +6,7 @@
 //! - `imports`: INSERT raw tables + imported_files (validate single-date).
 //! - `batch`: xóa batch (days, manual_rows) trong 1 transaction.
 
+pub mod accounts;
 pub mod admin_view;
 pub mod batch;
 pub mod imports;

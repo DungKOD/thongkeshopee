@@ -62,6 +62,8 @@ export type ManualEntryInput = {
   overrideCpc: number | null;
   overrideOrders: number | null;
   overrideCommission: number | null;
+  /** Account Shopee manual entry thuộc về. FE phải set từ selector. */
+  shopeeAccountId: number;
 };
 
 /** Derived values tính từ 1 UiRow. */

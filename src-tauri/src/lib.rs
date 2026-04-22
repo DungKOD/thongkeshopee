@@ -23,6 +23,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::accounts::list_shopee_accounts,
+            commands::accounts::create_shopee_account,
+            commands::accounts::rename_shopee_account,
+            commands::accounts::update_shopee_account_color,
+            commands::accounts::delete_shopee_account,
+            commands::accounts::reassign_shopee_account_data,
             commands::query::db_ping,
             commands::query::list_days,
             commands::query::list_days_with_rows,

@@ -719,7 +719,25 @@ pub async fn sync_pull_merge_push(
 
 /// Merge tất cả bảng từ `remote.*` vào `main.*` theo rule INSERT OR IGNORE.
 /// Raw rows re-map `source_file_id` qua JOIN `imported_files.file_hash`.
+/// Raw Shopee rows re-map `shopee_account_id` qua JOIN `shopee_accounts.name`.
 fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
+    // 0. shopee_accounts — UNIQUE(name). Merge trước để FK sau có sẵn id.
+    // Detect remote table có tồn tại không (backward compat với DB pre-v5).
+    let remote_has_accounts: bool = tx
+        .query_row(
+            "SELECT 1 FROM remote.sqlite_master WHERE type='table' AND name='shopee_accounts'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if remote_has_accounts {
+        tx.execute(
+            "INSERT OR IGNORE INTO main.shopee_accounts (name, color, created_at)
+             SELECT name, color, created_at FROM remote.shopee_accounts",
+            [],
+        )?;
+    }
+
     // 1. days — PK natural (date).
     tx.execute(
         "INSERT OR IGNORE INTO main.days (date, created_at, notes)
@@ -737,35 +755,80 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
     )?;
 
     // 3. raw_shopee_clicks — PK click_id. Re-map source_file_id qua file_hash.
-    tx.execute(
-        "INSERT OR IGNORE INTO main.raw_shopee_clicks
-         (click_id, click_time, region, sub_id_raw, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-          referrer, day_date, source_file_id)
-         SELECT r.click_id, r.click_time, r.region, r.sub_id_raw,
-                r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5,
-                r.referrer, r.day_date, lif.id
-         FROM remote.raw_shopee_clicks r
-         JOIN remote.imported_files rif ON rif.id = r.source_file_id
-         JOIN main.imported_files lif ON lif.file_hash = rif.file_hash",
-        [],
-    )?;
+    // shopee_account_id: nếu remote có cột (v5+), re-map qua JOIN account name.
+    // Nếu remote chưa có cột → COALESCE về default account id=1.
+    let remote_clicks_has_account = remote_table_has_column(tx, "raw_shopee_clicks", "shopee_account_id")?;
+    if remote_clicks_has_account && remote_has_accounts {
+        tx.execute(
+            "INSERT OR IGNORE INTO main.raw_shopee_clicks
+             (click_id, click_time, region, sub_id_raw, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              referrer, day_date, source_file_id, shopee_account_id)
+             SELECT r.click_id, r.click_time, r.region, r.sub_id_raw,
+                    r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5,
+                    r.referrer, r.day_date, lif.id,
+                    COALESCE(la.id, 1)
+             FROM remote.raw_shopee_clicks r
+             JOIN remote.imported_files rif ON rif.id = r.source_file_id
+             JOIN main.imported_files lif ON lif.file_hash = rif.file_hash
+             LEFT JOIN remote.shopee_accounts ra ON ra.id = r.shopee_account_id
+             LEFT JOIN main.shopee_accounts la ON la.name = ra.name",
+            [],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT OR IGNORE INTO main.raw_shopee_clicks
+             (click_id, click_time, region, sub_id_raw, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              referrer, day_date, source_file_id, shopee_account_id)
+             SELECT r.click_id, r.click_time, r.region, r.sub_id_raw,
+                    r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5,
+                    r.referrer, r.day_date, lif.id, 1
+             FROM remote.raw_shopee_clicks r
+             JOIN remote.imported_files rif ON rif.id = r.source_file_id
+             JOIN main.imported_files lif ON lif.file_hash = rif.file_hash",
+            [],
+        )?;
+    }
 
     // 4. raw_shopee_order_items — UNIQUE (checkout_id, item_id, model_id).
-    tx.execute(
-        "INSERT OR IGNORE INTO main.raw_shopee_order_items
-         (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
-          click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
-          price, quantity, order_value, refund_amount, net_commission, commission_total,
-          sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id)
-         SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
-                r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
-                r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
-                r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id
-         FROM remote.raw_shopee_order_items r
-         JOIN remote.imported_files rif ON rif.id = r.source_file_id
-         JOIN main.imported_files lif ON lif.file_hash = rif.file_hash",
-        [],
-    )?;
+    let remote_orders_has_account = remote_table_has_column(tx, "raw_shopee_order_items", "shopee_account_id")?;
+    if remote_orders_has_account && remote_has_accounts {
+        tx.execute(
+            "INSERT OR IGNORE INTO main.raw_shopee_order_items
+             (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
+              click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
+              price, quantity, order_value, refund_amount, net_commission, commission_total,
+              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
+              shopee_account_id)
+             SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
+                    r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
+                    r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
+                    r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id,
+                    COALESCE(la.id, 1)
+             FROM remote.raw_shopee_order_items r
+             JOIN remote.imported_files rif ON rif.id = r.source_file_id
+             JOIN main.imported_files lif ON lif.file_hash = rif.file_hash
+             LEFT JOIN remote.shopee_accounts ra ON ra.id = r.shopee_account_id
+             LEFT JOIN main.shopee_accounts la ON la.name = ra.name",
+            [],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT OR IGNORE INTO main.raw_shopee_order_items
+             (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
+              click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
+              price, quantity, order_value, refund_amount, net_commission, commission_total,
+              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
+              shopee_account_id)
+             SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
+                    r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
+                    r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
+                    r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id, 1
+             FROM remote.raw_shopee_order_items r
+             JOIN remote.imported_files rif ON rif.id = r.source_file_id
+             JOIN main.imported_files lif ON lif.file_hash = rif.file_hash",
+            [],
+        )?;
+    }
 
     // 5. raw_fb_ads — UNIQUE (day_date, level, name).
     tx.execute(
@@ -784,27 +847,58 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
 
     // 6. manual_entries — UNIQUE(sub_ids, day_date). UPSERT last-write-wins
     // theo `updated_at` (ISO8601 → string compare đúng trình tự).
-    tx.execute(
-        "INSERT INTO main.manual_entries
-         (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
-          override_clicks, override_spend, override_cpc, override_orders, override_commission,
-          notes, created_at, updated_at)
-         SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
-                override_clicks, override_spend, override_cpc, override_orders, override_commission,
-                notes, created_at, updated_at
-         FROM remote.manual_entries WHERE true
-         ON CONFLICT(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date) DO UPDATE SET
-           display_name        = excluded.display_name,
-           override_clicks     = excluded.override_clicks,
-           override_spend      = excluded.override_spend,
-           override_cpc        = excluded.override_cpc,
-           override_orders     = excluded.override_orders,
-           override_commission = excluded.override_commission,
-           notes               = excluded.notes,
-           updated_at          = excluded.updated_at
-         WHERE excluded.updated_at > manual_entries.updated_at",
-        [],
-    )?;
+    // shopee_account_id re-map qua name JOIN tương tự Shopee tables.
+    let remote_manual_has_account = remote_table_has_column(tx, "manual_entries", "shopee_account_id")?;
+    if remote_manual_has_account && remote_has_accounts {
+        tx.execute(
+            "INSERT INTO main.manual_entries
+             (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
+              override_clicks, override_spend, override_cpc, override_orders, override_commission,
+              notes, created_at, updated_at, shopee_account_id)
+             SELECT r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.day_date, r.display_name,
+                    r.override_clicks, r.override_spend, r.override_cpc, r.override_orders, r.override_commission,
+                    r.notes, r.created_at, r.updated_at,
+                    COALESCE(la.id, 1)
+             FROM remote.manual_entries r
+             LEFT JOIN remote.shopee_accounts ra ON ra.id = r.shopee_account_id
+             LEFT JOIN main.shopee_accounts la ON la.name = ra.name
+             WHERE true
+             ON CONFLICT(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date) DO UPDATE SET
+               display_name        = excluded.display_name,
+               override_clicks     = excluded.override_clicks,
+               override_spend      = excluded.override_spend,
+               override_cpc        = excluded.override_cpc,
+               override_orders     = excluded.override_orders,
+               override_commission = excluded.override_commission,
+               notes               = excluded.notes,
+               updated_at          = excluded.updated_at,
+               shopee_account_id   = excluded.shopee_account_id
+             WHERE excluded.updated_at > manual_entries.updated_at",
+            [],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO main.manual_entries
+             (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
+              override_clicks, override_spend, override_cpc, override_orders, override_commission,
+              notes, created_at, updated_at, shopee_account_id)
+             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, display_name,
+                    override_clicks, override_spend, override_cpc, override_orders, override_commission,
+                    notes, created_at, updated_at, 1
+             FROM remote.manual_entries WHERE true
+             ON CONFLICT(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date) DO UPDATE SET
+               display_name        = excluded.display_name,
+               override_clicks     = excluded.override_clicks,
+               override_spend      = excluded.override_spend,
+               override_cpc        = excluded.override_cpc,
+               override_orders     = excluded.override_orders,
+               override_commission = excluded.override_commission,
+               notes               = excluded.notes,
+               updated_at          = excluded.updated_at
+             WHERE excluded.updated_at > manual_entries.updated_at",
+            [],
+        )?;
+    }
 
     // 7. tombstones — UNIQUE(entity_type, entity_key).
     // (video_downloads đã move sang video_logs.db ở migration v4 — không merge
@@ -910,6 +1004,20 @@ fn apply_tombstones(tx: &rusqlite::Transaction) -> CmdResult<()> {
     }
 
     Ok(())
+}
+
+/// Check cột tồn tại trong `remote.<table>` (DB đã ATTACH).
+/// Dùng backward-compat khi merge DB từ R2 mà schema cũ chưa có cột mới.
+fn remote_table_has_column(
+    tx: &rusqlite::Transaction,
+    table: &str,
+    column: &str,
+) -> CmdResult<bool> {
+    let mut stmt = tx.prepare(&format!("PRAGMA remote.table_info({table})"))?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(cols.iter().any(|c| c == column))
 }
 
 /// Parse tombstone `entity_key` format `{day}|{s1}|{s2}|{s3}|{s4}|{s5}`.

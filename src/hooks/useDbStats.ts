@@ -10,12 +10,20 @@ import { uiRowKey } from "../formulas";
 
 export const todayIso = () => new Date().toISOString().slice(0, 10);
 
+/** Tagged union — account filter theo mode. Trùng shape Rust
+ *  `AccountFilterMode` (tag=kind, camelCase). */
+export type AccountFilterMode =
+  | { kind: "all" }
+  | { kind: "account"; id: number };
+
 /** Filter args gửi xuống Rust `list_days_with_rows`. Mọi field optional. */
 export interface DaysFilter {
   fromDate?: string;
   toDate?: string;
   limit?: number;
   subIdFilter?: string | null;
+  /// Account filter. Omit hoặc {kind:"all"} = không filter (backward compat).
+  accountFilter?: AccountFilterMode;
 }
 
 /** Snapshot toàn DB từ Rust `load_overview`. Gọi 1 lần/mutation, không filter. */
@@ -89,8 +97,15 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
         toDate: filter.toDate ?? null,
         limit: filter.limit ?? null,
         subIdFilter: filter.subIdFilter ?? null,
+        accountFilter: filter.accountFilter ?? null,
       }),
-    [filter.fromDate, filter.toDate, filter.limit, filter.subIdFilter],
+    [
+      filter.fromDate,
+      filter.toDate,
+      filter.limit,
+      filter.subIdFilter,
+      filter.accountFilter,
+    ],
   );
 
   const refetchDays = useCallback(async () => {
@@ -99,6 +114,7 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
       toDate: filter.toDate,
       limit: filter.limit,
       subIdFilter: filter.subIdFilter ?? undefined,
+      accountFilter: filter.accountFilter,
     };
     const data = await invoke<UiDay[]>("list_days_with_rows", {
       filter: payload,

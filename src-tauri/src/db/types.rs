@@ -82,6 +82,9 @@ pub struct ManualEntryInput {
     pub override_commission: Option<f64>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Account Shopee mà manual entry thuộc về. FE luôn pass giá trị (dropdown
+    /// chọn account khi tạo/edit). Phải là id hợp lệ trong `shopee_accounts`.
+    pub shopee_account_id: i64,
 }
 
 /// Payload batch delete: user bấm "Lưu thay đổi" sau khi đã gạch ngang.

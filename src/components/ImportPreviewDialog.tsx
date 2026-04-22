@@ -1,20 +1,26 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import type { PreviewBatch } from "../lib/dbImport";
 import { kindLabel } from "../lib/dbImport";
 import { fmtDate, fmtInt } from "../formulas";
+import { useAccounts } from "../contexts/AccountContext";
 
 interface ImportPreviewDialogProps {
   batch: PreviewBatch | null;
+  /// Account id mà toàn bộ Shopee file trong batch sẽ tag về. User chọn ở
+  /// ImportAccountPickerDialog trước khi pick file → dialog này chỉ hiển thị.
+  shopeeAccountId: number | null;
   onConfirm: () => Promise<void>;
   onCancel: () => void;
 }
 
 export function ImportPreviewDialog({
   batch,
+  shopeeAccountId,
   onConfirm,
   onCancel,
 }: ImportPreviewDialogProps) {
+  const { accounts } = useAccounts();
   const [committing, setCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,6 +34,14 @@ export function ImportPreviewDialog({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [batch, onCancel, committing]);
+
+  const accountName = useMemo(() => {
+    if (shopeeAccountId === null) return null;
+    return (
+      accounts?.find((a) => a.id === shopeeAccountId)?.name ??
+      `TK #${shopeeAccountId}`
+    );
+  }, [shopeeAccountId, accounts]);
 
   if (!batch) return null;
 
@@ -46,13 +60,34 @@ export function ImportPreviewDialog({
     if (e.target === e.currentTarget && !committing) onCancel();
   };
 
-  const totalReplace = batch.files.reduce(
+  const activeFiles = batch.files.filter((f) => !f.preview.alreadyImported);
+  const duplicateFiles = batch.files.filter((f) => f.preview.alreadyImported);
+  const totalReplace = activeFiles.reduce(
     (a, f) => a + f.preview.replaceRows,
     0,
   );
-  const totalNew = batch.files.reduce((a, f) => a + f.preview.newRows, 0);
-  const anyDayHasData = batch.files.some((f) => f.preview.dayHasData);
+  const totalNew = activeFiles.reduce((a, f) => a + f.preview.newRows, 0);
+  const totalSkipped = activeFiles.reduce((a, f) => a + f.preview.skipped, 0);
+  const anyDayHasData = activeFiles.some((f) => f.preview.dayHasData);
   const hasReplacements = totalReplace > 0;
+  const hasAnyShopee = activeFiles.some(
+    (f) =>
+      f.parsed.kind === "shopee_clicks" ||
+      f.parsed.kind === "shopee_commission",
+  );
+  const allDuplicates = activeFiles.length === 0 && duplicateFiles.length > 0;
+
+  // Date range của batch (toàn file) — hiện ở header.
+  const dateRange = (() => {
+    const from = batch.files
+      .map((f) => f.preview.dayDateFrom)
+      .sort()[0];
+    const to = batch.files
+      .map((f) => f.preview.dayDateTo)
+      .sort()
+      .reverse()[0];
+    return from === to ? fmtDate(from) : `${fmtDate(from)} → ${fmtDate(to)}`;
+  })();
 
   return createPortal(
     <div
@@ -77,7 +112,7 @@ export function ImportPreviewDialog({
               id="import-preview-title"
               className="text-lg font-semibold text-white/90"
             >
-              Ngày {fmtDate(batch.dayDate)}
+              {dateRange}
             </h2>
           </div>
           <div className="shrink-0 text-right text-xs">
@@ -93,6 +128,47 @@ export function ImportPreviewDialog({
         </header>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
+          {hasAnyShopee && accountName && (
+            <div className="rounded-lg border border-shopee-500/30 bg-shopee-500/10 px-4 py-2 text-sm text-shopee-200">
+              <span className="material-symbols-rounded align-middle text-base">
+                account_circle
+              </span>{" "}
+              Shopee files sẽ tag về TK: <b>{accountName}</b>
+            </div>
+          )}
+
+          {duplicateFiles.length > 0 && (
+            <div className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-4 py-3 text-sm">
+              <p className="mb-2 font-semibold text-amber-200">
+                <span className="material-symbols-rounded align-middle text-base">
+                  content_copy
+                </span>{" "}
+                {duplicateFiles.length} file đã import trước — sẽ bỏ qua:
+              </p>
+              <ul className="space-y-0.5 pl-6 text-xs text-white/70">
+                {duplicateFiles.map((f, i) => (
+                  <li key={i} className="truncate" title={f.preview.filename}>
+                    • {f.preview.filename}
+                    {f.preview.existingDayDate && (
+                      <span className="text-white/40">
+                        {" "}— đã import ngày {fmtDate(f.preview.existingDayDate)}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {totalSkipped > 0 && (
+            <div className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-4 py-2 text-sm text-amber-200">
+              <span className="material-symbols-rounded align-middle text-base">
+                warning
+              </span>{" "}
+              {totalSkipped} dòng bị bỏ qua do không parse được ngày (check format CSV)
+            </div>
+          )}
+
           {anyDayHasData && hasReplacements && (
             <div
               role="alert"
@@ -124,54 +200,73 @@ export function ImportPreviewDialog({
                   <th className="border-b border-surface-8 px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider">
                     File
                   </th>
-                  <th className="border-b border-surface-8 px-3 py-2 text-right text-[11px] font-semibold uppercase tracking-wider">
-                    Tổng dòng
+                  <th className="border-b border-surface-8 px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider">
+                    Ngày
                   </th>
                   <th className="border-b border-surface-8 px-3 py-2 text-right text-[11px] font-semibold uppercase tracking-wider">
-                    Thêm mới
+                    Tổng
                   </th>
                   <th className="border-b border-surface-8 px-3 py-2 text-right text-[11px] font-semibold uppercase tracking-wider">
-                    Sẽ replace
+                    Thêm
+                  </th>
+                  <th className="border-b border-surface-8 px-3 py-2 text-right text-[11px] font-semibold uppercase tracking-wider">
+                    Replace
                   </th>
                 </tr>
               </thead>
               <tbody>
-                {batch.files.map(({ preview }, i) => (
-                  <tr
-                    key={i}
-                    className="border-b border-surface-8 last:border-b-0 text-white/80 transition-colors hover:bg-shopee-500/15"
-                  >
-                    <td className="px-3 py-2">
-                      <span className="inline-flex items-center gap-1.5 rounded-full bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-200">
-                        {kindLabel(preview.kind)}
-                      </span>
-                    </td>
-                    <td
-                      className="max-w-[300px] truncate px-3 py-2 text-xs text-white/70"
-                      title={preview.filename}
-                    >
-                      {preview.filename}
-                    </td>
-                    <td className="px-3 py-2 text-right tabular-nums">
-                      {fmtInt(preview.totalRows)}
-                    </td>
-                    <td className="px-3 py-2 text-right tabular-nums text-green-400">
-                      {preview.newRows > 0 ? "+" : ""}
-                      {fmtInt(preview.newRows)}
-                    </td>
-                    <td
-                      className={`px-3 py-2 text-right tabular-nums ${
-                        preview.replaceRows > 0
-                          ? "text-amber-300"
-                          : "text-white/30"
+                {batch.files.map(({ preview }, i) => {
+                  const isDup = preview.alreadyImported;
+                  const dateCell =
+                    preview.dayDateFrom === preview.dayDateTo
+                      ? fmtDate(preview.dayDateFrom)
+                      : `${fmtDate(preview.dayDateFrom)} → ${fmtDate(preview.dayDateTo)}`;
+                  return (
+                    <tr
+                      key={i}
+                      className={`border-b border-surface-8 last:border-b-0 transition-colors ${
+                        isDup
+                          ? "bg-amber-950/20 text-white/40 line-through"
+                          : "text-white/80 hover:bg-shopee-500/15"
                       }`}
                     >
-                      {preview.replaceRows > 0
-                        ? `⟳ ${fmtInt(preview.replaceRows)}`
-                        : "—"}
-                    </td>
-                  </tr>
-                ))}
+                      <td className="px-3 py-2">
+                        <span className="inline-flex items-center gap-1.5 rounded-full bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-200">
+                          {kindLabel(preview.kind)}
+                        </span>
+                      </td>
+                      <td
+                        className="max-w-[260px] truncate px-3 py-2 text-xs"
+                        title={preview.filename}
+                      >
+                        {preview.filename}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-white/60 tabular-nums">
+                        {dateCell}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        {fmtInt(preview.totalRows)}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-green-400">
+                        {!isDup && preview.newRows > 0 ? "+" : ""}
+                        {isDup ? "—" : fmtInt(preview.newRows)}
+                      </td>
+                      <td
+                        className={`px-3 py-2 text-right tabular-nums ${
+                          !isDup && preview.replaceRows > 0
+                            ? "text-amber-300"
+                            : "text-white/30"
+                        }`}
+                      >
+                        {isDup
+                          ? "—"
+                          : preview.replaceRows > 0
+                            ? `⟳ ${fmtInt(preview.replaceRows)}`
+                            : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -212,7 +307,9 @@ export function ImportPreviewDialog({
 
         <footer className="flex shrink-0 items-center justify-between gap-2 border-t border-surface-8 bg-surface-1 px-6 py-3">
           <p className="text-xs text-white/50">
-            {hasReplacements
+            {allDuplicates
+              ? "Tất cả file đã import trước đó — không có gì để commit."
+              : hasReplacements
               ? "Xác nhận sẽ ghi đè các dòng trùng. Data không trùng được giữ nguyên."
               : "Tất cả dòng sẽ được thêm mới."}
           </p>
@@ -228,7 +325,11 @@ export function ImportPreviewDialog({
             <button
               type="button"
               onClick={handleConfirm}
-              disabled={committing}
+              disabled={
+                committing ||
+                allDuplicates ||
+                (hasAnyShopee && shopeeAccountId === null)
+              }
               className={`btn-ripple flex items-center gap-2 rounded-lg px-5 py-2 text-sm font-semibold text-white shadow-elev-2 hover:shadow-elev-4 disabled:cursor-not-allowed disabled:opacity-50 ${
                 hasReplacements
                   ? "bg-amber-500 hover:bg-amber-600"

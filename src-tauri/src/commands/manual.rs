@@ -46,8 +46,9 @@ pub fn save_manual_entry(
         "INSERT INTO manual_entries
          (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date,
           display_name, override_clicks, override_spend, override_cpc,
-          override_orders, override_commission, notes, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          override_orders, override_commission, notes, created_at, updated_at,
+          shopee_account_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date) DO UPDATE SET
             display_name         = excluded.display_name,
             override_clicks      = excluded.override_clicks,
@@ -56,7 +57,8 @@ pub fn save_manual_entry(
             override_orders      = excluded.override_orders,
             override_commission  = excluded.override_commission,
             notes                = excluded.notes,
-            updated_at           = excluded.updated_at",
+            updated_at           = excluded.updated_at,
+            shopee_account_id    = excluded.shopee_account_id",
         params![
             input.sub_ids[0],
             input.sub_ids[1],
@@ -73,6 +75,7 @@ pub fn save_manual_entry(
             input.notes,
             now,
             now,
+            input.shopee_account_id,
         ],
     )?;
 

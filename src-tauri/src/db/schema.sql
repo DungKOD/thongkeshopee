@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS days (
 -- =============================================================
 -- Bảng imported_files — audit log mọi lần import CSV.
 -- =============================================================
+-- day_date: earliest date trong file (informational only). Nullable +
+-- KHÔNG FK to days(date) — Shopee file có thể chứa nhiều ngày (commission
+-- report update đơn cũ). Nếu có FK CASCADE → xóa ngày X → wipe file metadata
+-- → wipe luôn raw rows của NGÀY KHÁC cùng file qua source_file_id CASCADE.
+-- Không CASCADE qua day cho imported_files = an toàn cho multi-day file.
 CREATE TABLE IF NOT EXISTS imported_files (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     filename     TEXT NOT NULL,
@@ -24,7 +29,7 @@ CREATE TABLE IF NOT EXISTS imported_files (
     row_count    INTEGER NOT NULL DEFAULT 0,
     file_hash    TEXT NOT NULL,        -- SHA-256 của raw content
     stored_path  TEXT,                 -- relative path trong app_data_dir/imports/
-    day_date     TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
+    day_date     TEXT,                 -- earliest date in file (informational)
     notes        TEXT,
     UNIQUE(file_hash)                  -- chặn import trùng
 );
@@ -209,6 +214,21 @@ CREATE TABLE IF NOT EXISTS tombstones (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tombstones_type ON tombstones(entity_type);
+
+-- =============================================================
+-- shopee_accounts — 1 user Firebase có thể quản lý nhiều TK Shopee
+-- affiliate. Mỗi row raw Shopee (clicks/orders/manual) tag về 1 account.
+-- FB ads KHÔNG tag trực tiếp — attribution derive qua JOIN sub_ids + day.
+--
+-- Seed default account (id=1, 'Mặc định') ở migration để row cũ (chưa có
+-- account) có default không-NULL sau ALTER TABLE ADD COLUMN.
+-- =============================================================
+CREATE TABLE IF NOT EXISTS shopee_accounts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,
+    color        TEXT,
+    created_at   TEXT NOT NULL
+);
 
 -- =============================================================
 -- Bảng version migration (để future-proof khi thay schema).

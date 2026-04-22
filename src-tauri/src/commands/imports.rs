@@ -103,10 +103,18 @@ fn save_raw_csv(app: &AppHandle, hash: &str, content: &str) -> CmdResult<String>
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {
     pub imported_file_id: i64,
+    /// Earliest date in file — backward compat cho FE toast. Single-day file
+    /// = day_date_from = day_date_to.
     pub day_date: String,
+    pub day_date_from: String,
+    pub day_date_to: String,
     pub row_count: i64,
     pub inserted: i64,
     pub duplicated: i64,
+    /// Rows bị skip vì extract_date thất bại (Shopee multi-day only; FB validate
+    /// single date nên 0). FE hiện warning nếu > 0.
+    #[serde(default)]
+    pub skipped: i64,
 }
 
 /// Kind hợp lệ trong bảng `imported_files.kind`.
@@ -184,6 +192,11 @@ pub struct ImportShopeeClicksPayload {
     pub filename: String,
     pub raw_content: String,
     pub rows: Vec<ShopeeClickRow>,
+    /// ID của `shopee_accounts` mà toàn bộ rows trong file này thuộc về.
+    /// Optional để preview command (dùng cùng struct) không fail — FE gửi
+    /// missing field lúc preview. Import command bắt buộc có → None = reject.
+    #[serde(default)]
+    pub shopee_account_id: Option<i64>,
 }
 
 /// Import Shopee WebsiteClickReport.csv — 1 row/click, PK = click_id.
@@ -193,12 +206,29 @@ pub fn import_shopee_clicks(
     state: State<'_, DbState>,
     payload: ImportShopeeClicksPayload,
 ) -> CmdResult<ImportResult> {
-    let dates: Vec<String> = payload
+    let shopee_account_id = payload.shopee_account_id.ok_or_else(|| {
+        CmdError::msg("shopeeAccountId bắt buộc — chọn TK trong dialog import")
+    })?;
+
+    // Multi-day: mỗi row tự derive day_date từ click_time. Rows không parse
+    // được date → skip (không insert). Collect date range cho imported_files.
+    let rows_with_dates: Vec<(&ShopeeClickRow, Option<String>)> = payload
         .rows
         .iter()
-        .filter_map(|r| extract_date(&r.click_time))
+        .map(|r| (r, extract_date(&r.click_time)))
         .collect();
-    let day_date = validate_single_date(dates, "Thời gian Click")?;
+    let valid_dates: Vec<&str> = rows_with_dates
+        .iter()
+        .filter_map(|(_, d)| d.as_deref())
+        .collect();
+    if valid_dates.is_empty() {
+        return Err(CmdError::msg("File rỗng hoặc không có Thời gian Click hợp lệ"));
+    }
+    let (day_date_from, day_date_to) = {
+        let mut sorted: Vec<&str> = valid_dates.clone();
+        sorted.sort();
+        (sorted[0].to_string(), sorted[sorted.len() - 1].to_string())
+    };
 
     let hash = compute_hash(&payload.raw_content);
     let stored_path = save_raw_csv(&app, &hash, &payload.raw_content)?;
@@ -207,6 +237,19 @@ pub fn import_shopee_clicks(
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let tx = conn.transaction()?;
 
+    // Auto-insert days entries cho mọi date phân biệt trong file. Cần vì
+    // raw_shopee_clicks.day_date vẫn FK tới days(date).
+    {
+        let mut distinct: Vec<&str> = valid_dates.clone();
+        distinct.sort();
+        distinct.dedup();
+        let mut day_stmt =
+            tx.prepare("INSERT OR IGNORE INTO days(date, created_at) VALUES(?, ?)")?;
+        for d in &distinct {
+            day_stmt.execute(params![d, now])?;
+        }
+    }
+
     let source_file_id = register_imported_file(
         &tx,
         &payload.filename,
@@ -214,21 +257,26 @@ pub fn import_shopee_clicks(
         &now,
         &hash,
         &stored_path,
-        &day_date,
+        &day_date_from,
         payload.rows.len() as i64,
     )?;
 
     let mut inserted: i64 = 0;
     let mut duplicated: i64 = 0;
+    let mut skipped: i64 = 0;
     {
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO raw_shopee_clicks
              (click_id, click_time, region, sub_id_raw,
               sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-              referrer, day_date, source_file_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              referrer, day_date, source_file_id, shopee_account_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )?;
-        for r in &payload.rows {
+        for (r, date_opt) in &rows_with_dates {
+            let Some(day_date) = date_opt else {
+                skipped += 1;
+                continue;
+            };
             let changes = stmt.execute(params![
                 r.click_id,
                 r.click_time,
@@ -242,6 +290,7 @@ pub fn import_shopee_clicks(
                 r.referrer,
                 day_date,
                 source_file_id,
+                shopee_account_id,
             ])?;
             if changes > 0 {
                 inserted += 1;
@@ -255,10 +304,13 @@ pub fn import_shopee_clicks(
 
     Ok(ImportResult {
         imported_file_id: source_file_id,
-        day_date,
+        day_date: day_date_from.clone(),
+        day_date_from,
+        day_date_to,
         row_count: payload.rows.len() as i64,
         inserted,
         duplicated,
+        skipped,
     })
 }
 
@@ -302,6 +354,11 @@ pub struct ImportShopeeOrdersPayload {
     pub filename: String,
     pub raw_content: String,
     pub rows: Vec<ShopeeOrderRow>,
+    /// ID của `shopee_accounts`. Optional cho preview command share struct.
+    /// Import bắt buộc có. Nếu row đã tồn tại (UPSERT theo checkout_id + item_id
+    /// + model_id), account_id **cập nhật** theo file mới — ưu tiên intention mới.
+    #[serde(default)]
+    pub shopee_account_id: Option<i64>,
 }
 
 /// Import Shopee AffiliateCommissionReport.csv — 1 row/item trong order.
@@ -312,12 +369,29 @@ pub fn import_shopee_orders(
     state: State<'_, DbState>,
     payload: ImportShopeeOrdersPayload,
 ) -> CmdResult<ImportResult> {
-    let dates: Vec<String> = payload
+    let shopee_account_id = payload.shopee_account_id.ok_or_else(|| {
+        CmdError::msg("shopeeAccountId bắt buộc — chọn TK trong dialog import")
+    })?;
+
+    // Multi-day: mỗi row tự derive day_date từ order_time. Commission report
+    // thường chứa đơn nhiều ngày (status update đơn cũ sau 10-30 ngày).
+    let rows_with_dates: Vec<(&ShopeeOrderRow, Option<String>)> = payload
         .rows
         .iter()
-        .filter_map(|r| extract_date(&r.order_time))
+        .map(|r| (r, extract_date(&r.order_time)))
         .collect();
-    let day_date = validate_single_date(dates, "Thời Gian Đặt Hàng")?;
+    let valid_dates: Vec<&str> = rows_with_dates
+        .iter()
+        .filter_map(|(_, d)| d.as_deref())
+        .collect();
+    if valid_dates.is_empty() {
+        return Err(CmdError::msg("File rỗng hoặc không có Thời Gian Đặt Hàng hợp lệ"));
+    }
+    let (day_date_from, day_date_to) = {
+        let mut sorted: Vec<&str> = valid_dates.clone();
+        sorted.sort();
+        (sorted[0].to_string(), sorted[sorted.len() - 1].to_string())
+    };
 
     let hash = compute_hash(&payload.raw_content);
     let stored_path = save_raw_csv(&app, &hash, &payload.raw_content)?;
@@ -326,6 +400,18 @@ pub fn import_shopee_orders(
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let tx = conn.transaction()?;
 
+    // Auto-insert days entries cho mọi date phân biệt trong file.
+    {
+        let mut distinct: Vec<&str> = valid_dates.clone();
+        distinct.sort();
+        distinct.dedup();
+        let mut day_stmt =
+            tx.prepare("INSERT OR IGNORE INTO days(date, created_at) VALUES(?, ?)")?;
+        for d in &distinct {
+            day_stmt.execute(params![d, now])?;
+        }
+    }
+
     let source_file_id = register_imported_file(
         &tx,
         &payload.filename,
@@ -333,13 +419,14 @@ pub fn import_shopee_orders(
         &now,
         &hash,
         &stored_path,
-        &day_date,
+        &day_date_from,
         payload.rows.len() as i64,
     )?;
 
     // UPSERT: ON CONFLICT DO UPDATE cập nhật trạng thái + field mới nhất.
     let mut inserted: i64 = 0;
     let mut updated: i64 = 0;
+    let mut skipped: i64 = 0;
     {
         let mut stmt = tx.prepare(
             "INSERT INTO raw_shopee_order_items
@@ -350,8 +437,8 @@ pub fn import_shopee_orders(
               price, quantity, order_value, refund_amount,
               net_commission, commission_total,
               sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-              channel, raw_json, day_date, source_file_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              channel, raw_json, day_date, source_file_id, shopee_account_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(checkout_id, item_id, model_id) DO UPDATE SET
                 order_status   = excluded.order_status,
                 order_time     = excluded.order_time,
@@ -364,9 +451,14 @@ pub fn import_shopee_orders(
                 net_commission = excluded.net_commission,
                 commission_total = excluded.commission_total,
                 raw_json       = excluded.raw_json,
-                source_file_id = excluded.source_file_id",
+                source_file_id = excluded.source_file_id,
+                shopee_account_id = excluded.shopee_account_id",
         )?;
-        for r in &payload.rows {
+        for (r, date_opt) in &rows_with_dates {
+            let Some(day_date) = date_opt else {
+                skipped += 1;
+                continue;
+            };
             let before: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM raw_shopee_order_items
@@ -407,6 +499,7 @@ pub fn import_shopee_orders(
                 r.raw_json,
                 day_date,
                 source_file_id,
+                shopee_account_id,
             ])?;
 
             if before == 0 {
@@ -421,10 +514,13 @@ pub fn import_shopee_orders(
 
     Ok(ImportResult {
         imported_file_id: source_file_id,
-        day_date,
+        day_date: day_date_from.clone(),
+        day_date_from,
+        day_date_to,
         row_count: payload.rows.len() as i64,
         inserted,
         duplicated: updated, // ở đây = số row bị overwrite
+        skipped,
     })
 }
 
@@ -591,10 +687,13 @@ pub fn import_fb_ad_groups(
 
     Ok(ImportResult {
         imported_file_id: source_file_id,
-        day_date,
+        day_date: day_date.clone(),
+        day_date_from: day_date.clone(),
+        day_date_to: day_date,
         row_count: payload.rows.len() as i64,
         inserted,
         duplicated,
+        skipped: 0,
     })
 }
 
@@ -731,10 +830,13 @@ pub fn import_fb_campaigns(
 
     Ok(ImportResult {
         imported_file_id: source_file_id,
-        day_date,
+        day_date: day_date.clone(),
+        day_date_from: day_date.clone(),
+        day_date_to: day_date,
         row_count: payload.rows.len() as i64,
         inserted,
         duplicated,
+        skipped: 0,
     })
 }
 

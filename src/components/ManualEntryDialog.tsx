@@ -7,6 +7,9 @@ interface ManualEntryDialogProps {
   isOpen: boolean;
   initialDate: string;
   initialRow?: UiRow | null;
+  /// Account Shopee hiện đang active (AppInner pass từ useAccounts).
+  /// Null = chưa có account nào — dialog sẽ hiện warning thay cho form.
+  shopeeAccountId: number | null;
   onSave: (input: ManualEntryInput) => Promise<void>;
   onClose: () => void;
 }
@@ -31,6 +34,7 @@ export function ManualEntryDialog({
   isOpen,
   initialDate,
   initialRow,
+  shopeeAccountId,
   onSave,
   onClose,
 }: ManualEntryDialogProps) {
@@ -94,6 +98,10 @@ export function ManualEntryDialog({
       setError("Vui lòng nhập tên (sẽ tự split thành sub_id)");
       return;
     }
+    if (shopeeAccountId === null) {
+      setError("Chưa có account Shopee — tạo account trước khi thêm dòng tay");
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -106,6 +114,7 @@ export function ManualEntryDialog({
         overrideCpc: s2n(cpc),
         overrideOrders: s2n(orders),
         overrideCommission: s2n(commission),
+        shopeeAccountId,
       };
       await onSave(input);
     } catch (err) {

@@ -25,6 +25,10 @@ import {
   AdminViewProvider,
   useAdminView,
 } from "./contexts/AdminViewContext";
+import { AccountProvider, useAccounts } from "./contexts/AccountContext";
+import { AccountFilterDropdown } from "./components/AccountFilterDropdown";
+import { AccountManagerDialog } from "./components/AccountManagerDialog";
+import { ImportAccountPickerDialog } from "./components/ImportAccountPickerDialog";
 import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
 import { LoginScreen } from "./components/LoginScreen";
@@ -61,8 +65,17 @@ function AppInner() {
   const [subIdQuery, setSubIdQuery] = useState("");
   const [selectedSubId, setSelectedSubId] = useState<string | null>(null);
 
+  // Account filter + active account từ context. Default filter {kind:"all"}
+  // = không filter (backward compat với code trước multi-account).
+  const {
+    filter: accountFilter,
+    activeAccountId,
+    refresh: refreshAccounts,
+  } = useAccounts();
+
   // Filter args gửi xuống Rust. BE nhận từ_date/to_date/limit → trả slice days,
-  // và sub_id_filter → subset match trên display_name (xem Rust `display_name_subset_match`).
+  // sub_id_filter → subset match trên display_name (xem Rust `display_name_subset_match`),
+  // account_filter → Shopee FK + FB attribution qua sub_ids JOIN.
   const effectiveFilter = useMemo<DaysFilter>(() => {
     const base: DaysFilter = (() => {
       if (filterMode.type === "recent") return { limit: filterMode.count };
@@ -76,8 +89,12 @@ function AppInner() {
       }
       return {}; // all
     })();
-    return selectedSubId ? { ...base, subIdFilter: selectedSubId } : base;
-  }, [filterMode, selectedSubId]);
+    return {
+      ...base,
+      ...(selectedSubId ? { subIdFilter: selectedSubId } : {}),
+      accountFilter,
+    };
+  }, [filterMode, selectedSubId, accountFilter]);
 
   const {
     days,
@@ -100,6 +117,7 @@ function AppInner() {
 
   const { view: adminView, busy: adminBusy, exit: adminExit } = useAdminView();
   const inAdminView = adminView !== null;
+
 
   // Sync v2: pull-merge-push. Khi vào app: metadata check; nếu dirty hoặc remote
   // mới + khác máy → pull-merge-push + refetch UI. UI chặn overlay suốt startup
@@ -136,6 +154,7 @@ function AppInner() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [userListOpen, setUserListOpen] = useState(false);
+  const [accountMgrOpen, setAccountMgrOpen] = useState(false);
   // Máy tính — open state lift lên App để header button toggle được.
   const [calcOpen, setCalcOpen] = useState<boolean>(() => {
     try {
@@ -158,21 +177,38 @@ function AppInner() {
     row?: UiRow | null;
   } | null>(null);
   const [previewBatch, setPreviewBatch] = useState<PreviewBatch | null>(null);
+  // TK user pick trong ImportAccountPickerDialog — giữ xuyên suốt flow import.
+  // null khi chưa pick (dialog đóng) hoặc không có batch pending.
+  const [importAccountId, setImportAccountId] = useState<number | null>(null);
+  const [accountPickerOpen, setAccountPickerOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleImportClick = () => fileInputRef.current?.click();
+  // Flow: bấm "Import CSV" → mở AccountPicker → user chọn TK → mở file picker
+  // → parse → preview (hiển thị TK đã pick) → confirm → commit.
+  const handleImportClick = () => setAccountPickerOpen(true);
+
+  const handleAccountPicked = (accountId: number) => {
+    setImportAccountId(accountId);
+    setAccountPickerOpen(false);
+    // Defer mở file picker 1 tick để dialog đóng animation xong.
+    setTimeout(() => fileInputRef.current?.click(), 0);
+  };
 
   const handleFilesSelected = async (
     e: React.ChangeEvent<HTMLInputElement>,
   ) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (files.length === 0) return;
+    if (files.length === 0) {
+      setImportAccountId(null);
+      return;
+    }
 
     try {
       const batch = await previewCsvBatch(files);
       setPreviewBatch(batch);
     } catch (err) {
+      setImportAccountId(null);
       showToast({
         message: (err as Error).message ?? String(err),
         duration: 10000,
@@ -181,21 +217,32 @@ function AppInner() {
   };
 
   const handleConfirmImport = useCallback(async () => {
-    if (!previewBatch) return;
-    const results = await commitCsvBatch(previewBatch);
-    const date = previewBatch.dayDate;
+    if (!previewBatch || importAccountId === null) return;
+    const results = await commitCsvBatch(previewBatch, importAccountId);
+    await refreshAccounts();
     const totalNew = results.reduce((a, r) => a + r.inserted, 0);
     const totalReplace = results.reduce((a, r) => a + r.duplicated, 0);
+    const totalSkipped = results.reduce((a, r) => a + r.skipped, 0);
+    // Date range của batch thực tế đã commit (dayDateFrom/To từ kết quả Rust).
+    const dateRange = (() => {
+      if (results.length === 0) return "";
+      const from = results.map((r) => r.dayDateFrom).sort()[0];
+      const to = results.map((r) => r.dayDateTo).sort().reverse()[0];
+      return from === to ? fmtDate(from) : `${fmtDate(from)} → ${fmtDate(to)}`;
+    })();
     setPreviewBatch(null);
     markMutation();
     await refetch();
     showToast({
-      message: `Đã import ngày ${fmtDate(date)}: ${fmtInt(totalNew)} dòng mới${
-        totalReplace > 0 ? `, ${fmtInt(totalReplace)} dòng replace` : ""
-      }`,
+      message:
+        results.length === 0
+          ? "Tất cả file đã import trước đó — không có gì để commit"
+          : `Đã import ${dateRange}: ${fmtInt(totalNew)} dòng mới${
+              totalReplace > 0 ? `, ${fmtInt(totalReplace)} replace` : ""
+            }${totalSkipped > 0 ? `, ${fmtInt(totalSkipped)} skip` : ""}`,
       duration: 5000,
     });
-  }, [previewBatch, refetch, showToast, markMutation]);
+  }, [previewBatch, refetch, showToast, markMutation, importAccountId, refreshAccounts]);
 
   const handleSaveEntry = useCallback(
     async (input: Parameters<typeof saveManualEntry>[0]) => {
@@ -614,6 +661,22 @@ function AppInner() {
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
+                {/* Account filter — tách theo TK Shopee affiliate. */}
+                <div className="flex items-center gap-1">
+                  <AccountFilterDropdown />
+                  <button
+                    onClick={() => setAccountMgrOpen(true)}
+                    className="rounded p-1 text-white/60 hover:bg-white/10 hover:text-white"
+                    title="Quản lý TK Shopee"
+                  >
+                    <span className="material-symbols-rounded text-base">
+                      manage_accounts
+                    </span>
+                  </button>
+                </div>
+
+                <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
+
                 {/* Group 1: Sub_id search (flex-1 fill remaining) */}
                 <div className="relative flex min-w-[200px] max-w-[340px] flex-1 items-center gap-1.5">
                   <span
@@ -705,14 +768,7 @@ function AppInner() {
                 </div>
               </div>
             </div>
-            {activeTab === "overview" ? (
-              <OverviewTab
-                days={days}
-                dateFrom={dateFrom}
-                dateTo={dateTo}
-                totalDaysInDb={totalDaysInDb}
-              />
-            ) : days.length === 0 ? (
+            {days.length === 0 ? (
               <div className="mx-auto max-w-xl rounded-2xl border border-dashed border-surface-8 bg-surface-1 p-12 text-center text-white/60">
                 <span className="material-symbols-rounded text-5xl text-white/30">
                   search_off
@@ -723,6 +779,13 @@ function AppInner() {
                     : "Không có ngày nào khớp với khoảng lọc. Thử mở rộng khoảng hoặc bỏ lọc."}
                 </p>
               </div>
+            ) : activeTab === "overview" ? (
+              <OverviewTab
+                days={days}
+                dateFrom={dateFrom}
+                dateTo={dateTo}
+                totalDaysInDb={totalDaysInDb}
+              />
             ) : (
               <>
                 {selectedSubId ? (
@@ -798,15 +861,31 @@ function AppInner() {
           isOpen={true}
           initialDate={entryDialog.date}
           initialRow={entryDialog.row}
+          shopeeAccountId={activeAccountId}
           onSave={handleSaveEntry}
           onClose={() => setEntryDialog(null)}
         />
       )}
 
+      <ImportAccountPickerDialog
+        isOpen={accountPickerOpen}
+        onPick={handleAccountPicked}
+        onClose={() => setAccountPickerOpen(false)}
+      />
+
       <ImportPreviewDialog
         batch={previewBatch}
+        shopeeAccountId={importAccountId}
         onConfirm={handleConfirmImport}
-        onCancel={() => setPreviewBatch(null)}
+        onCancel={() => {
+          setPreviewBatch(null);
+          setImportAccountId(null);
+        }}
+      />
+
+      <AccountManagerDialog
+        isOpen={accountMgrOpen}
+        onClose={() => setAccountMgrOpen(false)}
       />
 
       <PendingChangesBar
@@ -933,7 +1012,9 @@ function AuthGate() {
   return (
     <SettingsProvider>
       <AdminViewProvider>
-        <AppInner />
+        <AccountProvider>
+          <AppInner />
+        </AccountProvider>
       </AdminViewProvider>
     </SettingsProvider>
   );

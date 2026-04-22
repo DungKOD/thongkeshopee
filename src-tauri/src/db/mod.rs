@@ -93,6 +93,12 @@ pub fn init_db(app: &AppHandle) -> Result<Connection> {
 
 /// Check DDL hiện tại của các bảng, fix nếu phát hiện schema cũ.
 /// Idempotent — chạy mỗi lần startup an toàn.
+/// Public alias cho tests — tests cần chạy migrate trên in-memory DB.
+#[cfg(test)]
+pub fn migrate_for_tests(conn: &Connection) -> Result<()> {
+    migrate(conn)
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     // Legacy UNIQUE cũ (pre-v2): `(source_file_id, name)`. Nếu còn phát hiện,
     // data FB cũ bỏ luôn — về trước v2 không còn user thực nào giữ data.
@@ -112,8 +118,132 @@ fn migrate(conn: &Connection) -> Result<()> {
     migrate_fb_unify(conn).context("fb unify migration failed")?;
     migrate_sync_state(conn).context("sync_state migration failed")?;
     migrate_drop_video_downloads(conn).context("drop video_downloads failed")?;
+    // v5: thêm multi-account (shopee_accounts + FK cột trên raw tables).
+    migrate_shopee_accounts(conn).context("shopee_accounts migration failed")?;
+    // v6: drop FK CASCADE trên imported_files.day_date để support multi-day file.
+    migrate_imported_files_drop_day_fk(conn)
+        .context("imported_files drop day_fk migration failed")?;
 
     Ok(())
+}
+
+/// v6 migration: imported_files.day_date — rebuild table để drop `REFERENCES
+/// days(date) ON DELETE CASCADE` + `NOT NULL`. Cho phép file Shopee multi-day
+/// (commission report update đơn nhiều ngày trong 1 lần export).
+///
+/// Pre-fix bug: xóa 1 ngày → CASCADE xóa imported_files entry có day_date=đó
+/// → CASCADE xóa raw_shopee_* rows theo source_file_id → mất data của NGÀY
+/// KHÁC cùng file. Post-fix: day_date chỉ là info, không cascade.
+fn migrate_imported_files_drop_day_fk(conn: &Connection) -> Result<()> {
+    let existing_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='imported_files'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let needs_migrate = match existing_sql.as_deref() {
+        Some(s) => s.contains("REFERENCES days(date)"),
+        None => false,
+    };
+    if !needs_migrate {
+        return Ok(());
+    }
+
+    // Disable FK checks trong quá trình rebuild. Làm ngoài transaction vì
+    // pragma không có hiệu lực trong transaction đang mở trong SQLite.
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         CREATE TABLE imported_files_new (
+             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+             filename     TEXT NOT NULL,
+             kind         TEXT NOT NULL,
+             imported_at  TEXT NOT NULL,
+             row_count    INTEGER NOT NULL DEFAULT 0,
+             file_hash    TEXT NOT NULL,
+             stored_path  TEXT,
+             day_date     TEXT,
+             notes        TEXT,
+             UNIQUE(file_hash)
+         );
+         INSERT INTO imported_files_new
+           (id, filename, kind, imported_at, row_count, file_hash, stored_path, day_date, notes)
+         SELECT
+           id, filename, kind, imported_at, row_count, file_hash, stored_path, day_date, notes
+         FROM imported_files;
+         DROP TABLE imported_files;
+         ALTER TABLE imported_files_new RENAME TO imported_files;
+         CREATE INDEX IF NOT EXISTS idx_imported_day  ON imported_files(day_date);
+         CREATE INDEX IF NOT EXISTS idx_imported_kind ON imported_files(kind);
+         PRAGMA foreign_keys = ON;",
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v5 migration: multi-tenant cho Shopee affiliate account.
+/// - Tạo bảng `shopee_accounts` (schema.sql chạy trước nên có rồi, idempotent).
+/// - Seed default account (id=1) nếu chưa có — để row cũ có default khi ALTER.
+/// - ALTER TABLE ADD COLUMN `shopee_account_id` với DEFAULT 1 cho 3 bảng raw
+///   Shopee (clicks/orders/manual). SQLite auto backfill = 1 cho mọi row cũ.
+/// - KHÔNG thêm FK constraint (ALTER TABLE ADD COLUMN không support FK trong
+///   SQLite — app-layer enforce referential integrity).
+fn migrate_shopee_accounts(conn: &Connection) -> Result<()> {
+    // Seed default account — dùng INSERT OR IGNORE để idempotent.
+    // Literal id=1 để FK cột DEFAULT 1 ở ALTER TABLE luôn trỏ đúng.
+    conn.execute(
+        "INSERT OR IGNORE INTO shopee_accounts (id, name, color, created_at)
+         VALUES (1, 'Mặc định', '#ff6b35', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
+
+    for table in ["raw_shopee_clicks", "raw_shopee_order_items", "manual_entries"] {
+        if !table_has_column(conn, table, "shopee_account_id")? {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE {table} ADD COLUMN shopee_account_id INTEGER NOT NULL DEFAULT 1"
+                ),
+                [],
+            )?;
+        }
+    }
+
+    // Index phụ cho filter query theo account.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clicks_account
+         ON raw_shopee_clicks(shopee_account_id, day_date)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_account
+         ON raw_shopee_order_items(shopee_account_id, day_date)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_manual_account
+         ON manual_entries(shopee_account_id, day_date)",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(cols.iter().any(|c| c == column))
 }
 
 /// v4 migration: drop `video_downloads` khỏi main DB. Table đã move sang
@@ -291,6 +421,11 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
         // restore (tương lai) hoặc compact — cũng mark dirty.
         ("trg_sync_tombstones_ins", "INSERT", "tombstones"),
         ("trg_sync_tombstones_del", "DELETE", "tombstones"),
+        // Shopee accounts: CRUD account cần đồng bộ cross-device (2 máy tạo
+        // cùng TK → sync merge theo UNIQUE name).
+        ("trg_sync_accounts_ins", "INSERT", "shopee_accounts"),
+        ("trg_sync_accounts_upd", "UPDATE", "shopee_accounts"),
+        ("trg_sync_accounts_del", "DELETE", "shopee_accounts"),
     ];
 
     // Drop legacy triggers trên bảng FB cũ (đã gộp vào raw_fb_ads ở v3).
@@ -404,10 +539,12 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0, "CASCADE phải xóa raw_shopee_clicks");
 
+        // v6: imported_files không còn FK CASCADE qua day_date → metadata survive
+        // sau khi day bị xóa. Cần thiết để support file Shopee multi-day.
         let file_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM imported_files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(file_count, 0, "CASCADE phải xóa imported_files");
+        assert_eq!(file_count, 1, "imported_files KHÔNG cascade từ day (v6)");
     }
 
     #[test]

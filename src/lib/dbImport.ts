@@ -105,10 +105,15 @@ export interface FbCampaignRow {
 
 export interface ImportResult {
   importedFileId: number;
+  /** Earliest date — backward compat. */
   dayDate: string;
+  dayDateFrom: string;
+  dayDateTo: string;
   rowCount: number;
   inserted: number;
   duplicated: number;
+  /** Rows bị skip do date không parse (Shopee multi-day). */
+  skipped: number;
 }
 
 // =========================================================
@@ -380,12 +385,21 @@ function toFbCampaignRow(r: Record<string, string>): FbCampaignRow | null {
 export interface ImportPreview {
   kind: CsvKind;
   filename: string;
+  /** Earliest date — backward compat. */
   dayDate: string;
+  dayDateFrom: string;
+  dayDateTo: string;
   totalRows: number;
   newRows: number;
   replaceRows: number;
   sampleReplace: string[];
   dayHasData: boolean;
+  /** File đã import (hash match) — FE highlight + skip khỏi commit. */
+  alreadyImported: boolean;
+  /** Nếu alreadyImported=true: day_date của lần import trước. */
+  existingDayDate: string | null;
+  /** Rows không parse được date (Shopee multi-day only). */
+  skipped: number;
 }
 
 /** Parsed + typed payload của 1 file, giữ trong RAM để commit sau preview. */
@@ -550,19 +564,31 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
     ),
   );
 
-  // Validate cross-date: tất cả file phải cùng 1 ngày.
-  const uniqueDates = Array.from(new Set(previews.map((p) => p.dayDate))).sort();
-  if (uniqueDates.length > 1) {
-    const summary = previews
-      .map((p) => `  • ${p.filename}: ${p.dayDate} (${kindLabel(p.kind)})`)
-      .join("\n");
-    throw new Error(
-      `Các file không cùng ngày:\n${summary}\n\nVui lòng import từng ngày riêng lẻ.`,
-    );
+  // Validate cross-date CHỈ cho FB (single-date). Shopee multi-day OK.
+  // Mỗi FB file phải share cùng ngày với các FB file khác nếu có nhiều; và
+  // cùng ngày với Shopee files. Thực tế 1 batch thường 1 ngày FB → check nhẹ.
+  const fbFiles = previews.filter(
+    (p) => p.kind === "fb_ad_group" || p.kind === "fb_campaign",
+  );
+  if (fbFiles.length > 0) {
+    const fbDates = Array.from(new Set(fbFiles.map((p) => p.dayDate))).sort();
+    if (fbDates.length > 1) {
+      const summary = fbFiles
+        .map((p) => `  • ${p.filename}: ${p.dayDate} (${kindLabel(p.kind)})`)
+        .join("\n");
+      throw new Error(
+        `File FB phải cùng 1 ngày:\n${summary}\n\nImport từng ngày FB riêng lẻ.`,
+      );
+    }
   }
 
+  // Representative date cho batch: earliest của day_date_from của mọi file.
+  const representative = previews
+    .map((p) => p.dayDateFrom)
+    .sort()[0];
+
   return {
-    dayDate: uniqueDates[0],
+    dayDate: representative,
     files: parsed.map((p, i) => ({ parsed: p, preview: previews[i] })),
   };
 }
@@ -571,15 +597,25 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
  * Commit tất cả file trong batch (sau khi user xác nhận preview).
  * Gọi tuần tự để nếu 1 file fail thì dừng (data partial là OK vì
  * mỗi file là 1 transaction riêng).
+ *
+ * `shopeeAccountId`: TK user chọn trong ImportAccountPickerDialog TRƯỚC khi pick
+ * file. Gắn cho mọi Shopee file (clicks + commission) trong batch. FB
+ * (ad_group/campaign) không dùng account_id — attribution derive qua JOIN
+ * sub_ids + day_date ở query time.
  */
 export async function commitCsvBatch(
   batch: PreviewBatch,
+  shopeeAccountId: number,
 ): Promise<ImportResult[]> {
   const results: ImportResult[] = [];
-  for (const { parsed } of batch.files) {
-    const r = await invoke<ImportResult>(IMPORT_CMD[parsed.kind], {
-      payload: parsed.payload,
-    });
+  for (const { parsed, preview } of batch.files) {
+    // Skip file đã import trước (hash match). FE dialog đã báo user rồi.
+    if (preview.alreadyImported) continue;
+    const payload =
+      parsed.kind === "shopee_clicks" || parsed.kind === "shopee_commission"
+        ? { ...parsed.payload, shopeeAccountId }
+        : parsed.payload;
+    const r = await invoke<ImportResult>(IMPORT_CMD[parsed.kind], { payload });
     results.push(r);
   }
   return results;
