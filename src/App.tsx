@@ -437,26 +437,15 @@ function AppInner() {
             </button>
             <UserMenu />
             {activeTab === "stats" && !inAdminView && (
-              <>
-                <button
-                  onClick={handleImportClick}
-                  className="btn-ripple flex items-center gap-2 rounded-lg border border-white/50 px-4 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
-                >
-                  <span className="material-symbols-rounded text-base">
-                    upload_file
-                  </span>
-                  Import CSV
-                </button>
-                <button
-                  onClick={() => setEntryDialog({ date: todayIso() })}
-                  className="btn-ripple flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-sm font-medium text-shopee-600 shadow-elev-2 hover:shadow-elev-4"
-                >
-                  <span className="material-symbols-rounded text-base">
-                    add
-                  </span>
-                  Thêm dòng
-                </button>
-              </>
+              <button
+                onClick={handleImportClick}
+                className="btn-ripple flex items-center gap-2 rounded-lg border border-white/50 px-4 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
+              >
+                <span className="material-symbols-rounded text-base">
+                  upload_file
+                </span>
+                Import CSV
+              </button>
             )}
           </div>
         </div>
@@ -1066,7 +1055,7 @@ function SplashScreen({
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-surface-0 text-white">
       <span className="material-symbols-rounded animate-spin text-5xl text-shopee-400">
-        cloud_sync
+        progress_activity
       </span>
       <div className="text-lg font-medium">{title}</div>
       {subtitle && (

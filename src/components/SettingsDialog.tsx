@@ -175,6 +175,21 @@ export function SettingsDialog({
             )}
           </section>
 
+          {/* App info — version + build metadata. Cuối Settings làm footer info. */}
+          <section className="rounded-xl border border-surface-8 bg-surface-1 px-4 py-3">
+            <div className="flex items-center justify-between text-xs text-white/60">
+              <span className="flex items-center gap-1.5">
+                <span className="material-symbols-rounded text-sm text-shopee-400">
+                  info
+                </span>
+                ThongKeShopee
+              </span>
+              <span className="font-mono tabular-nums text-white/80">
+                v{__APP_VERSION__}
+              </span>
+            </div>
+          </section>
+
         </div>
 
         <footer className="flex shrink-0 justify-end border-t border-surface-8 bg-surface-1 px-6 py-3">

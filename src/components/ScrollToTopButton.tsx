@@ -42,7 +42,9 @@ export function ScrollToTopButton({
     }
   };
 
-  const posCls = className ?? "fixed bottom-6 right-6";
+  // Default position: bottom-24 để không đè lên DevCredit floating (bottom-4).
+  // Caller có thể override qua className cho dialog-scope (vd absolute).
+  const posCls = className ?? "fixed bottom-24 right-6";
   return (
     <button
       type="button"
