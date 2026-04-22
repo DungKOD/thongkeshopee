@@ -39,6 +39,23 @@ pub struct UiRow {
     pub has_manual: bool,
 }
 
+/// Day-level totals — KHÔNG áp row-0 filter (spend==0 && commission==0).
+/// UI dùng cho KPI tổng. Nếu sum từ `UiDay.rows` thì miss tuple nào bị filter
+/// row-0 drop (có click/order nhưng không có spend/commission). Mọi field
+/// ở đây luôn accurate 100% so với raw data.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UiDayTotals {
+    pub ads_clicks: i64,
+    pub total_spend: f64,
+    pub impressions: i64,
+    pub shopee_clicks_by_referrer: std::collections::HashMap<String, i64>,
+    pub shopee_clicks_total: i64,
+    pub orders_count: i64,
+    pub commission_total: f64,
+    pub order_value_total: f64,
+}
+
 /// 1 ngày hiển thị trên UI (dùng cho DayBlock).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +63,9 @@ pub struct UiDay {
     pub date: String,
     pub notes: Option<String>,
     pub rows: Vec<UiRow>,
+    /// Tổng day-level TRƯỚC khi row-0 filter. KPI dùng field này để đúng với
+    /// raw data kể cả khi có tuple chỉ có click (không spend/commission).
+    pub totals: UiDayTotals,
 }
 
 /// Payload khi user lưu manual entry (add/edit 1 dòng tay).

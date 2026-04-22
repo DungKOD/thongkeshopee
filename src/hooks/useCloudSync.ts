@@ -28,6 +28,7 @@ interface SyncStateDto {
   last_synced_at_ms: number | null;
   last_synced_remote_mtime_ms: number | null;
   last_error: string | null;
+  ownerUid: string | null;
 }
 
 interface UseCloudSyncResult {
@@ -316,6 +317,11 @@ export function useCloudSync({
 
   // Startup check — chạy MỖI LẦN login (kể cả cùng user, sau logout).
   // Reset ref trên logout → login tiếp theo re-run.
+  //
+  // CRITICAL: trước khi sync, gọi `sync_reset_for_new_user(authUid)` để đảm
+  // bảo local DB thuộc về user hiện tại. Nếu DB của user khác → wipe + refetch
+  // sync_state. Tránh leak data user A sang UI user B + tránh upload DB của A
+  // lên R2 path users/{uid_B}/.
   useEffect(() => {
     if (!enabled) return;
     if (!authUid) {
@@ -327,6 +333,17 @@ export function useCloudSync({
     startupDoneRef.current = true;
     void (async () => {
       try {
+        const wiped = await invoke<boolean>("sync_reset_for_new_user", {
+          newUid: authUid,
+        });
+        if (wiped) {
+          console.log("[sync] owner change detected → local DB wiped");
+          try {
+            await onRemoteAppliedRef.current?.();
+          } catch {
+            // ignore — UI sẽ refresh sau startup check.
+          }
+        }
         await doStartupCheck();
       } finally {
         setIsStartupPhase(false);

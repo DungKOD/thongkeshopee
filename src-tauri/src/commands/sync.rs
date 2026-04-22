@@ -102,6 +102,10 @@ pub struct SyncState {
     pub last_synced_at_ms: Option<i64>,
     pub last_synced_remote_mtime_ms: Option<i64>,
     pub last_error: Option<String>,
+    /// Firebase UID cuối cùng sở hữu/sync DB này. Null = DB vừa init chưa có
+    /// user (pre-migration). FE compare với current user — khác = wipe.
+    #[serde(rename = "ownerUid")]
+    pub owner_uid: Option<String>,
 }
 
 /// Compute machine fingerprint: MD5(os | hostname | machine-uid) → hex string.
@@ -150,7 +154,7 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
     let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let row = conn.query_row(
         "SELECT dirty, change_id, last_uploaded_change_id,
-                last_synced_at_ms, last_synced_remote_mtime_ms, last_error
+                last_synced_at_ms, last_synced_remote_mtime_ms, last_error, owner_uid
          FROM sync_state WHERE id = 1",
         [],
         |r| {
@@ -161,6 +165,7 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, Option<i64>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         },
     )?;
@@ -171,7 +176,84 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
         last_synced_at_ms: row.3,
         last_synced_remote_mtime_ms: row.4,
         last_error: row.5,
+        owner_uid: row.6,
     })
+}
+
+/// Multi-tenant guard — wipe local DB nếu owner_uid != new_uid (khác user
+/// đang login so với lần trước). Idempotent: cùng user → no-op, chỉ stamp
+/// owner_uid nếu chưa có.
+///
+/// Flow: FE gọi NGAY SAU khi Firebase auth ready (trước mọi sync) với
+/// `new_uid = currentUser.uid`. Nếu return `true` = DB đã wipe, FE refetch
+/// sync_state + trigger pull-merge-push (R2 sẽ restore data nếu user mới có
+/// backup, hoặc DB ở trạng thái empty clean nếu chưa có).
+#[tauri::command]
+pub async fn sync_reset_for_new_user(
+    db: State<'_, DbState>,
+    new_uid: String,
+) -> CmdResult<bool> {
+    if new_uid.is_empty() {
+        return Err(CmdError::msg("new_uid rỗng — phải là Firebase UID hợp lệ"));
+    }
+    let mut conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let current_owner: Option<String> = conn
+        .query_row(
+            "SELECT owner_uid FROM sync_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+
+    // Same user → chỉ đảm bảo owner stamped (pre-migration DB có thể null).
+    if current_owner.as_deref() == Some(new_uid.as_str()) {
+        return Ok(false);
+    }
+
+    let need_wipe = current_owner.is_some();
+
+    if need_wipe {
+        eprintln!(
+            "[sync_reset] owner change: {} → {} — wipe local DB",
+            current_owner.as_deref().unwrap_or("<none>"),
+            new_uid,
+        );
+        let tx = conn.transaction().map_err(CmdError::from)?;
+        // Thứ tự DELETE: leaf tables trước (triggers tăng change_id nhưng ta
+        // sẽ reset về 0 ở UPDATE sync_state cuối). `days` DELETE CASCADE xóa
+        // imported_files, raw_*, manual_entries — nhưng triggers chạy sao chắc,
+        // ta explicit DELETE từng bảng để không dính FK issue.
+        tx.execute("DELETE FROM raw_shopee_clicks", [])?;
+        tx.execute("DELETE FROM raw_shopee_order_items", [])?;
+        tx.execute("DELETE FROM raw_fb_ads", [])?;
+        tx.execute("DELETE FROM manual_entries", [])?;
+        tx.execute("DELETE FROM imported_files", [])?;
+        tx.execute("DELETE FROM days", [])?;
+        tx.execute("DELETE FROM tombstones", [])?;
+        // Reset sync_state — change_id bị trigger tăng vì DELETE ở trên, ta
+        // force về 0 + stamp owner mới.
+        tx.execute(
+            "UPDATE sync_state SET
+                dirty = 1,
+                change_id = 0,
+                last_uploaded_change_id = 0,
+                last_synced_at_ms = NULL,
+                last_synced_remote_mtime_ms = NULL,
+                last_error = NULL,
+                owner_uid = ?1
+             WHERE id = 1",
+            params![new_uid],
+        )?;
+        tx.commit().map_err(CmdError::from)?;
+    } else {
+        // Pre-migration DB / fresh install — chỉ stamp owner, không wipe.
+        conn.execute(
+            "UPDATE sync_state SET owner_uid = ?1 WHERE id = 1",
+            params![new_uid],
+        )?;
+    }
+
+    Ok(need_wipe)
 }
 
 /// Ghi lỗi sync vào sync_state.last_error (không đổi dirty). Dùng khi upload fail.

@@ -24,11 +24,26 @@ export type UiRow = {
   hasManual: boolean;
 };
 
+/** Day-level totals — tính từ MỌI tuple trước row-0 filter. KPI dùng field
+ *  này để đúng 100% với raw data kể cả khi tuple chỉ có click (không spend/
+ *  commission) bị filter khỏi row display. */
+export type UiDayTotals = {
+  adsClicks: number;
+  totalSpend: number;
+  impressions: number;
+  shopeeClicksByReferrer: Record<string, number>;
+  shopeeClicksTotal: number;
+  ordersCount: number;
+  commissionTotal: number;
+  orderValueTotal: number;
+};
+
 /** 1 ngày hiển thị, chứa rows (= UiRow[]). */
 export type UiDay = {
   date: string;
   notes: string | null;
   rows: UiRow[];
+  totals: UiDayTotals;
 };
 
 /** Key định danh 1 row manual — dùng khi delete. */

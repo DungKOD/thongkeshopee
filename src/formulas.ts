@@ -133,22 +133,41 @@ export function computeOverviewTotals(
     rowsCount: 0,
   };
   for (const day of days) {
+    // Source filter 'shopee_only': totals SUM vẫn dùng day.totals (chính xác
+    // pre-filter), nhưng bỏ ads spend/clicks → lấy net commission thuần.
+    // Source 'all': dùng toàn bộ day.totals.
+    //
+    // KPI PHẢI lấy từ day.totals (pre row-0 filter) — nếu sum từ day.rows sẽ
+    // miss tuple chỉ có click/order nhưng spend=0 & commission=0 (row-0 drop).
+    const t = day.totals;
+    const spend = includeAds ? t.totalSpend : 0;
+    const adsClicks = includeAds ? t.adsClicks : 0;
+    const net = t.commissionTotal * ratio;
+    acc.clicks += adsClicks;
+    acc.shopeeClicks += sumFiltered(t.shopeeClicksByReferrer, clickSources);
+    acc.totalSpend += spend;
+    acc.orders += t.ordersCount;
+    acc.commission += t.commissionTotal;
+    acc.netCommission += net;
+    acc.profit += net - spend;
+    acc.orderValueTotal += t.orderValueTotal;
+
+    // daysCount/rowsCount vẫn dựa vào row-level vì là metrics hiển thị UI.
     let dayContributed = false;
     for (const r of day.rows) {
       if (!rowMatchesSource(r, source)) continue;
-      const spend = includeAds ? r.totalSpend ?? 0 : 0;
-      const adsClicks = includeAds ? r.adsClicks ?? 0 : 0;
-      const net = r.commissionTotal * ratio;
-      acc.clicks += adsClicks;
-      acc.shopeeClicks += sumFiltered(r.shopeeClicksByReferrer, clickSources);
-      acc.totalSpend += spend;
-      acc.orders += r.ordersCount;
-      acc.commission += r.commissionTotal;
-      acc.netCommission += net;
-      acc.profit += net - spend;
-      acc.orderValueTotal += r.orderValueTotal;
       acc.rowsCount += 1;
       dayContributed = true;
+    }
+    // Nếu day có data từ raw (totals != 0) nhưng mọi row bị filter → vẫn count.
+    if (!dayContributed) {
+      const hasAnyData =
+        t.adsClicks > 0 ||
+        t.shopeeClicksTotal > 0 ||
+        t.ordersCount > 0 ||
+        t.commissionTotal !== 0 ||
+        t.totalSpend !== 0;
+      if (hasAnyData) dayContributed = true;
     }
     if (dayContributed) acc.daysCount += 1;
   }

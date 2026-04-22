@@ -63,6 +63,7 @@ pub fn run() {
             commands::sync::machine_fingerprint,
             commands::sync::sync_state_get,
             commands::sync::sync_state_record_error,
+            commands::sync::sync_reset_for_new_user,
             commands::admin_view::admin_view_user_db,
             commands::admin_view::admin_exit_view_user_db,
             commands::admin_view::admin_view_state_get,

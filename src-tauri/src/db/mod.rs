@@ -262,6 +262,15 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // owner_uid: Firebase UID của user cuối cùng sync/sở hữu DB này. Dùng detect
+    // multi-tenant khi nhiều user login cùng máy → FE check owner != current
+    // user sẽ wipe local DB trước khi sync (tránh B thấy data của A).
+    if !cols.iter().any(|c| c == "owner_uid") {
+        conn.execute(
+            "ALTER TABLE sync_state ADD COLUMN owner_uid TEXT",
+            [],
+        )?;
+    }
 
     // Drop + re-create sync triggers để đảm bảo body match code hiện tại.
     // Triggers increment cả dirty lẫn change_id (cho CAS pattern).
