@@ -483,7 +483,7 @@ function ProductsTable({
         </span>
       </header>
 
-      <div className="overflow-x-auto">
+      <div>
         <table className="w-full border-collapse text-sm">
           <thead>
             <tr className="border-b-2 border-shopee-500/50 bg-gradient-to-b from-shopee-900/35 to-shopee-900/15 text-shopee-100">
