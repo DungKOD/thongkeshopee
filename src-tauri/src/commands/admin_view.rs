@@ -27,6 +27,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use tokio::fs;
 
+use super::sync::gunzip_if_needed;
 use super::sync_client;
 use super::{CmdError, CmdResult};
 use crate::db::{DbState, resolve_db_path};
@@ -77,9 +78,19 @@ pub async fn admin_view_user_db(
     let (base64, size_bytes, last_modified_ms) =
         sync_client::admin_download(&sync_api_url, &id_token, &target_uid).await?;
 
-    let bytes = BASE64
+    let raw_payload = BASE64
         .decode(base64.as_bytes())
         .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
+
+    // R2 lưu gzipped (`db.gz`). Phải decompress trước khi write làm SQLite
+    // file, nếu không SQLite mở file sẽ lỗi "file is not a database".
+    // gunzip_if_needed backward-compat với bản cũ (raw SQLite chưa gzip).
+    let bytes = gunzip_if_needed(&raw_payload)?;
+    eprintln!(
+        "admin_view download: payload={} KB → sqlite={} KB",
+        raw_payload.len() / 1024,
+        bytes.len() / 1024,
+    );
 
     // 2. Ghi file ra disk.
     let dir = admin_view_dir(&app)?;

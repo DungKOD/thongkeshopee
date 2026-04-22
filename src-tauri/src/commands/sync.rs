@@ -40,7 +40,9 @@ fn gzip_compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
 
 /// Detect magic + decompress nếu cần. Backward compat: bản DB cũ (raw SQLite
 /// chưa gzip) upload lên Drive thời kỳ đầu vẫn restore được.
-fn gunzip_if_needed(input: &[u8]) -> CmdResult<Vec<u8>> {
+/// Pub(crate) để `admin_view::admin_view_user_db` reuse — payload base64 từ
+/// Worker luôn gzipped, cần decompress trước khi write làm SQLite file.
+pub(crate) fn gunzip_if_needed(input: &[u8]) -> CmdResult<Vec<u8>> {
     if input.len() >= 2 && input[0..2] == GZIP_MAGIC {
         let mut decoder = GzDecoder::new(input);
         let mut out = Vec::with_capacity(input.len() * 3);
