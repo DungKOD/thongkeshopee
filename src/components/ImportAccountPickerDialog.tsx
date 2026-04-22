@@ -176,7 +176,7 @@ export function ImportAccountPickerDialog({
                     setNewName("");
                   }
                 }}
-                placeholder="Tên TK mới (vd: TK Cao Thắng)"
+                placeholder="Tên TK mới"
                 className="flex-1 rounded-md border border-shopee-500 bg-surface-1 px-3 py-2 text-sm text-white/90 placeholder:text-white/30 focus:outline-none"
               />
               <button

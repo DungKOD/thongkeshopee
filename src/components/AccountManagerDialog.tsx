@@ -166,7 +166,7 @@ export function AccountManagerDialog({
               type="text"
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              placeholder="Tên account (vd: TK Cao Thắng)"
+              placeholder="Tên account"
               disabled={saving}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void handleCreate();
