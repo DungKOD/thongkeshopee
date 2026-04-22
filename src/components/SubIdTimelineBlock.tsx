@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { UiDay, UiRow } from "../types";
 import {
+  computeNetCommission,
   computeUiRow,
   fmtDate,
   fmtInt,
@@ -8,11 +9,7 @@ import {
   fmtVnd,
   uiRowKey,
 } from "../formulas";
-import {
-  netCommissionRatio,
-  sumFiltered,
-  useSettings,
-} from "../hooks/useSettings";
+import { sumFiltered, useSettings } from "../hooks/useSettings";
 import { ProductDetailDialog } from "./ProductDetailDialog";
 
 interface SubIdTimelineBlockProps {
@@ -79,7 +76,6 @@ export function SubIdTimelineBlock({
   const flatRows = useMemo(() => days.flatMap((d) => d.rows), [days]);
 
   const totals = useMemo(() => {
-    const ratio = netCommissionRatio(settings.profitFees);
     return flatRows.reduce(
       (acc, r) => {
         acc.clicks += r.adsClicks ?? 0;
@@ -90,7 +86,12 @@ export function SubIdTimelineBlock({
         acc.totalSpend += r.totalSpend ?? 0;
         acc.orders += r.ordersCount;
         acc.commission += r.commissionTotal;
-        acc.profit += r.commissionTotal * ratio - (r.totalSpend ?? 0);
+        const net = computeNetCommission(
+          r.commissionTotal,
+          r.commissionPending,
+          settings.profitFees,
+        );
+        acc.profit += net - (r.totalSpend ?? 0);
         return acc;
       },
       {

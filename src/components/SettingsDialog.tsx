@@ -104,7 +104,7 @@ export function SettingsDialog({
               Phí khấu trừ lợi nhuận
             </h3>
             <p className="mb-3 text-xs text-white/50">
-              Lợi nhuận = Hoa hồng × (1 − tổng phí) − Tiền ads
+              Net = Hoa hồng × (1 − Thuế) − Hoa hồng <i>pending</i> × Dự phòng
             </p>
             <div className="grid grid-cols-2 gap-3">
               <FeeInput
@@ -118,25 +118,19 @@ export function SettingsDialog({
                 onChange={(v) => onSetProfitFee("returnReserveRate", v)}
               />
             </div>
-            <div className="mt-2 rounded-lg bg-surface-2 px-3 py-2 text-xs text-white/60">
-              Tổng khấu trừ:{" "}
-              <span className="font-semibold text-shopee-300">
-                {(
-                  settings.profitFees.taxAndPlatformRate +
-                  settings.profitFees.returnReserveRate
-                ).toFixed(2)}
-                %
+            <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
+              <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
+                info
               </span>
-              {" → Giữ lại: "}
-              <span className="font-semibold text-shopee-300">
-                {(
-                  100 -
-                  settings.profitFees.taxAndPlatformRate -
-                  settings.profitFees.returnReserveRate
-                ).toFixed(2)}
-                %
-              </span>{" "}
-              hoa hồng
+              <div>
+                <div className="font-semibold">Dự phòng hoàn/hủy</div>
+                <div className="mt-0.5 text-amber-200/80">
+                  CHỈ trừ từ hoa hồng của đơn trạng thái{" "}
+                  <b>"Đang chờ xử lý"</b>. Đơn đã hoàn thành/thanh toán không
+                  bị trừ dự phòng (đã chắc chắn, không có rủi ro hủy). Thuế +
+                  phí sàn thì áp cho mọi đơn.
+                </div>
+              </div>
             </div>
           </section>
 

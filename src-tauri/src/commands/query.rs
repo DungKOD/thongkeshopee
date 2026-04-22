@@ -385,6 +385,10 @@ fn aggregate_rows_for_day(
         canonical: Canonical,
         orders: i64,
         commission_cents: i64,
+        /// Commission từ đơn trạng thái "Đang chờ xử lý" — FE dùng để trừ
+        /// dự phòng hoàn huỷ chỉ trên phần chưa chắc chắn. Status chính xác
+        /// do Shopee CSV export (không localize khác).
+        commission_pending_cents: i64,
         order_value_cents: i64,
     }
     let mut shopee_orders: Vec<ShopeeOrder> = Vec::new();
@@ -393,6 +397,9 @@ fn aggregate_rows_for_day(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     COUNT(DISTINCT order_id),
                     COALESCE(SUM(CAST(ROUND(net_commission * 100) AS INTEGER)), 0),
+                    COALESCE(SUM(CASE WHEN order_status = 'Đang chờ xử lý'
+                                      THEN CAST(ROUND(net_commission * 100) AS INTEGER)
+                                      ELSE 0 END), 0),
                     COALESCE(SUM(CAST(ROUND(order_value * 100) AS INTEGER)), 0)
              FROM raw_shopee_order_items
              WHERE day_date = ?",
@@ -416,7 +423,8 @@ fn aggregate_rows_for_day(
                 canonical: to_canonical(tuple),
                 orders: r.get(5)?,
                 commission_cents: r.get(6)?,
-                order_value_cents: r.get(7)?,
+                commission_pending_cents: r.get(7)?,
+                order_value_cents: r.get(8)?,
             })
         })?;
         for row in iter {
@@ -548,6 +556,10 @@ fn aggregate_rows_for_day(
         shopee_clicks_total: i64,
         orders_count: i64,
         commission_cents: i64,
+        /// Subset của commission_cents từ đơn status "Đang chờ xử lý".
+        /// FE trừ `pending × returnReserveRate` khỏi net — reserve chỉ áp
+        /// cho pending (có khả năng hoàn huỷ), completed đã chắc ăn.
+        commission_pending_cents: i64,
         order_value_cents: i64,
         has_fb: bool,
         has_shopee_clicks: bool,
@@ -566,6 +578,7 @@ fn aggregate_rows_for_day(
         shopee_clicks_total: 0,
         orders_count: 0,
         commission_cents: 0,
+        commission_pending_cents: 0,
         order_value_cents: 0,
         has_fb: false,
         has_shopee_clicks: false,
@@ -613,6 +626,7 @@ fn aggregate_rows_for_day(
         entry.has_shopee_orders = true;
         entry.orders_count += r.orders;
         entry.commission_cents += r.commission_cents;
+        entry.commission_pending_cents += r.commission_pending_cents;
         entry.order_value_cents += r.order_value_cents;
     }
 
@@ -644,6 +658,11 @@ fn aggregate_rows_for_day(
         }
         if let Some(v) = r.commission {
             entry.commission_cents = (v * 100.0).round() as i64;
+            // Manual override replace commission → không còn concept "pending"
+            // từ raw status. Reset pending_cents = 0 để FE không trừ reserve
+            // nhầm từ manual total (user đã tự set commission, không có
+            // uncertainty).
+            entry.commission_pending_cents = 0;
         }
     }
 
@@ -657,6 +676,7 @@ fn aggregate_rows_for_day(
     for (c, acc) in canonicals {
         let total_spend = acc.spend_cents.map(|c| c as f64 / 100.0);
         let commission_total = acc.commission_cents as f64 / 100.0;
+        let commission_pending = acc.commission_pending_cents as f64 / 100.0;
         let cpc = acc.cpc.or_else(|| {
             if let (Some(s_cents), Some(clicks)) = (acc.spend_cents, acc.ads_clicks) {
                 if clicks > 0 {
@@ -682,6 +702,7 @@ fn aggregate_rows_for_day(
         }
         day_totals.orders_count += acc.orders_count;
         day_totals.commission_total += commission_total;
+        day_totals.commission_pending += commission_pending;
         day_totals.order_value_total += acc.order_value_cents as f64 / 100.0;
 
         // Row-0 filter: chỉ giữ row có spend ≠ 0 HOẶC commission ≠ 0 cho UI
@@ -704,6 +725,7 @@ fn aggregate_rows_for_day(
             shopee_clicks_total: acc.shopee_clicks_total,
             orders_count: acc.orders_count,
             commission_total,
+            commission_pending,
             order_value_total: acc.order_value_cents as f64 / 100.0,
             has_fb: acc.has_fb,
             has_shopee_clicks: acc.has_shopee_clicks,

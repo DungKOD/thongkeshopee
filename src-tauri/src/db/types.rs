@@ -30,6 +30,10 @@ pub struct UiRow {
     // Shopee orders/commission
     pub orders_count: i64,
     pub commission_total: f64,
+    /// Commission từ đơn trạng thái "Đang chờ xử lý" (subset của commission_total).
+    /// FE trừ `commission_pending × returnReserveRate` khỏi net commission —
+    /// chỉ pending bị dự phòng hoàn huỷ, completed đã chắc chắn.
+    pub commission_pending: f64,
     pub order_value_total: f64,
 
     // Source flags để UI biết dòng này có data gì
@@ -53,6 +57,8 @@ pub struct UiDayTotals {
     pub shopee_clicks_total: i64,
     pub orders_count: i64,
     pub commission_total: f64,
+    /// Commission từ đơn "Đang chờ xử lý" (subset của commission_total).
+    pub commission_pending: f64,
     pub order_value_total: f64,
 }
 

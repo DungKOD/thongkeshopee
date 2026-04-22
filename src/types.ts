@@ -17,6 +17,10 @@ export type UiRow = {
   shopeeClicksTotal: number;
   ordersCount: number;
   commissionTotal: number;
+  /** Subset commissionTotal từ đơn status "Đang chờ xử lý". FE dùng trừ
+   *  `commissionPending × (returnReserveRate / 100)` khỏi net commission —
+   *  chỉ pending có rủi ro hoàn huỷ. Xem `computeNetCommission`. */
+  commissionPending: number;
   orderValueTotal: number;
   hasFb: boolean;
   hasShopeeClicks: boolean;
@@ -35,6 +39,8 @@ export type UiDayTotals = {
   shopeeClicksTotal: number;
   ordersCount: number;
   commissionTotal: number;
+  /** Subset commission từ đơn "Đang chờ xử lý". Dùng cho công thức reserve. */
+  commissionPending: number;
   orderValueTotal: number;
 };
 

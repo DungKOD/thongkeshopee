@@ -1,6 +1,5 @@
 import type { DayTotals, UiDay, UiRow, VideoComputed } from "./types";
 import {
-  netCommissionRatio,
   sumFiltered,
   type ProfitFees,
 } from "./hooks/useSettings";
@@ -62,6 +61,31 @@ export function uiRowKey(dayDate: string, subIds: readonly string[]): string {
  *   mới có khả năng mua). Tham số `shopeeClicks` truyền từ caller (đã filter theo settings).
  * - `netCommission`, `profit`, `profitMargin`: luôn tính (không có field DB sẵn)
  */
+/// SINGLE SOURCE OF TRUTH cho công thức net commission.
+/// - `commission`: hoa hồng gross (gross commission).
+/// - `commissionPending`: subset commission từ đơn status "Đang chờ xử lý"
+///   (raw Shopee orders only — manual override có pending=0).
+///
+/// Logic:
+///   net = commission × (1 - taxRate) - commissionPending × reserveRate
+///
+/// Giải thích:
+/// - `taxRate` (thuế & phí sàn): áp cho MỌI commission (đơn nào cũng bị Shopee
+///   trừ trước khi payout).
+/// - `reserveRate` (dự phòng hoàn huỷ): CHỈ trừ từ pending — đơn chưa chắc
+///   ăn, có rủi ro bị huỷ/hoàn. Completed order đã chắc → không cần reserve.
+///
+/// MỌI nơi tính net commission PHẢI gọi hàm này. Đổi công thức → sửa 1 chỗ.
+export function computeNetCommission(
+  commission: number,
+  commissionPending: number,
+  fees: ProfitFees,
+): number {
+  const tax = fees.taxAndPlatformRate / 100;
+  const reserve = fees.returnReserveRate / 100;
+  return commission * (1 - tax) - commissionPending * reserve;
+}
+
 export function computeUiRow(
   row: UiRow,
   fees: ProfitFees,
@@ -74,7 +98,11 @@ export function computeUiRow(
   const commission = row.commissionTotal;
   const conversionRate = safeDiv(orders, shopeeClicks) * 100;
   const orderValue = safeDiv(row.orderValueTotal, orders);
-  const netCommission = commission * netCommissionRatio(fees);
+  const netCommission = computeNetCommission(
+    commission,
+    row.commissionPending,
+    fees,
+  );
   const profit = netCommission - spend;
   const profitMargin = safeDiv(profit, spend) * 100;
   return { cpc, conversionRate, orderValue, netCommission, profit, profitMargin };
@@ -118,7 +146,6 @@ export function computeOverviewTotals(
   fees: ProfitFees,
   source: SourceFilter = "all",
 ): OverviewTotals {
-  const ratio = netCommissionRatio(fees);
   const includeAds = source === "all";
   const acc: OverviewTotals = {
     clicks: 0,
@@ -133,16 +160,16 @@ export function computeOverviewTotals(
     rowsCount: 0,
   };
   for (const day of days) {
-    // Source filter 'shopee_only': totals SUM vẫn dùng day.totals (chính xác
-    // pre-filter), nhưng bỏ ads spend/clicks → lấy net commission thuần.
-    // Source 'all': dùng toàn bộ day.totals.
-    //
-    // KPI PHẢI lấy từ day.totals (pre row-0 filter) — nếu sum từ day.rows sẽ
-    // miss tuple chỉ có click/order nhưng spend=0 & commission=0 (row-0 drop).
     const t = day.totals;
     const spend = includeAds ? t.totalSpend : 0;
     const adsClicks = includeAds ? t.adsClicks : 0;
-    const net = t.commissionTotal * ratio;
+    // Dùng computeNetCommission trên day.totals (pre row-0 filter) — KPI
+    // accurate kể cả khi có tuple click-only bị filter.
+    const net = computeNetCommission(
+      t.commissionTotal,
+      t.commissionPending,
+      fees,
+    );
     acc.clicks += adsClicks;
     acc.shopeeClicks += sumFiltered(t.shopeeClicksByReferrer, clickSources);
     acc.totalSpend += spend;
@@ -185,7 +212,6 @@ export function aggregateProductRows(
   fees: ProfitFees,
   source: SourceFilter = "all",
 ): AggregatedProductRow[] {
-  const ratio = netCommissionRatio(fees);
   const includeAds = source === "all";
   const map = new Map<string, AggregatedProductRow>();
   for (const day of days) {
@@ -212,7 +238,7 @@ export function aggregateProductRows(
       if (!agg.displayName && r.displayName) agg.displayName = r.displayName;
       const spend = includeAds ? r.totalSpend ?? 0 : 0;
       const adsClicks = includeAds ? r.adsClicks ?? 0 : 0;
-      const net = r.commissionTotal * ratio;
+      const net = computeNetCommission(r.commissionTotal, r.commissionPending, fees);
       agg.adsClicks += adsClicks;
       agg.shopeeClicks += sumFiltered(r.shopeeClicksByReferrer, clickSources);
       agg.totalSpend += spend;
