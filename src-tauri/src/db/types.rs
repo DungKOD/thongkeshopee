@@ -30,9 +30,10 @@ pub struct UiRow {
     // Shopee orders/commission
     pub orders_count: i64,
     pub commission_total: f64,
-    /// Commission từ đơn trạng thái "Đang chờ xử lý" (subset của commission_total).
-    /// FE trừ `commission_pending × returnReserveRate` khỏi net commission —
-    /// chỉ pending bị dự phòng hoàn huỷ, completed đã chắc chắn.
+    /// Commission từ đơn trạng thái rủi ro huỷ (subset của commission_total).
+    /// Bao gồm "Đang chờ xử lý" + "Chưa thanh toán". FE trừ `commission_pending
+    /// × returnReserveRate` khỏi net commission — chỉ đơn rủi ro bị dự phòng,
+    /// completed đã chắc chắn.
     pub commission_pending: f64,
     pub order_value_total: f64,
 
@@ -57,9 +58,13 @@ pub struct UiDayTotals {
     pub shopee_clicks_total: i64,
     pub orders_count: i64,
     pub commission_total: f64,
-    /// Commission từ đơn "Đang chờ xử lý" (subset của commission_total).
+    /// Commission từ đơn rủi ro huỷ: "Đang chờ xử lý" + "Chưa thanh toán".
     pub commission_pending: f64,
     pub order_value_total: f64,
+    /// Tổng phí quản lý MCN đã bị Shopee cắt trước khi payout. Hiển thị trên UI
+    /// để user biết đã mất bao nhiêu vào MCN (số này đã trừ sẵn trong
+    /// `commission_total` — KHÔNG trừ lần nữa).
+    pub mcn_fee_total: f64,
 }
 
 /// 1 ngày hiển thị trên UI (dùng cho DayBlock).

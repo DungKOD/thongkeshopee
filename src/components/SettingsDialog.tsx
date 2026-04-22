@@ -126,9 +126,10 @@ export function SettingsDialog({
                 <div className="font-semibold">Dự phòng hoàn/hủy</div>
                 <div className="mt-0.5 text-amber-200/80">
                   CHỈ trừ từ hoa hồng của đơn trạng thái{" "}
-                  <b>"Đang chờ xử lý"</b>. Đơn đã hoàn thành/thanh toán không
-                  bị trừ dự phòng (đã chắc chắn, không có rủi ro hủy). Thuế +
-                  phí sàn thì áp cho mọi đơn.
+                  <b>"Đang chờ xử lý"</b> và{" "}
+                  <b>"Chưa thanh toán"</b> (các đơn có rủi ro bị hủy). Đơn đã
+                  hoàn thành/thanh toán không bị trừ dự phòng (đã chắc chắn).
+                  Thuế + phí sàn thì áp cho mọi đơn.
                 </div>
               </div>
             </div>

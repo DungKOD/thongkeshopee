@@ -385,11 +385,16 @@ fn aggregate_rows_for_day(
         canonical: Canonical,
         orders: i64,
         commission_cents: i64,
-        /// Commission từ đơn trạng thái "Đang chờ xử lý" — FE dùng để trừ
-        /// dự phòng hoàn huỷ chỉ trên phần chưa chắc chắn. Status chính xác
-        /// do Shopee CSV export (không localize khác).
+        /// Commission từ đơn trạng thái có rủi ro bị huỷ/hoàn — FE dùng để
+        /// trừ dự phòng hoàn huỷ chỉ trên phần chưa chắc chắn. Bao gồm:
+        /// - "Đang chờ xử lý" (đang chờ shop xác nhận/giao hàng)
+        /// - "Chưa thanh toán" (buyer chưa thanh toán, có thể huỷ)
+        /// Status chính xác do Shopee CSV export (không localize khác).
         commission_pending_cents: i64,
         order_value_cents: i64,
+        /// Phí MCN đã bị Shopee cắt (đã nằm trong commission_cents ở dạng net).
+        /// Chỉ dùng hiển thị minh bạch trên UI — không tính vào profit formula.
+        mcn_fee_cents: i64,
     }
     let mut shopee_orders: Vec<ShopeeOrder> = Vec::new();
     {
@@ -397,10 +402,11 @@ fn aggregate_rows_for_day(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     COUNT(DISTINCT order_id),
                     COALESCE(SUM(CAST(ROUND(net_commission * 100) AS INTEGER)), 0),
-                    COALESCE(SUM(CASE WHEN order_status = 'Đang chờ xử lý'
+                    COALESCE(SUM(CASE WHEN order_status IN ('Đang chờ xử lý', 'Chưa thanh toán')
                                       THEN CAST(ROUND(net_commission * 100) AS INTEGER)
                                       ELSE 0 END), 0),
-                    COALESCE(SUM(CAST(ROUND(order_value * 100) AS INTEGER)), 0)
+                    COALESCE(SUM(CAST(ROUND(order_value * 100) AS INTEGER)), 0),
+                    COALESCE(SUM(CAST(ROUND(mcn_fee * 100) AS INTEGER)), 0)
              FROM raw_shopee_order_items
              WHERE day_date = ?",
         );
@@ -425,6 +431,7 @@ fn aggregate_rows_for_day(
                 commission_cents: r.get(6)?,
                 commission_pending_cents: r.get(7)?,
                 order_value_cents: r.get(8)?,
+                mcn_fee_cents: r.get(9)?,
             })
         })?;
         for row in iter {
@@ -556,11 +563,14 @@ fn aggregate_rows_for_day(
         shopee_clicks_total: i64,
         orders_count: i64,
         commission_cents: i64,
-        /// Subset của commission_cents từ đơn status "Đang chờ xử lý".
-        /// FE trừ `pending × returnReserveRate` khỏi net — reserve chỉ áp
-        /// cho pending (có khả năng hoàn huỷ), completed đã chắc ăn.
+        /// Subset commission_cents từ đơn trạng thái rủi ro huỷ: "Đang chờ
+        /// xử lý" + "Chưa thanh toán". FE trừ `pending × returnReserveRate`
+        /// khỏi net — reserve chỉ áp cho pending (rủi ro huỷ), completed đã
+        /// chắc ăn nên không cần dự phòng.
         commission_pending_cents: i64,
         order_value_cents: i64,
+        /// Phí MCN đã bị cắt — dùng hiển thị UI, không tính profit.
+        mcn_fee_cents: i64,
         has_fb: bool,
         has_shopee_clicks: bool,
         has_shopee_orders: bool,
@@ -580,6 +590,7 @@ fn aggregate_rows_for_day(
         commission_cents: 0,
         commission_pending_cents: 0,
         order_value_cents: 0,
+        mcn_fee_cents: 0,
         has_fb: false,
         has_shopee_clicks: false,
         has_shopee_orders: false,
@@ -628,6 +639,7 @@ fn aggregate_rows_for_day(
         entry.commission_cents += r.commission_cents;
         entry.commission_pending_cents += r.commission_pending_cents;
         entry.order_value_cents += r.order_value_cents;
+        entry.mcn_fee_cents += r.mcn_fee_cents;
     }
 
     // Manual entries — override field, display_name chỉ khi không có sub_id.
@@ -704,6 +716,7 @@ fn aggregate_rows_for_day(
         day_totals.commission_total += commission_total;
         day_totals.commission_pending += commission_pending;
         day_totals.order_value_total += acc.order_value_cents as f64 / 100.0;
+        day_totals.mcn_fee_total += acc.mcn_fee_cents as f64 / 100.0;
 
         // Row-0 filter: chỉ giữ row có spend ≠ 0 HOẶC commission ≠ 0 cho UI
         // display (tránh clutter). Day totals đã tính ở trên → KPI vẫn đúng.

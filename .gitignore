@@ -23,6 +23,13 @@ service-account*.json
 target/
 **/*.rs.bk
 
+# Build artifacts downloaded từ GitHub Actions / local build — không commit.
+docs/build-*/
+docs/*.dmg
+docs/*.zip
+docs/*.msi
+docs/*.exe
+
 # Python
 __pycache__/
 *.pyc

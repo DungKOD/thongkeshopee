@@ -1,14 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { UiDay, UiRow } from "../types";
 import {
   buildDayTsv,
   computeUiDayTotals,
+  computeUiRow,
   fmtDate,
   fmtInt,
   fmtVnd,
   uiRowKey,
 } from "../formulas";
-import { useSettings } from "../hooks/useSettings";
+import { useSettings, sumFiltered } from "../hooks/useSettings";
 import {
   captureElementToBlob,
   prefetchFontEmbedCSS,
@@ -134,6 +135,19 @@ export function DayBlock({
     settings.clickSources,
     settings.profitFees,
   );
+
+  // Sort rows theo Lợi nhuận giảm dần (cao → thấp). Profit phụ thuộc fees
+  // (tax/reserve) nên phải compute FE-side, Rust sort fallback theo tên
+  // (query.rs) — ở đây override.
+  const sortedRows = useMemo(() => {
+    return [...day.rows].sort((a, b) => {
+      const shopeeA = sumFiltered(a.shopeeClicksByReferrer, settings.clickSources);
+      const shopeeB = sumFiltered(b.shopeeClicksByReferrer, settings.clickSources);
+      const profitA = computeUiRow(a, settings.profitFees, shopeeA).profit;
+      const profitB = computeUiRow(b, settings.profitFees, shopeeB).profit;
+      return profitB - profitA;
+    });
+  }, [day.rows, settings.clickSources, settings.profitFees]);
   const totalsProfitCls =
     totals.profit > 0
       ? "text-green-400"
@@ -252,6 +266,20 @@ export function DayBlock({
         </div>
       </header>
 
+      {day.totals.mcnFeeTotal > 0 && (
+        <div
+          className="flex items-center gap-2 border-b border-surface-8 bg-amber-500/5 px-5 py-2 text-xs text-amber-200/80"
+          title="Shopee đã cắt phí MCN này trước khi payout. Số hoa hồng hiển thị là NET (đã trừ phí MCN)."
+        >
+          <span className="material-symbols-rounded text-sm text-amber-300/70">info</span>
+          <span>
+            Phí quản lý MCN đã trừ:{" "}
+            <b className="tabular-nums text-amber-200">
+              {fmtVnd(day.totals.mcnFeeTotal)}
+            </b>
+          </span>
+        </div>
+      )}
       <div className="overflow-x-auto">
         <table className="w-full border-collapse text-sm">
           <thead>
@@ -297,7 +325,7 @@ export function DayBlock({
                 </td>
               </tr>
             ) : (
-              day.rows.map((r, i) => {
+              sortedRows.map((r, i) => {
                 const key = uiRowKey(r.dayDate, r.subIds);
                 return (
                   <VideoRow

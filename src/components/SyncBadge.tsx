@@ -23,27 +23,27 @@ function getDisplay(
     case "checking":
       return {
         icon: "cloud_sync",
-        label: "Kiểm tra Drive...",
+        label: "Kiểm tra R2...",
         color: "text-white/70",
         spin: true,
       };
     case "syncing":
       return {
         icon: "cloud_sync",
-        label: "Đang sync...",
+        label: "Đang đồng bộ lên R2...",
         color: "text-blue-300",
         spin: true,
       };
     case "dirty":
       return {
         icon: "pending",
-        label: "Chờ sync",
+        label: "Chờ đồng bộ lên R2",
         color: "text-amber-300",
       };
     case "error":
       return {
         icon: "cloud_off",
-        label: "Lỗi sync",
+        label: "Lỗi đồng bộ R2",
         color: "text-red-300",
       };
     case "offline":
@@ -57,8 +57,8 @@ function getDisplay(
       return {
         icon: "cloud_done",
         label: lastSyncAt
-          ? `Đã sync ${formatTime(lastSyncAt)}`
-          : "Đã sync",
+          ? `Đã đồng bộ R2 ${formatTime(lastSyncAt)}`
+          : "Đã đồng bộ R2",
         color: "text-green-300",
       };
   }
@@ -122,7 +122,7 @@ export function SyncBadge({
           />
           <div className="absolute right-0 top-full z-40 mt-1 w-64 rounded-lg border border-surface-8 bg-surface-2 shadow-elev-16">
             <div className="border-b border-surface-8 px-3 py-2 text-xs text-white/50">
-              Đồng bộ Drive
+              Đồng bộ lên R2
             </div>
             <div className="px-3 py-2 text-xs">
               <div className="flex items-center gap-2">
@@ -160,7 +160,7 @@ export function SyncBadge({
                 <span className="material-symbols-rounded text-sm">
                   cloud_upload
                 </span>
-                Sync ngay
+                Đồng bộ lên R2 ngay
               </button>
             </div>
           </div>

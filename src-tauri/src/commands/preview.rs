@@ -44,9 +44,15 @@ pub struct ImportPreview {
     pub sample_replace: Vec<String>,
     /// True nếu bất kỳ ngày nào trong file đã có data trong DB (cảnh báo override).
     pub day_has_data: bool,
-    /// File đã import trước đó (hash trùng). FE hiện "sẽ bỏ qua" + skip commit.
+    /// File này đã có trong DB VÀ mọi row CSV đã tồn tại (re-import sẽ
+    /// không thêm gì). FE skip commit. Nếu hash match nhưng có row thiếu
+    /// (backfill scenario — user xóa day từ multi-day file), field này
+    /// = false → commit bình thường, Rust reuse imported_files entry cũ.
     pub already_imported: bool,
-    /// Nếu already_imported = true: day_date của lần import trước (informational).
+    /// True khi hash đã tồn tại trong DB, bất kể có row thiếu không.
+    /// FE dùng để show note "đã import trước đó — đang backfill N dòng".
+    pub hash_match: bool,
+    /// Nếu hash_match = true: day_date của lần import trước (informational).
     pub existing_day_date: Option<String>,
     /// Số rows không parse được date → skip khi import (Shopee multi-day only).
     pub skipped: i64,
@@ -142,34 +148,14 @@ pub fn preview_import_shopee_clicks(
     let hash = compute_hash(&payload.raw_content);
 
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let (already_imported, existing_day) = check_hash_imported(&conn, &hash)?;
+    let (hash_match, existing_day) = check_hash_imported(&conn, &hash)?;
 
-    // Nếu đã import → KHÔNG đếm replace (sẽ skip commit). Return shape tối giản.
-    if already_imported {
-        return Ok(ImportPreview {
-            kind: "shopee_clicks".into(),
-            filename: payload.filename,
-            day_date: day_date_from.clone(),
-            day_date_from,
-            day_date_to,
-            total_rows: payload.rows.len() as i64,
-            new_rows: 0,
-            replace_rows: 0,
-            sample_replace: Vec::new(),
-            day_has_data: any_day_has_data(&conn, &distinct_dates)?,
-            already_imported: true,
-            existing_day_date: existing_day,
-            skipped,
-        });
-    }
-
-    // Replace detection: check từng click_id trong file với DB — KHÔNG filter
-    // theo day_date. Click_id là PK natural (INSERT OR IGNORE): nếu click_id
-    // đã tồn tại trên ngày BẤT KỲ (kể cả ngoài date range của file), re-import
-    // → IGNORE. Preview phải count đúng để user biết bao nhiêu "thật sự mới".
+    // LUÔN tính replace rows kể cả khi hash_match — cần biết có row nào bị
+    // thiếu trong DB không (scenario: user xóa 1 ngày từ multi-day file,
+    // re-import để backfill). Chỉ skip commit khi mọi row đã có.
     //
-    // Chiến lược: load HashSet tất cả click_id từ DB (filter theo file click_id
-    // chunked IN để tránh load toàn DB khi scale lớn).
+    // Click_id là PK natural (INSERT OR IGNORE): nếu click_id đã tồn tại trên
+    // ngày BẤT KỲ (kể cả ngoài date range của file), re-import → IGNORE.
     let file_click_ids: Vec<&str> =
         payload.rows.iter().map(|r| r.click_id.as_str()).collect();
     let mut existing: HashSet<String> = HashSet::new();
@@ -196,6 +182,7 @@ pub fn preview_import_shopee_clicks(
 
     let total = payload.rows.len() as i64;
     let replace_rows = replace.len() as i64;
+    let new_rows = total - replace_rows - skipped;
     let sample_replace: Vec<String> = replace.into_iter().take(SAMPLE_LIMIT).collect();
 
     Ok(ImportPreview {
@@ -205,12 +192,14 @@ pub fn preview_import_shopee_clicks(
         day_date_from,
         day_date_to,
         total_rows: total,
-        new_rows: total - replace_rows - skipped,
+        new_rows,
         replace_rows,
         sample_replace,
         day_has_data: any_day_has_data(&conn, &distinct_dates)?,
-        already_imported: false,
-        existing_day_date: None,
+        // Skip commit chỉ khi hash đã có VÀ mọi row đã trong DB (no backfill).
+        already_imported: hash_match && new_rows == 0,
+        hash_match,
+        existing_day_date: existing_day,
         skipped,
     })
 }
@@ -232,29 +221,12 @@ pub fn preview_import_shopee_orders(
     let hash = compute_hash(&payload.raw_content);
 
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let (already_imported, existing_day) = check_hash_imported(&conn, &hash)?;
+    let (hash_match, existing_day) = check_hash_imported(&conn, &hash)?;
 
-    if already_imported {
-        return Ok(ImportPreview {
-            kind: "shopee_commission".into(),
-            filename: payload.filename,
-            day_date: day_date_from.clone(),
-            day_date_from,
-            day_date_to,
-            total_rows: payload.rows.len() as i64,
-            new_rows: 0,
-            replace_rows: 0,
-            sample_replace: Vec::new(),
-            day_has_data: any_day_has_data(&conn, &distinct_dates)?,
-            already_imported: true,
-            existing_day_date: existing_day,
-            skipped,
-        });
-    }
-
-    // Replace detection: tương tự clicks, check key `(checkout_id, item_id,
-    // model_id)` xuyên tất cả ngày trong DB. UPSERT update theo key này bất
-    // kể day_date hiện tại của row, preview phải count chính xác.
+    // LUÔN tính replace rows (xem note ở `preview_import_shopee_clicks`).
+    // Replace detection: check key `(checkout_id, item_id, model_id)` xuyên
+    // tất cả ngày trong DB. UPSERT update theo key này bất kể day_date hiện
+    // tại của row, preview phải count chính xác.
     //
     // Triple key không hỗ trợ IN tuples tự nhiên ở SQLite → encode key thành
     // concatenated string "checkout|item|model" + IN chunked.
@@ -305,6 +277,7 @@ pub fn preview_import_shopee_orders(
 
     let total = payload.rows.len() as i64;
     let replace_rows = replace.len() as i64;
+    let new_rows = total - replace_rows - skipped;
     let sample_replace: Vec<String> = replace.into_iter().take(SAMPLE_LIMIT).collect();
 
     Ok(ImportPreview {
@@ -314,12 +287,13 @@ pub fn preview_import_shopee_orders(
         day_date_from,
         day_date_to,
         total_rows: total,
-        new_rows: total - replace_rows - skipped,
+        new_rows,
         replace_rows,
         sample_replace,
         day_has_data: any_day_has_data(&conn, &distinct_dates)?,
-        already_imported: false,
-        existing_day_date: None,
+        already_imported: hash_match && new_rows == 0,
+        hash_match,
+        existing_day_date: existing_day,
         skipped,
     })
 }
@@ -343,25 +317,7 @@ pub fn preview_import_fb_ad_groups(
     let hash = compute_hash(&payload.raw_content);
 
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let (already_imported, existing_day) = check_hash_imported(&conn, &hash)?;
-
-    if already_imported {
-        return Ok(ImportPreview {
-            kind: "fb_ad_group".into(),
-            filename: payload.filename,
-            day_date: day_date.clone(),
-            day_date_from: day_date.clone(),
-            day_date_to: day_date.clone(),
-            total_rows: payload.rows.len() as i64,
-            new_rows: 0,
-            replace_rows: 0,
-            sample_replace: Vec::new(),
-            day_has_data: any_day_has_data(&conn, &[day_date])?,
-            already_imported: true,
-            existing_day_date: existing_day,
-            skipped: 0,
-        });
-    }
+    let (hash_match, existing_day) = check_hash_imported(&conn, &hash)?;
 
     let mut existing: HashSet<String> = HashSet::new();
     {
@@ -382,6 +338,7 @@ pub fn preview_import_fb_ad_groups(
 
     let total = payload.rows.len() as i64;
     let replace_rows = replace.len() as i64;
+    let new_rows = total - replace_rows;
     let sample_replace: Vec<String> = replace.into_iter().take(SAMPLE_LIMIT).collect();
 
     Ok(ImportPreview {
@@ -391,12 +348,13 @@ pub fn preview_import_fb_ad_groups(
         day_date_from: day_date.clone(),
         day_date_to: day_date.clone(),
         total_rows: total,
-        new_rows: total - replace_rows,
+        new_rows,
         replace_rows,
         sample_replace,
         day_has_data: any_day_has_data(&conn, &[day_date])?,
-        already_imported: false,
-        existing_day_date: None,
+        already_imported: hash_match && new_rows == 0,
+        hash_match,
+        existing_day_date: existing_day,
         skipped: 0,
     })
 }
@@ -420,25 +378,7 @@ pub fn preview_import_fb_campaigns(
     let hash = compute_hash(&payload.raw_content);
 
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let (already_imported, existing_day) = check_hash_imported(&conn, &hash)?;
-
-    if already_imported {
-        return Ok(ImportPreview {
-            kind: "fb_campaign".into(),
-            filename: payload.filename,
-            day_date: day_date.clone(),
-            day_date_from: day_date.clone(),
-            day_date_to: day_date.clone(),
-            total_rows: payload.rows.len() as i64,
-            new_rows: 0,
-            replace_rows: 0,
-            sample_replace: Vec::new(),
-            day_has_data: any_day_has_data(&conn, &[day_date])?,
-            already_imported: true,
-            existing_day_date: existing_day,
-            skipped: 0,
-        });
-    }
+    let (hash_match, existing_day) = check_hash_imported(&conn, &hash)?;
 
     let mut existing: HashSet<String> = HashSet::new();
     {
@@ -459,6 +399,7 @@ pub fn preview_import_fb_campaigns(
 
     let total = payload.rows.len() as i64;
     let replace_rows = replace.len() as i64;
+    let new_rows = total - replace_rows;
     let sample_replace: Vec<String> = replace.into_iter().take(SAMPLE_LIMIT).collect();
 
     Ok(ImportPreview {
@@ -468,12 +409,13 @@ pub fn preview_import_fb_campaigns(
         day_date_from: day_date.clone(),
         day_date_to: day_date.clone(),
         total_rows: total,
-        new_rows: total - replace_rows,
+        new_rows,
         replace_rows,
         sample_replace,
         day_has_data: any_day_has_data(&conn, &[day_date])?,
-        already_imported: false,
-        existing_day_date: None,
+        already_imported: hash_match && new_rows == 0,
+        hash_match,
+        existing_day_date: existing_day,
         skipped: 0,
     })
 }

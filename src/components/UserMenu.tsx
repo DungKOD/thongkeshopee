@@ -2,7 +2,13 @@ import { useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { useIsAdmin } from "../hooks/usePremium";
 
-export function UserMenu() {
+interface UserMenuProps {
+  /// Override signOut flow — App.tsx pass callback để check dirty DB + hỏi
+  /// sync trước khi signOut. Nếu bỏ, dùng `auth.signOut` trực tiếp (không check).
+  onRequestSignOut?: () => Promise<void> | void;
+}
+
+export function UserMenu({ onRequestSignOut }: UserMenuProps = {}) {
   const { user, signOut } = useAuth();
   const isAdmin = useIsAdmin();
   const [open, setOpen] = useState(false);
@@ -17,7 +23,11 @@ export function UserMenu() {
     if (signingOut) return;
     setSigningOut(true);
     try {
-      await signOut();
+      if (onRequestSignOut) {
+        await onRequestSignOut();
+      } else {
+        await signOut();
+      }
     } finally {
       setSigningOut(false);
       setOpen(false);

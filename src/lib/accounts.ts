@@ -32,8 +32,18 @@ export function updateShopeeAccountColor(
   return invoke<void>("update_shopee_account_color", { id, color });
 }
 
-export function deleteShopeeAccount(id: number): Promise<void> {
-  return invoke<void>("delete_shopee_account", { id });
+export function deleteShopeeAccount(
+  id: number,
+  alsoDeleteFb: boolean,
+): Promise<void> {
+  return invoke<void>("delete_shopee_account", { id, alsoDeleteFb });
+}
+
+/// Đếm FB ads sẽ bị "cuốn theo" khi xóa account — khớp sub_id prefix-
+/// compatible với Shopee data của account, VÀ không dùng chung với account
+/// khác (safeguard). Dùng cho preview dialog.
+export function countFbLinkedToAccount(id: number): Promise<number> {
+  return invoke<number>("count_fb_linked_to_account", { id });
 }
 
 /// Chuyển toàn bộ data từ account `fromId` sang `toId`. Trả về số row đã chuyển.

@@ -6,6 +6,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useAuth } from "./AuthContext";
 import {
   listShopeeAccounts,
   type ShopeeAccount,
@@ -44,6 +45,8 @@ interface AccountProviderProps {
 }
 
 export function AccountProvider({ children }: AccountProviderProps) {
+  const { user } = useAuth();
+  const uid = user?.uid ?? null;
   const [accounts, setAccounts] = useState<ShopeeAccount[] | null>(null);
   const [filter, setFilter] = useState<AccountFilter>({ kind: "all" });
   const [activeAccountId, setActiveAccountId] = useState<number | null>(null);
@@ -69,9 +72,19 @@ export function AccountProvider({ children }: AccountProviderProps) {
     }
   }, []);
 
+  // CRITICAL phân quyền: user UID đổi → CLEAR state ngay (không giữ list
+  // account + filter của user cũ). KHÔNG tự refresh ở đây vì race với
+  // `switch_db_to_user`: AccountContext effect fire NGAY khi authUid đổi,
+  // nhưng DbState còn trỏ vào user cũ cho đến khi switch_db_to_user xong →
+  // refresh ở đây đọc DB CŨ, hiện list sai.
+  //
+  // Refresh thực sự do `useCloudSync.onRemoteApplied` trigger SAU khi switch
+  // hoàn tất (xem App.tsx `onRemoteApplied` callback).
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    setAccounts(null);
+    setFilter({ kind: "all" });
+    setActiveAccountId(null);
+  }, [uid]);
 
   return (
     <AccountContext.Provider

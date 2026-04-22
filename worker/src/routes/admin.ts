@@ -79,6 +79,43 @@ export async function adminUsersRoute(
   return jsonOk({ users });
 }
 
+/// Clean R2 orphan files — xoá `users/{uid}/db.gz` khi `{uid}` không tồn tại
+/// trong Firestore `users` collection. Admin-only.
+///
+/// Use case: đổi Firebase project → UIDs cũ không còn trong Firestore mới
+/// nhưng R2 vẫn giữ file. Gọi endpoint này dọn 1 phát.
+export async function adminCleanupOrphansRoute(
+  _req: Request,
+  auth: AuthContext,
+  env: Env,
+): Promise<Response> {
+  if (!auth.isAdmin) return jsonError(403, 'Admin only');
+
+  const profiles = await listAllUsers(auth.idToken, env);
+  const validUids = new Set(profiles.map((p) => p.uid));
+
+  const deleted: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.DB_BUCKET.list({
+      prefix: 'users/',
+      cursor,
+      limit: 1000,
+    });
+    for (const obj of page.objects) {
+      const m = /^users\/([^/]+)\/db\.gz$/.exec(obj.key);
+      if (!m) continue;
+      const uid = m[1];
+      if (validUids.has(uid)) continue;
+      await env.DB_BUCKET.delete(obj.key);
+      deleted.push(uid);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  return jsonOk({ deleted });
+}
+
 /// Download DB của user target. Admin-only.
 export async function adminDownloadRoute(
   req: Request,

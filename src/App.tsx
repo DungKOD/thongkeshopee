@@ -32,6 +32,7 @@ import { ImportAccountPickerDialog } from "./components/ImportAccountPickerDialo
 import { ScrollToTopButton } from "./components/ScrollToTopButton";
 import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
+import { useSelfPresence } from "./hooks/usePresence";
 import { SyncBadge } from "./components/SyncBadge";
 import { CloseWarningDialog } from "./components/CloseWarningDialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -45,6 +46,7 @@ import { VideoLogsTab } from "./components/VideoLogsTab";
 import "./App.css";
 
 function AppInner() {
+  const { signOut: authSignOut } = useAuth();
   // Khai báo sớm để filter có thể derive theo tab.
   const [activeTab, setActiveTab] = useState<
     "stats" | "overview" | "download" | "video-logs"
@@ -55,6 +57,14 @@ function AppInner() {
   const statsFilter = useFilterMode("stats");
   const overviewFilter = useFilterMode("overview");
   const activeFilter = activeTab === "overview" ? overviewFilter : statsFilter;
+
+  // Overview tab: mỗi lần chuyển vào → reset về default (1 ngày gần nhất).
+  // Không giữ filter cũ user đã chọn ở lần trước; user muốn luôn thấy data
+  // mới nhất khi mở Overview.
+  const overviewClear = overviewFilter.clear;
+  useEffect(() => {
+    if (activeTab === "overview") overviewClear();
+  }, [activeTab, overviewClear]);
 
   // Alias để không đụng call sites hiện có trong component.
   const filterMode = activeFilter.mode;
@@ -128,7 +138,17 @@ function AppInner() {
   // (cả checking + syncing) để user không thao tác với data cũ trước khi merge xong.
   //
   // Khi admin đang xem DB của user khác → disable sync (dirty của DB khác không
-  // được upload lên Drive của admin).
+  // được upload lên R2 của admin).
+  // CRITICAL phân quyền: sau khi `switch_db_to_user` swap DB sang user mới
+  // (owner_changed=true) hoặc merge remote, PHẢI refetch cả days/rows lẫn
+  // account list. AccountContext dep uid-change đã refetch lần 1, nhưng race
+  // với switch_db_to_user (AccountContext effect fire trước switch xong) →
+  // cần re-trigger ở đây để đảm bảo list account đúng sau khi DB swapped.
+  const onRemoteApplied = useCallback(async () => {
+    await refetch();
+    await refreshAccounts();
+  }, [refetch, refreshAccounts]);
+
   const {
     status: syncStatus,
     isStartupPhase,
@@ -139,7 +159,7 @@ function AppInner() {
   } = useCloudSync({
     mutationVersion,
     enabled: !inAdminView,
-    onRemoteApplied: refetch,
+    onRemoteApplied,
   });
 
   // Khi swap sang DB khác (hoặc thoát) → refetch + clear pending changes
@@ -235,6 +255,39 @@ function AppInner() {
     setCloseWarningOpen(false);
   }, []);
 
+  // Logout flow: check dirty trước khi signOut. Nếu dirty → dialog 3 lựa chọn
+  // (đồng bộ rồi logout / logout luôn / hủy). Không dirty → signOut ngay.
+  const requestSignOut = useCallback(async () => {
+    if (syncStatusRef.current === "dirty") {
+      setLogoutDialogOpen(true);
+      return;
+    }
+    await authSignOut();
+  }, [authSignOut]);
+
+  const handleSyncAndSignOut = useCallback(async () => {
+    setLogoutSyncing(true);
+    try {
+      await forceSyncRef.current();
+    } catch (e) {
+      console.error("[logout] forceSync failed:", e);
+      setLogoutSyncing(false);
+      return; // giữ dialog để user thấy lỗi + chọn lại
+    }
+    setLogoutSyncing(false);
+    setLogoutDialogOpen(false);
+    await authSignOut();
+  }, [authSignOut]);
+
+  const handleSignOutAnyway = useCallback(async () => {
+    setLogoutDialogOpen(false);
+    await authSignOut();
+  }, [authSignOut]);
+
+  const handleCancelSignOut = useCallback(() => {
+    setLogoutDialogOpen(false);
+  }, []);
+
   const { showToast } = useToast();
   const { settings, setClickSource, registerSources, setProfitFee } =
     useSettings();
@@ -254,6 +307,9 @@ function AppInner() {
   // Close warning: Tauri intercept event, show dialog nếu dirty.
   const [closeWarningOpen, setCloseWarningOpen] = useState(false);
   const [closeSyncing, setCloseSyncing] = useState(false);
+  // Logout warning: user bấm đăng xuất mà DB dirty → hỏi sync trước.
+  const [logoutDialogOpen, setLogoutDialogOpen] = useState(false);
+  const [logoutSyncing, setLogoutSyncing] = useState(false);
   // Máy tính — open state lift lên App để header button toggle được.
   const [calcOpen, setCalcOpen] = useState<boolean>(() => {
     try {
@@ -461,7 +517,9 @@ function AppInner() {
   }, [canLoadMore]);
 
   if (isStartupPhase) {
-    return <SplashScreen {...splashTextFor(syncPhase)} />;
+    return (
+      <SplashScreen {...splashTextFor(syncPhase)} lastSyncAt={lastSyncAt} />
+    );
   }
 
   return (
@@ -482,7 +540,7 @@ function AppInner() {
             </span>
             <div>
               <h1 className="text-xl font-semibold tracking-tight text-white">
-                Thống kê Shopee Affiliate
+                Shopee Affiliate Tracker
               </h1>
               <p className="text-xs text-white/70">
                 Data từ database — manual override luôn ưu tiên raw CSV
@@ -537,6 +595,16 @@ function AppInner() {
             </button>
             {!inAdminView && (
               <button
+                onClick={() => setAccountMgrOpen(true)}
+                className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
+                title="Quản lý TK Shopee"
+                aria-label="Quản lý TK Shopee"
+              >
+                <span className="material-symbols-rounded">manage_accounts</span>
+              </button>
+            )}
+            {!inAdminView && (
+              <button
                 onClick={() => setSettingsOpen(true)}
                 className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
                 title="Cài đặt"
@@ -545,7 +613,7 @@ function AppInner() {
                 <span className="material-symbols-rounded">settings</span>
               </button>
             )}
-            {!inAdminView && <UserMenu />}
+            {!inAdminView && <UserMenu onRequestSignOut={requestSignOut} />}
             {activeTab === "stats" && !inAdminView && (
               <button
                 onClick={handleImportClick}
@@ -610,7 +678,7 @@ function AppInner() {
         ) : loading ? (
           <div className="mx-auto flex max-w-xl flex-col items-center gap-3 py-16 text-center text-white/60">
             <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">
-              progress_activity
+              sync
             </span>
             <span className="text-sm">Đang tải data...</span>
           </div>
@@ -766,19 +834,9 @@ function AppInner() {
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
-                {/* Account filter — tách theo TK Shopee affiliate. */}
-                <div className="flex items-center gap-1">
-                  <AccountFilterDropdown />
-                  <button
-                    onClick={() => setAccountMgrOpen(true)}
-                    className="rounded p-1 text-white/60 hover:bg-white/10 hover:text-white"
-                    title="Quản lý TK Shopee"
-                  >
-                    <span className="material-symbols-rounded text-base">
-                      manage_accounts
-                    </span>
-                  </button>
-                </div>
+                {/* Account filter — tách theo TK Shopee affiliate. Nút
+                    quản lý TK đã chuyển lên header bên trái nút Cài đặt. */}
+                <AccountFilterDropdown />
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
@@ -931,7 +989,7 @@ function AppInner() {
                     className="mx-auto flex max-w-xs items-center justify-center gap-2 py-4 text-xs text-white/50"
                   >
                     <span className="material-symbols-rounded animate-spin text-base">
-                      progress_activity
+                      sync
                     </span>
                     Đang tải thêm ngày cũ hơn...
                   </div>
@@ -991,6 +1049,10 @@ function AppInner() {
       <AccountManagerDialog
         isOpen={accountMgrOpen}
         onClose={() => setAccountMgrOpen(false)}
+        onDataChanged={() => {
+          markMutation();
+          void refetch();
+        }}
       />
 
       {/* FAB — hiện khi scroll sâu, click về đầu page */}
@@ -1002,6 +1064,18 @@ function AppInner() {
         onSyncAndClose={handleSyncAndClose}
         onCloseAnyway={handleCloseAnyway}
         onCancel={handleCancelClose}
+      />
+
+      <CloseWarningDialog
+        isOpen={logoutDialogOpen}
+        syncing={logoutSyncing}
+        title="Data chưa đồng bộ lên R2"
+        description="Vẫn còn thay đổi chưa upload lên R2. Nếu đăng xuất luôn, khi bạn đăng nhập ở máy khác sẽ không thấy những thay đổi này."
+        syncLabel="Đồng bộ lên R2 rồi đăng xuất"
+        anywayLabel="Đăng xuất luôn (chấp nhận mất đồng bộ R2)"
+        onSyncAndClose={handleSyncAndSignOut}
+        onCloseAnyway={handleSignOutAnyway}
+        onCancel={handleCancelSignOut}
       />
 
       <PendingChangesBar
@@ -1090,7 +1164,7 @@ function AdminViewBanner({
         <span
           className={`material-symbols-rounded text-sm ${busy ? "animate-spin" : ""}`}
         >
-          {busy ? "progress_activity" : "logout"}
+          {busy ? "sync" : "logout"}
         </span>
         Thoát
       </button>
@@ -1117,6 +1191,10 @@ function TabButton({ active, onClick, icon, label }: TabButtonProps) {
 function AuthGate() {
   const { user, loading: authLoading } = useAuth();
   const { status, expiredAt } = usePremium();
+  // Presence tracking — mount 1 lần ở AuthGate, hook tự re-subscribe khi
+  // uid đổi qua auth.onAuthStateChanged. Chạy bất kể status paywall vì
+  // user vẫn "online" khi đang ở màn PaywallScreen.
+  useSelfPresence();
 
   if (authLoading) return <SplashScreen title="Đang tải..." />;
   if (!user) return <LoginScreen />;
@@ -1137,50 +1215,66 @@ function AuthGate() {
 }
 
 /// Map sync phase → text cho SplashScreen. Null (chưa có event) → default
-/// "Đang đồng bộ Drive..." để UX nhất quán với lúc init.
+/// "Đang đồng bộ lên R2..." để UX nhất quán với lúc init.
 function splashTextFor(phase: SyncPhase): { title: string; subtitle?: string } {
   switch (phase) {
     case "downloading":
       return {
         title: "Đang tải xuống...",
-        subtitle: "Lấy dữ liệu mới từ Drive.",
+        subtitle: "Lấy dữ liệu mới từ R2.",
       };
     case "merging":
       return {
         title: "Đang hợp nhất...",
-        subtitle: "Kết hợp dữ liệu local với bản từ Drive.",
+        subtitle: "Kết hợp dữ liệu local với bản từ R2.",
       };
     case "uploading":
       return {
-        title: "Đang đẩy lên Drive...",
+        title: "Đang đẩy lên R2...",
         subtitle: "Lưu thay đổi cuối cùng.",
       };
     default:
       return {
-        title: "Đang đồng bộ Drive...",
+        title: "Đang đồng bộ lên R2...",
         subtitle: "Hợp nhất dữ liệu từ các máy khác, vui lòng chờ.",
       };
   }
 }
 
-/// Fullscreen splash dùng chung cho cả "đang tải" và "đang đồng bộ Drive".
-/// Chỉ khác text — layout, icon giống nhau để UX nhất quán.
+/// Fullscreen splash — icon xoay anchor ở vị trí cố định (32vh từ top),
+/// text flow dưới. Khi subtitle/timestamp dài, text wrap xuống nhưng icon
+/// KHÔNG di chuyển — UX ổn định, user vẫn biết đang sync.
 function SplashScreen({
   title,
   subtitle,
+  lastSyncAt,
 }: {
   title: string;
   subtitle?: string;
+  lastSyncAt?: Date | null;
 }) {
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-surface-0 text-white">
-      <span className="material-symbols-rounded animate-spin text-5xl text-shopee-400">
-        progress_activity
-      </span>
-      <div className="text-lg font-medium">{title}</div>
-      {subtitle && (
-        <div className="text-sm text-white/60">{subtitle}</div>
-      )}
+    <main className="min-h-screen bg-surface-0 px-6 text-white">
+      <div className="flex flex-col items-center pt-[32vh]">
+        <span className="material-symbols-rounded animate-spin text-7xl text-shopee-400">
+          cloud_sync
+        </span>
+        <div className="mt-6 flex flex-col items-center gap-3">
+          <h1 className="text-center text-2xl font-semibold text-white/95">
+            {title}
+          </h1>
+          {subtitle && (
+            <p className="max-w-md text-center text-base text-white/70">
+              {subtitle}
+            </p>
+          )}
+          {lastSyncAt && (
+            <p className="text-sm text-white/50">
+              Lần cuối: {lastSyncAt.toLocaleString("vi-VN")}
+            </p>
+          )}
+        </div>
+      </div>
     </main>
   );
 }

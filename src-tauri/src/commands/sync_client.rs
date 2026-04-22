@@ -218,6 +218,28 @@ pub async fn admin_list_users(base_url: &str, id_token: &str) -> CmdResult<Vec<U
     Ok(body.users)
 }
 
+/// `POST /admin/cleanup-orphans` — admin only. Worker list R2 `users/` prefix,
+/// xoá `db.gz` của UID không tồn tại trong Firestore. Trả list UIDs đã xóa.
+pub async fn admin_cleanup_orphans(
+    base_url: &str,
+    id_token: &str,
+) -> CmdResult<Vec<String>> {
+    let extra = call_worker::<()>(
+        base_url,
+        "/admin/cleanup-orphans",
+        reqwest::Method::POST,
+        id_token,
+        Some(&()),
+    )
+    .await?;
+    #[derive(serde::Deserialize)]
+    struct CleanupBody {
+        deleted: Vec<String>,
+    }
+    let body: CleanupBody = serde_json::from_value(extra).map_err(CmdError::from)?;
+    Ok(body.deleted)
+}
+
 /// `GET /admin/download?uid=<uid>` — admin only. Trả base64 + size + mtime.
 /// Tuple output giữ backward-compat với `as_download_for_user` cũ để
 /// `admin_view.rs` không phải refactor tough.

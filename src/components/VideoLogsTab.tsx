@@ -434,7 +434,7 @@ export function VideoLogsTab() {
           {usersLoading && !users ? (
             <div className="flex items-center justify-center py-8 text-white/50">
               <span className="material-symbols-rounded animate-spin">
-                progress_activity
+                sync
               </span>
             </div>
           ) : usersError ? (
@@ -550,7 +550,7 @@ export function VideoLogsTab() {
                 <span
                   className={`material-symbols-rounded text-base ${deletingSheet ? "animate-spin" : ""}`}
                 >
-                  {deletingSheet ? "progress_activity" : "delete_sweep"}
+                  {deletingSheet ? "sync" : "delete_sweep"}
                 </span>
                 Xóa tab
               </button>
@@ -645,7 +645,7 @@ export function VideoLogsTab() {
                             <span
                               className={`material-symbols-rounded text-base ${deleting ? "animate-spin" : ""}`}
                             >
-                              {deleting ? "progress_activity" : "delete"}
+                              {deleting ? "sync" : "delete"}
                             </span>
                           </button>
                         </td>
@@ -663,7 +663,7 @@ export function VideoLogsTab() {
                   {logsLoading ? (
                     <span className="flex items-center gap-2">
                       <span className="material-symbols-rounded animate-spin text-sm">
-                        progress_activity
+                        sync
                       </span>
                       Đang tải thêm...
                     </span>

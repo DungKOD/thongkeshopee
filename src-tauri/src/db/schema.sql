@@ -85,8 +85,11 @@ CREATE TABLE IF NOT EXISTS raw_shopee_order_items (
     quantity           INTEGER,
     order_value        REAL,
     refund_amount      REAL,
-    net_commission     REAL,              -- Hoa hồng ròng tiếp thị liên kết
-    commission_total   REAL,              -- Tổng hoa hồng sản phẩm
+    net_commission     REAL,              -- Hoa hồng ròng tiếp thị liên kết (CSV col 37)
+                                           -- = order_commission_total − mcn_fee, đã là số affiliate nhận
+    commission_total   REAL,              -- Tổng hoa hồng sản phẩm (CSV col 28) — chỉ tra cứu
+    order_commission_total REAL,          -- Tổng hoa hồng đơn hàng (CSV col 31) — trước trừ phí MCN
+    mcn_fee            REAL,              -- Phí quản lý MCN (CSV col 35) — đã bị Shopee cắt
     sub_id1            TEXT NOT NULL DEFAULT '',
     sub_id2            TEXT NOT NULL DEFAULT '',
     sub_id3            TEXT NOT NULL DEFAULT '',

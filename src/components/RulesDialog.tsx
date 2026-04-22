@@ -68,11 +68,11 @@ export function RulesDialog({ isOpen, onClose }: RulesDialogProps) {
                 <p className="text-xs text-white/70">
                   Campaign FB{" "}
                   <code className="rounded bg-surface-1 px-1.5 py-0.5 font-mono text-amber-200">
-                    MuseStudio-aotodinh-0412
+                    sanpham0101
                   </code>{" "}
                   → Sub_id trong link Shopee cũng phải là{" "}
                   <code className="rounded bg-surface-1 px-1.5 py-0.5 font-mono text-amber-200">
-                    MuseStudio-aotodinh-0412
+                    sanpham0101
                   </code>
                   . App mới gộp được data FB + Shopee về cùng 1 dòng.
                 </p>
@@ -144,15 +144,15 @@ export function RulesDialog({ isOpen, onClose }: RulesDialogProps) {
                 <ul className="mt-1.5 space-y-0.5 pl-4 text-xs text-white/65">
                   <li>
                     • <code className="text-shopee-200">Sub_id1</code> =
-                    shop/account (VD <code>MuseStudio</code>)
+                    shop/account (VD <code>shop1</code>)
                   </li>
                   <li>
                     • <code className="text-shopee-200">Sub_id2</code> = slug
-                    sản phẩm (VD <code>aotodinhdaxanhdamdaitay</code>)
+                    sản phẩm (VD <code>sanpham1</code>)
                   </li>
                   <li>
                     • <code className="text-shopee-200">Sub_id3</code> = mã
-                    campaign/ngày (VD <code>0412</code>)
+                    campaign/ngày (VD <code>0101</code>)
                   </li>
                   <li>
                     • <code className="text-shopee-200">Sub_id4-5</code> = biến
@@ -163,14 +163,16 @@ export function RulesDialog({ isOpen, onClose }: RulesDialogProps) {
 
               <div>
                 <p className="mb-1 font-semibold text-shopee-300">
-                  2. Tên FB Campaign = Sub_id nối bằng "-"
+                  2. Tên FB Campaign = Sub_id (nối bằng "-" nếu dùng nhiều slot)
                 </p>
                 <div className="rounded bg-surface-1 px-2 py-1 font-mono text-xs text-shopee-200">
-                  MuseStudio-aotodinhdaxanhdamdaitay-0412
+                  sanpham0101
                 </div>
                 <p className="mt-1 text-xs text-white/55">
-                  App split tên camp theo{" "}
-                  <code className="text-shopee-200">-</code> → sub_id1..5 để
+                  Đơn giản nhất: dùng 1 slot (Sub_id1 = tên camp) như trên.
+                  Nếu chia thành nhiều slot (shop-sản phẩm-ngày), nối bằng{" "}
+                  <code className="text-shopee-200">-</code> — app sẽ split theo
+                  <code className="text-shopee-200">-</code> về Sub_id1..5 để
                   merge với Shopee.
                 </p>
               </div>
@@ -183,10 +185,10 @@ export function RulesDialog({ isOpen, onClose }: RulesDialogProps) {
                   Vì app split theo <code className="text-shopee-200">-</code>.
                 </p>
                 <p className="mt-1 text-xs text-white/55">
-                  ✅ <code className="text-shopee-200">aotodinh</code>,{" "}
-                  <code className="text-shopee-200">ao_to_dinh</code>,{" "}
-                  <code className="text-shopee-200">aoToDinh</code>
-                  <br />❌ <code className="text-red-300">ao-to-dinh</code>
+                  ✅ <code className="text-shopee-200">sanpham</code>,{" "}
+                  <code className="text-shopee-200">san_pham</code>,{" "}
+                  <code className="text-shopee-200">sanPham</code>
+                  <br />❌ <code className="text-red-300">san-pham</code>
                 </p>
               </div>
 
@@ -243,8 +245,14 @@ export function RulesDialog({ isOpen, onClose }: RulesDialogProps) {
                 trong CSV).
               </MetricRow>
               <MetricRow name="Lợi nhuận">
-                <code>= Hoa hồng × (1 − thuế − dự phòng) − Tiền ads</code>. Phí
-                cấu hình trong "Phí khấu trừ lợi nhuận".
+                <code>
+                  = Hoa hồng × (1 − thuế) − Hoa hồng pending × dự phòng − Tiền
+                  ads
+                </code>
+                . Thuế/phí sàn áp cho mọi đơn. <strong>Dự phòng</strong> CHỈ
+                trừ từ hoa hồng của đơn <b>"Đang chờ xử lý"</b> và{" "}
+                <b>"Chưa thanh toán"</b> (rủi ro bị hủy). Đơn đã hoàn thành →
+                không dự phòng. Phí cấu hình trong "Phí khấu trừ lợi nhuận".
               </MetricRow>
               <MetricRow name="ROI">
                 <code>= Lợi nhuận / Tiền ads × 100%</code>. Không có spend →

@@ -83,7 +83,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-          releaseName: "Thống kê Shopee ${{ github.ref_name }}"
+          releaseName: "Shopee Affiliate Tracker ${{ github.ref_name }}"
           releaseBody: |
             ### Download
 

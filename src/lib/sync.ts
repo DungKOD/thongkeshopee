@@ -109,6 +109,15 @@ export function adminListUsers(idToken: string): Promise<UserListEntry[]> {
   });
 }
 
+/// Worker xóa R2 orphan files (UIDs không có Firestore doc). Return list UIDs
+/// đã xóa. Use case: đổi Firebase project → dọn file cũ khỏi bucket.
+export function adminCleanupOrphans(idToken: string): Promise<string[]> {
+  return invoke<string[]>("admin_cleanup_orphans", {
+    syncApiUrl: syncApiUrl(),
+    idToken,
+  });
+}
+
 /// Cache singleton — user list JSON blob. FE tự parse qua `JSON.parse(users_json)`.
 export interface AdminUserListCache {
   users_json: string;

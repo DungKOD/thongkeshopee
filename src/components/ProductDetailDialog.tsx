@@ -489,7 +489,7 @@ export function ProductDetailDialog({
             {loadingItems ? (
               <div className="rounded-xl border border-surface-8 bg-surface-2 px-4 py-4 text-sm text-white/50">
                 <span className="material-symbols-rounded mr-2 animate-spin align-middle text-base">
-                  progress_activity
+                  sync
                 </span>
                 Đang tải...
               </div>

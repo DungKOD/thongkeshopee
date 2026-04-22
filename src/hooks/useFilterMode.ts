@@ -23,6 +23,16 @@ export const DEFAULT_MODE: FilterMode = {
   count: DEFAULT_RECENT,
   canExpand: true,
 };
+/** Overview scope mặc định 1 ngày gần nhất — khớp với shortcut "Ngày gần
+ *  nhất" (canExpand=false, count=1) để UI highlight đúng. User click
+ *  shortcut khác để mở rộng range. */
+const OVERVIEW_DEFAULT_MODE: FilterMode = {
+  type: "recent",
+  count: 1,
+  canExpand: false,
+};
+const defaultModeFor = (scope: FilterScope): FilterMode =>
+  scope === "overview" ? OVERVIEW_DEFAULT_MODE : DEFAULT_MODE;
 
 /** Prefix + scope → key localStorage. 2 tab persist độc lập. */
 const STORAGE_PREFIX = "thongkeshopee.filter.v2";
@@ -44,12 +54,13 @@ export function prevMonthRange(): { from: string; to: string } {
 }
 
 function loadFilterMode(scope: FilterScope): FilterMode {
+  const fallback = defaultModeFor(scope);
   try {
     // Migrate: legacy key (trước khi tách scope) dùng cho tab "stats".
     const raw =
       localStorage.getItem(storageKey(scope)) ??
       (scope === "stats" ? localStorage.getItem(STORAGE_PREFIX) : null);
-    if (!raw) return DEFAULT_MODE;
+    if (!raw) return fallback;
     const parsed = JSON.parse(raw);
     if (parsed?.type === "recent" && Number.isFinite(parsed.count)) {
       return {
@@ -69,7 +80,7 @@ function loadFilterMode(scope: FilterScope): FilterMode {
   } catch {
     // ignore
   }
-  return DEFAULT_MODE;
+  return fallback;
 }
 
 function saveFilterMode(scope: FilterScope, m: FilterMode) {
@@ -120,7 +131,7 @@ export function useFilterMode(scope: FilterScope): UseFilterModeResult {
     setMode({ type: "range", from: r.from, to: r.to });
   }, []);
   const setAllTime = useCallback(() => setMode({ type: "all" }), []);
-  const clear = useCallback(() => setMode(DEFAULT_MODE), []);
+  const clear = useCallback(() => setMode(defaultModeFor(scope)), [scope]);
   const setDateFrom = useCallback((v: string) => {
     setMode((m) => ({
       type: "range",

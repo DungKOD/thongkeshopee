@@ -7,7 +7,7 @@
 //! raw tables + manual_entries là source of truth, query on-the-fly cho UI.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -28,6 +28,15 @@ const DB_FILENAME: &str = "thongkeshopee.db";
 /// Subfolder chứa raw CSV đã import (dùng cho `imported_files.stored_path`).
 pub const IMPORTS_SUBDIR: &str = "imports";
 
+/// Subfolder root chứa DB + imports của từng Firebase user (multi-tenant).
+/// Layout: `{app_data}/users/{uid}/thongkeshopee.db` + `{app_data}/users/{uid}/imports/`.
+pub const USERS_SUBDIR: &str = "users";
+
+/// Folder placeholder khi app mới start, chưa biết user UID (pre-auth).
+/// Tauri setup() bắt buộc có DbState managed, nên ta mở DB tạm ở đây.
+/// Sau khi user login, `switch_db_to_user` reopen ở user folder thật.
+pub const PRE_AUTH_SUBDIR: &str = "_pre_auth";
+
 /// State quản lý connection, wrap `Mutex` để share giữa các Tauri command.
 pub struct DbState(pub Mutex<Connection>);
 
@@ -41,34 +50,99 @@ pub fn tombstone_key_sub(day_date: &str, sub_ids: &[String; 5]) -> String {
     )
 }
 
-/// Resolve đường dẫn file DB dựa trên `app_data_dir()` của platform.
-/// Tạo folder cha nếu chưa có.
-pub fn resolve_db_path(app: &AppHandle) -> Result<PathBuf> {
+/// Resolve app_data_dir root (base cho mọi path khác).
+fn app_data_root(app: &AppHandle) -> Result<PathBuf> {
     let base = app
         .path()
         .app_data_dir()
         .context("không lấy được app_data_dir")?;
     fs::create_dir_all(&base)
         .with_context(|| format!("không tạo được thư mục app_data_dir: {}", base.display()))?;
-    Ok(base.join(DB_FILENAME))
+    Ok(base)
 }
 
-/// Resolve folder lưu raw CSV gốc (app_data_dir/imports/).
-pub fn resolve_imports_dir(app: &AppHandle) -> Result<PathBuf> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .context("không lấy được app_data_dir")?;
-    let dir = base.join(IMPORTS_SUBDIR);
+/// Resolve user-scoped folder: `{app_data}/users/{uid}/`. Sanitize UID chống
+/// path traversal (Firebase UID toàn alphanumeric nên thực tế an toàn, nhưng
+/// verify cho chắc).
+pub fn resolve_user_dir(app: &AppHandle, uid: &str) -> Result<PathBuf> {
+    let safe = uid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !safe || uid.is_empty() {
+        anyhow::bail!("UID không hợp lệ: {uid}");
+    }
+    let dir = app_data_root(app)?.join(USERS_SUBDIR).join(uid);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("không tạo được thư mục user: {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Resolve DB path cho 1 user cụ thể. Caller bảo đảm UID hợp lệ qua
+/// `resolve_user_dir`.
+pub fn resolve_db_path_for_user(app: &AppHandle, uid: &str) -> Result<PathBuf> {
+    Ok(resolve_user_dir(app, uid)?.join(DB_FILENAME))
+}
+
+/// Resolve imports folder cho 1 user: `{app_data}/users/{uid}/imports/`.
+/// Mọi CSV gốc user import lưu ở đây; stored_path trong DB là "imports/<hash>.csv"
+/// relative, resolve tại runtime qua fn này.
+pub fn resolve_imports_dir_for_user(app: &AppHandle, uid: &str) -> Result<PathBuf> {
+    let dir = resolve_user_dir(app, uid)?.join(IMPORTS_SUBDIR);
     fs::create_dir_all(&dir)
         .with_context(|| format!("không tạo được thư mục imports: {}", dir.display()))?;
     Ok(dir)
 }
 
-/// Mở hoặc tạo DB, apply schema + PRAGMA cần thiết. Gọi 1 lần khi app start.
-pub fn init_db(app: &AppHandle) -> Result<Connection> {
-    let path = resolve_db_path(app)?;
-    let conn = Connection::open(&path)
+/// Legacy DB path ở root app_data_dir (trước khi multi-tenant folder).
+/// Dùng để migration: lần đầu user login sau upgrade, move root DB sang user folder.
+pub fn resolve_legacy_db_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_data_root(app)?.join(DB_FILENAME))
+}
+
+/// Legacy imports folder ở root (migration source).
+pub fn resolve_legacy_imports_dir(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_data_root(app)?.join(IMPORTS_SUBDIR))
+}
+
+/// Placeholder DB path dùng khi app start chưa có user UID. DbState phải có
+/// connection để Tauri managed, nên init tạm ở đây; swap sau khi user login.
+pub fn resolve_pre_auth_db_path(app: &AppHandle) -> Result<PathBuf> {
+    let dir = app_data_root(app)?.join(PRE_AUTH_SUBDIR);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("không tạo được thư mục pre_auth: {}", dir.display()))?;
+    Ok(dir.join(DB_FILENAME))
+}
+
+/// Active DB path — query `PRAGMA database_list` từ connection đang mở.
+/// Dùng khi command cần physical path (sync snapshot, imports folder, admin view reopen)
+/// mà không muốn truyền uid qua param.
+pub fn resolve_active_db_path(conn: &Connection) -> Result<PathBuf> {
+    let path_str: String = conn
+        .query_row("PRAGMA database_list", [], |r| r.get::<_, String>(2))
+        .context("không đọc được DB path từ PRAGMA database_list")?;
+    if path_str.is_empty() {
+        anyhow::bail!("DB đang ở :memory: — không có physical path");
+    }
+    Ok(PathBuf::from(path_str))
+}
+
+/// Active imports folder — parent của DB path + "imports/". Luôn đồng bộ với
+/// DB path hiện tại (switch user → DB + imports đi cùng folder).
+pub fn resolve_active_imports_dir(conn: &Connection) -> Result<PathBuf> {
+    let db_path = resolve_active_db_path(conn)?;
+    let parent = db_path
+        .parent()
+        .context("DB path không có parent")?;
+    let dir = parent.join(IMPORTS_SUBDIR);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("không tạo được thư mục imports: {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Mở hoặc tạo DB tại `path`, apply schema + PRAGMA + migrations.
+/// Idempotent — chạy an toàn trên DB cũ hay mới.
+pub fn init_db_at(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
         .with_context(|| format!("không mở được DB tại {}", path.display()))?;
 
     // PRAGMAs: WAL cho concurrent read, foreign_keys bật để CASCADE hoạt động.
@@ -123,7 +197,55 @@ fn migrate(conn: &Connection) -> Result<()> {
     // v6: drop FK CASCADE trên imported_files.day_date để support multi-day file.
     migrate_imported_files_drop_day_fk(conn)
         .context("imported_files drop day_fk migration failed")?;
+    // v7: MCN fee visibility — lưu cột 31 (pre-MCN) + cột 35 (phí MCN) từ CSV.
+    migrate_mcn_columns(conn).context("mcn columns migration failed")?;
+    // Dọn orphan imported_files mỗi startup — idempotent. Xử lý legacy DB
+    // của user đã xóa ngày trước khi batch_commit_deletes biết cleanup
+    // (kẻo re-import cùng file bị chặn bởi hash dedup).
+    cleanup_orphan_imported_files(conn).context("cleanup orphan imported_files failed")?;
 
+    Ok(())
+}
+
+/// DELETE imported_files không còn raw row nào reference qua source_file_id.
+/// Chạy mỗi startup vì DELETE orphan là idempotent — chi phí rẻ và đảm bảo
+/// user re-import được file sau khi xóa data, kể cả với DB legacy.
+fn cleanup_orphan_imported_files(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM imported_files
+         WHERE id NOT IN (
+             SELECT source_file_id FROM raw_shopee_clicks UNION
+             SELECT source_file_id FROM raw_shopee_order_items UNION
+             SELECT source_file_id FROM raw_fb_ads
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v7 migration: MCN fee visibility.
+/// ALTER TABLE ADD 2 cột mới (idempotent check-before-add):
+/// - `order_commission_total` — CSV col 31 "Tổng hoa hồng đơn hàng(₫)" (pre-MCN).
+/// - `mcn_fee` — CSV col 35 "Phí quản lý MCN(₫)" (Shopee đã cắt sẵn khỏi net).
+/// Data cũ NULL → query aggregate COALESCE(..., 0) khi SUM.
+fn migrate_mcn_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "raw_shopee_order_items", "order_commission_total")? {
+        conn.execute(
+            "ALTER TABLE raw_shopee_order_items ADD COLUMN order_commission_total REAL",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "raw_shopee_order_items", "mcn_fee")? {
+        conn.execute(
+            "ALTER TABLE raw_shopee_order_items ADD COLUMN mcn_fee REAL",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
     Ok(())
 }
 
@@ -465,9 +587,15 @@ fn has_legacy_fb_unique(conn: &Connection, table: &str, legacy: &str) -> Result<
     Ok(sql.as_deref().map(|s| s.contains(legacy)).unwrap_or(false))
 }
 
-/// Setup hook cho `tauri::Builder`: init main DB + video logs DB + manage state.
+/// Setup hook cho `tauri::Builder`: init DB placeholder ở `_pre_auth/` folder
+/// + video logs DB + managed state. Main DB sẽ được swap sang user folder thật
+/// khi `switch_db_to_user(uid)` chạy sau khi FE auth ready.
+///
+/// Placeholder có migrations + schema đầy đủ → commands pre-auth technically
+/// work nhưng data bị isolate trong `_pre_auth/` folder, không leak sang user.
 pub fn setup(app: &AppHandle) -> Result<()> {
-    let conn = init_db(app)?;
+    let path = resolve_pre_auth_db_path(app)?;
+    let conn = init_db_at(&path)?;
     app.manage(DbState(Mutex::new(conn)));
     video_db::setup(app)?;
     Ok(())

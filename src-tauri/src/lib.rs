@@ -10,10 +10,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Nếu có file DB pending từ lần download R2 trước → apply trước khi mở DB.
-            // Nếu không có pending → noop. Lỗi rename KHÔNG block app start (log + tiếp tục).
-            if let Err(e) = commands::sync::apply_pending_sync(app.handle()) {
-                eprintln!("apply_pending_sync warning: {e}");
-            }
+            // v7+ multi-tenant: pending DB nằm trong user folder (không biết UID
+            // ở setup, chưa auth). Apply pending được dời vào `switch_db_to_user`
+            // — chạy sau khi FE auth ready và gọi command. Không làm gì ở đây.
             // Init SQLite DB + manage state.
             db::setup(app.handle())?;
             // Admin view state — track user đang được admin xem (None = normal mode).
@@ -28,6 +27,7 @@ pub fn run() {
             commands::accounts::rename_shopee_account,
             commands::accounts::update_shopee_account_color,
             commands::accounts::delete_shopee_account,
+            commands::accounts::count_fb_linked_to_account,
             commands::accounts::reassign_shopee_account_data,
             commands::query::db_ping,
             commands::query::list_days,
@@ -65,11 +65,12 @@ pub fn run() {
             commands::sync::sync_apply_pending,
             commands::sync::sync_pull_merge_push,
             commands::sync::admin_list_users,
+            commands::sync::admin_cleanup_orphans,
             commands::sync::restart_app,
             commands::sync::machine_fingerprint,
             commands::sync::sync_state_get,
             commands::sync::sync_state_record_error,
-            commands::sync::sync_reset_for_new_user,
+            commands::sync::switch_db_to_user,
             commands::admin_view::admin_view_user_db,
             commands::admin_view::admin_exit_view_user_db,
             commands::admin_view::admin_view_state_get,

@@ -4,15 +4,14 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     match /users/{userId} {
-      // User tự đọc doc của mình HOẶC admin đọc mọi doc.
-      // get() cost: 1 extra read cho mỗi request (miễn phí trong free tier).
+      // User tự đọc doc của mình HOẶC admin (check qua custom claim, không tốn
+      // extra Firestore read như get()). Claim được sync từ users/{uid}.admin
+      // qua Cloud Function syncAdminClaim. Admin mới grant phải refresh token
+      // (logout/login hoặc đợi 1h) trước khi đọc được docs khác.
       allow read: if request.auth != null
                   && (
                     request.auth.uid == userId
-                    || (
-                      exists(/databases/$(database)/documents/users/$(request.auth.uid))
-                      && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.admin == true
-                    )
+                    || request.auth.token.admin == true
                   );
 
       allow create: if request.auth != null

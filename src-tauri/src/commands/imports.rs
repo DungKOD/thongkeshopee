@@ -15,15 +15,15 @@
 //! - `raw_fb_*` UNIQUE(source_file_id, name) — file mới sẽ tạo row mới tự nhiên.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, State};
+use tauri::State;
 
-use crate::db::{resolve_imports_dir, DbState};
+use crate::db::{resolve_active_imports_dir, DbState};
 
 use super::{CmdError, CmdResult};
 
@@ -87,11 +87,11 @@ pub(super) fn validate_single_date(dates: Vec<String>, label: &str) -> CmdResult
     }
 }
 
-/// Ghi raw CSV content ra `<app_data_dir>/imports/<hash>.csv`.
-/// Trả relative path để lưu vào `imported_files.stored_path`.
-fn save_raw_csv(app: &AppHandle, hash: &str, content: &str) -> CmdResult<String> {
-    let dir = resolve_imports_dir(app).map_err(|e| CmdError::msg(e.to_string()))?;
-    let file_path: PathBuf = dir.join(format!("{hash}.csv"));
+/// Ghi raw CSV content ra `<imports_dir>/<hash>.csv`. `imports_dir` thuộc
+/// user folder hiện tại (resolve từ DB path qua `resolve_active_imports_dir`).
+/// Trả relative path "imports/<hash>.csv" để lưu vào `imported_files.stored_path`.
+fn save_raw_csv(imports_dir: &Path, hash: &str, content: &str) -> CmdResult<String> {
+    let file_path: PathBuf = imports_dir.join(format!("{hash}.csv"));
     if !file_path.exists() {
         fs::write(&file_path, content)?;
     }
@@ -123,9 +123,13 @@ const KIND_SHOPEE_COMMISSION: &str = "shopee_commission";
 const KIND_FB_AD_GROUP: &str = "fb_ad_group";
 const KIND_FB_CAMPAIGN: &str = "fb_campaign";
 
-/// Upsert `days` row + check dedup qua `file_hash` + INSERT `imported_files`.
+/// Upsert `days` row + INSERT (hoặc reuse) `imported_files`.
 /// Trả về `source_file_id` để caller dùng làm FK cho raw rows.
-/// Lỗi nếu file_hash đã tồn tại (user import trùng file).
+///
+/// Hash match handling: nếu file_hash đã tồn tại → **reuse** entry cũ
+/// (không error, không UPDATE metadata). Dùng cho backfill scenario:
+/// user xóa 1 ngày từ multi-day file → re-import cùng file để lấy lại
+/// data đã bị xóa. Raw rows được UPSERT với source_file_id = id cũ.
 #[allow(clippy::too_many_arguments)]
 fn register_imported_file(
     tx: &rusqlite::Transaction,
@@ -156,10 +160,8 @@ fn register_imported_file(
             |r| r.get(0),
         )
         .optional()?;
-    if existing.is_some() {
-        return Err(CmdError::msg(format!(
-            "File '{filename}' đã được import trước đó (hash trùng). Vui lòng chọn file khác."
-        )));
+    if let Some(id) = existing {
+        return Ok(id);
     }
 
     tx.execute(
@@ -202,7 +204,6 @@ pub struct ImportShopeeClicksPayload {
 /// Import Shopee WebsiteClickReport.csv — 1 row/click, PK = click_id.
 #[tauri::command]
 pub fn import_shopee_clicks(
-    app: AppHandle,
     state: State<'_, DbState>,
     payload: ImportShopeeClicksPayload,
 ) -> CmdResult<ImportResult> {
@@ -231,10 +232,12 @@ pub fn import_shopee_clicks(
     };
 
     let hash = compute_hash(&payload.raw_content);
-    let stored_path = save_raw_csv(&app, &hash, &payload.raw_content)?;
     let now = Utc::now().to_rfc3339();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let imports_dir = resolve_active_imports_dir(&conn)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
     let tx = conn.transaction()?;
 
     // Auto-insert days entries cho mọi date phân biệt trong file. Cần vì
@@ -343,6 +346,10 @@ pub struct ShopeeOrderRow {
     pub refund_amount: Option<f64>,
     pub net_commission: Option<f64>,
     pub commission_total: Option<f64>,
+    /// CSV col 31 "Tổng hoa hồng đơn hàng(₫)" — pre-MCN.
+    pub order_commission_total: Option<f64>,
+    /// CSV col 35 "Phí quản lý MCN(₫)" — Shopee cắt trước payout.
+    pub mcn_fee: Option<f64>,
     pub sub_ids: [String; 5],
     pub channel: Option<String>,
     pub raw_json: Option<String>,
@@ -365,7 +372,6 @@ pub struct ImportShopeeOrdersPayload {
 /// Dedup UNIQUE(checkout_id, item_id, model_id) → ON CONFLICT DO UPDATE (status/price/commission mới nhất).
 #[tauri::command]
 pub fn import_shopee_orders(
-    app: AppHandle,
     state: State<'_, DbState>,
     payload: ImportShopeeOrdersPayload,
 ) -> CmdResult<ImportResult> {
@@ -394,10 +400,12 @@ pub fn import_shopee_orders(
     };
 
     let hash = compute_hash(&payload.raw_content);
-    let stored_path = save_raw_csv(&app, &hash, &payload.raw_content)?;
     let now = Utc::now().to_rfc3339();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let imports_dir = resolve_active_imports_dir(&conn)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
     let tx = conn.transaction()?;
 
     // Auto-insert days entries cho mọi date phân biệt trong file.
@@ -435,10 +443,10 @@ pub fn import_shopee_orders(
               shop_id, shop_name, shop_type, item_name,
               category_l1, category_l2, category_l3,
               price, quantity, order_value, refund_amount,
-              net_commission, commission_total,
+              net_commission, commission_total, order_commission_total, mcn_fee,
               sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
               channel, raw_json, day_date, source_file_id, shopee_account_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(checkout_id, item_id, model_id) DO UPDATE SET
                 order_status   = excluded.order_status,
                 order_time     = excluded.order_time,
@@ -450,11 +458,19 @@ pub fn import_shopee_orders(
                 refund_amount  = excluded.refund_amount,
                 net_commission = excluded.net_commission,
                 commission_total = excluded.commission_total,
+                order_commission_total = excluded.order_commission_total,
+                mcn_fee        = excluded.mcn_fee,
                 raw_json       = excluded.raw_json,
                 source_file_id = excluded.source_file_id,
                 shopee_account_id = excluded.shopee_account_id,
                 day_date       = excluded.day_date",
         )?;
+
+        // Validation: Shopee spec `net_commission = order_commission_total − mcn_fee`.
+        // Chỉ verify khi cả 3 field có giá trị. Tolerance 0.5đ cho rounding.
+        // Lệch quá → log warning (không fail import — data vẫn ghi được, user
+        // tự quyết định có refresh export lại hay không).
+        let mut mcn_mismatch_count: i64 = 0;
         for (r, date_opt) in &rows_with_dates {
             let Some(day_date) = date_opt else {
                 skipped += 1;
@@ -491,6 +507,8 @@ pub fn import_shopee_orders(
                 r.refund_amount,
                 r.net_commission,
                 r.commission_total,
+                r.order_commission_total,
+                r.mcn_fee,
                 r.sub_ids[0],
                 r.sub_ids[1],
                 r.sub_ids[2],
@@ -503,11 +521,38 @@ pub fn import_shopee_orders(
                 shopee_account_id,
             ])?;
 
+            if let (Some(net), Some(pre), Some(fee)) =
+                (r.net_commission, r.order_commission_total, r.mcn_fee)
+            {
+                if (net - (pre - fee)).abs() > 0.5 {
+                    mcn_mismatch_count += 1;
+                    if mcn_mismatch_count <= 5 {
+                        eprintln!(
+                            "[shopee_commission] MCN mismatch order={} checkout={} item={}: \
+                             net={} order_total={} mcn_fee={} expected={}",
+                            r.order_id,
+                            r.checkout_id,
+                            r.item_id,
+                            net,
+                            pre,
+                            fee,
+                            pre - fee,
+                        );
+                    }
+                }
+            }
+
             if before == 0 {
                 inserted += 1;
             } else {
                 updated += 1;
             }
+        }
+        if mcn_mismatch_count > 5 {
+            eprintln!(
+                "[shopee_commission] + {} more MCN mismatches (suppressed)",
+                mcn_mismatch_count - 5
+            );
         }
     }
 
@@ -611,7 +656,6 @@ pub(super) fn validate_fb_single_date(
 
 #[tauri::command]
 pub fn import_fb_ad_groups(
-    app: AppHandle,
     state: State<'_, DbState>,
     payload: ImportFbAdGroupsPayload,
 ) -> CmdResult<ImportResult> {
@@ -624,10 +668,12 @@ pub fn import_fb_ad_groups(
     )?;
 
     let hash = compute_hash(&payload.raw_content);
-    let stored_path = save_raw_csv(&app, &hash, &payload.raw_content)?;
     let now = Utc::now().to_rfc3339();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let imports_dir = resolve_active_imports_dir(&conn)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
     let tx = conn.transaction()?;
 
     let source_file_id = register_imported_file(
@@ -754,7 +800,6 @@ pub struct ImportFbCampaignsPayload {
 
 #[tauri::command]
 pub fn import_fb_campaigns(
-    app: AppHandle,
     state: State<'_, DbState>,
     payload: ImportFbCampaignsPayload,
 ) -> CmdResult<ImportResult> {
@@ -767,10 +812,12 @@ pub fn import_fb_campaigns(
     )?;
 
     let hash = compute_hash(&payload.raw_content);
-    let stored_path = save_raw_csv(&app, &hash, &payload.raw_content)?;
     let now = Utc::now().to_rfc3339();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let imports_dir = resolve_active_imports_dir(&conn)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
     let tx = conn.transaction()?;
 
     let source_file_id = register_imported_file(

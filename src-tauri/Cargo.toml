@@ -1,7 +1,7 @@
 [package]
 name = "thongkeshopee"
-version = "0.1.0"
-description = "Thống kê chạy ads FB hàng ngày"
+version = "0.2.0"
+description = "Shopee Affiliate Tracker — Thống kê chạy ads FB hàng ngày"
 authors = ["dungnv92734"]
 edition = "2021"
 

@@ -60,10 +60,12 @@ export function ImportPreviewDialog({
     if (e.target === e.currentTarget && !committing) onCancel();
   };
 
-  const isSkipped = (p: typeof batch.files[0]["preview"]) =>
-    p.alreadyImported || p.batchDuplicate;
+  // Chỉ skip file duplicate trong cùng batch (FE detect). File hash match
+  // với DB vẫn cho commit — Rust reuse entry cũ + UPSERT idempotent.
+  const isSkipped = (p: typeof batch.files[0]["preview"]) => p.batchDuplicate;
   const activeFiles = batch.files.filter((f) => !isSkipped(f.preview));
   const duplicateFiles = batch.files.filter((f) => isSkipped(f.preview));
+  const hashMatchActive = activeFiles.filter((f) => f.preview.hashMatch);
   const totalReplace = activeFiles.reduce(
     (a, f) => a + f.preview.replaceRows,
     0,
@@ -145,23 +147,33 @@ export function ImportPreviewDialog({
                 <span className="material-symbols-rounded align-middle text-base">
                   content_copy
                 </span>{" "}
-                {duplicateFiles.length} file sẽ bỏ qua:
+                {duplicateFiles.length} file sẽ bỏ qua (trùng nội dung trong batch):
               </p>
               <ul className="space-y-0.5 pl-6 text-xs text-white/70">
                 {duplicateFiles.map((f, i) => (
                   <li key={i} className="truncate" title={f.preview.filename}>
                     • {f.preview.filename}
-                    {f.preview.alreadyImported && f.preview.existingDayDate && (
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {hashMatchActive.length > 0 && (
+            <div className="rounded-lg border border-blue-500/40 bg-blue-950/30 px-4 py-3 text-sm">
+              <p className="mb-2 font-semibold text-blue-200">
+                <span className="material-symbols-rounded align-middle text-base">
+                  restart_alt
+                </span>{" "}
+                {hashMatchActive.length} file đã import trước đó — re-import sẽ refresh data:
+              </p>
+              <ul className="space-y-0.5 pl-6 text-xs text-white/70">
+                {hashMatchActive.map((f, i) => (
+                  <li key={i} className="truncate" title={f.preview.filename}>
+                    • {f.preview.filename}
+                    {f.preview.existingDayDate && (
                       <span className="text-white/40">
-                        {" "}— đã import ngày {fmtDate(f.preview.existingDayDate)}
-                      </span>
-                    )}
-                    {f.preview.alreadyImported && !f.preview.existingDayDate && (
-                      <span className="text-white/40"> — đã import trước đó</span>
-                    )}
-                    {f.preview.batchDuplicate && (
-                      <span className="text-white/40">
-                        {" "}— trùng nội dung với file khác trong batch
+                        {" "}— lần đầu import ngày {fmtDate(f.preview.existingDayDate)}
                       </span>
                     )}
                   </li>
@@ -250,6 +262,14 @@ export function ImportPreviewDialog({
                         title={preview.filename}
                       >
                         {preview.filename}
+                        {!isDup && preview.hashMatch && (
+                          <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-blue-500/20 px-2 py-0.5 text-[10px] font-medium text-blue-300">
+                            <span className="material-symbols-rounded text-[10px]">
+                              restart_alt
+                            </span>
+                            Đã import
+                          </span>
+                        )}
                       </td>
                       <td className="px-3 py-2 text-xs text-white/60 tabular-nums">
                         {dateCell}
@@ -281,33 +301,6 @@ export function ImportPreviewDialog({
             </table>
           </div>
 
-          {batch.files
-            .filter((f) => f.preview.sampleReplace.length > 0)
-            .map(({ preview }, i) => (
-              <div
-                key={i}
-                className="rounded-xl border border-amber-500/30 bg-amber-950/20 px-4 py-3"
-              >
-                <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-amber-300">
-                  Ví dụ dòng sẽ replace trong {kindLabel(preview.kind)} (
-                  {preview.filename}):
-                </p>
-                <ul className="space-y-0.5 pl-4 text-xs text-white/70">
-                  {preview.sampleReplace.map((s, j) => (
-                    <li key={j} className="truncate font-mono" title={s}>
-                      • {s}
-                    </li>
-                  ))}
-                  {preview.replaceRows > preview.sampleReplace.length && (
-                    <li className="italic text-white/40">
-                      ... và {preview.replaceRows - preview.sampleReplace.length}{" "}
-                      dòng khác
-                    </li>
-                  )}
-                </ul>
-              </div>
-            ))}
-
           {error && (
             <div className="rounded-lg border border-red-500/50 bg-red-900/30 px-3 py-2 text-sm text-red-200">
               {error}
@@ -318,7 +311,7 @@ export function ImportPreviewDialog({
         <footer className="flex shrink-0 items-center justify-between gap-2 border-t border-surface-8 bg-surface-1 px-6 py-3">
           <p className="text-xs text-white/50">
             {allDuplicates
-              ? "Tất cả file đã import trước đó — không có gì để commit."
+              ? "Không có file nào để commit."
               : hasReplacements
               ? "Xác nhận sẽ ghi đè các dòng trùng. Data không trùng được giữ nguyên."
               : "Tất cả dòng sẽ được thêm mới."}

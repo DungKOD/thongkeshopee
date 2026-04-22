@@ -173,7 +173,7 @@ export function ManualEntryDialog({
                 value={name}
                 autoFocus={!isEdit}
                 onChange={(e) => setName(e.currentTarget.value)}
-                placeholder="VD: MuseStudio-aotodinh-0412"
+                placeholder="VD: sanpham0101"
                 className={inputCls}
                 required
                 disabled={isEdit}

@@ -4,6 +4,13 @@ import { createPortal } from "react-dom";
 interface CloseWarningDialogProps {
   isOpen: boolean;
   syncing: boolean;
+  /// Label actions — customize cho "tắt app" vs "đăng xuất" vs khác.
+  /// Default: tắt app.
+  title?: string;
+  description?: string;
+  syncLabel?: string;
+  syncBusyLabel?: string;
+  anywayLabel?: string;
   /// User chọn đồng bộ trước khi tắt.
   onSyncAndClose: () => void;
   /// User chọn tắt luôn (mất dữ liệu chưa sync).
@@ -17,6 +24,11 @@ interface CloseWarningDialogProps {
 export function CloseWarningDialog({
   isOpen,
   syncing,
+  title = "Data chưa đồng bộ lên R2",
+  description = "Vẫn còn thay đổi chưa upload lên R2. Nếu tắt app bây giờ, data mới sẽ ở local — máy khác chưa thấy.",
+  syncLabel = "Đồng bộ lên R2 rồi tắt",
+  syncBusyLabel = "Đang đồng bộ lên R2...",
+  anywayLabel = "Tắt luôn (chấp nhận mất đồng bộ R2)",
   onSyncAndClose,
   onCloseAnyway,
   onCancel,
@@ -54,12 +66,9 @@ export function CloseWarningDialog({
               id="close-warn-title"
               className="text-lg font-semibold text-white"
             >
-              Data chưa đồng bộ
+              {title}
             </h2>
-            <p className="mt-1 text-sm text-white/70">
-              Vẫn còn thay đổi chưa upload lên cloud. Nếu tắt app bây giờ, data
-              mới sẽ ở local — máy khác chưa thấy.
-            </p>
+            <p className="mt-1 text-sm text-white/70">{description}</p>
           </div>
         </div>
 
@@ -73,9 +82,9 @@ export function CloseWarningDialog({
             <span
               className={`material-symbols-rounded text-base ${syncing ? "animate-spin" : ""}`}
             >
-              {syncing ? "progress_activity" : "cloud_upload"}
+              {syncing ? "sync" : "cloud_upload"}
             </span>
-            {syncing ? "Đang đồng bộ..." : "Đồng bộ rồi tắt"}
+            {syncing ? syncBusyLabel : syncLabel}
           </button>
           <button
             type="button"
@@ -83,7 +92,7 @@ export function CloseWarningDialog({
             disabled={syncing}
             className="btn-ripple rounded-lg border border-red-500/50 bg-red-500/10 px-4 py-2.5 text-sm font-medium text-red-300 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            Tắt luôn (chấp nhận mất data chưa sync)
+            {anywayLabel}
           </button>
           <button
             type="button"

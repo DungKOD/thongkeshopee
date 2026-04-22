@@ -182,80 +182,124 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
     })
 }
 
-/// Multi-tenant guard — wipe local DB nếu owner_uid != new_uid (khác user
-/// đang login so với lần trước). Idempotent: cùng user → no-op, chỉ stamp
-/// owner_uid nếu chưa có.
+/// Multi-tenant switch — swap DbState connection sang `users/{uid}/` folder.
 ///
-/// Flow: FE gọi NGAY SAU khi Firebase auth ready (trước mọi sync) với
-/// `new_uid = currentUser.uid`. Nếu return `true` = DB đã wipe, FE refetch
-/// sync_state + trigger pull-merge-push (R2 sẽ restore data nếu user mới có
-/// backup, hoặc DB ở trạng thái empty clean nếu chưa có).
+/// Flow:
+/// 1. Resolve user DB path: `{app_data}/users/{uid}/thongkeshopee.db`.
+/// 2. Nếu user folder chưa có + legacy root DB tồn tại + owner_uid khớp (hoặc
+///    null = pre-v7) → migrate: move root DB + imports/ sang user folder.
+/// 3. Apply pending.db nếu có (user download lần login trước, chưa apply).
+/// 4. Open connection, apply schema + migrations, seed Default account,
+///    stamp owner_uid trong sync_state.
+/// 5. Swap vào DbState (drop connection cũ).
+///
+/// Trả `owner_changed = true` nếu UID khác so với session DbState trước đó.
+/// FE dùng flag này để clear localStorage + refetch UI.
 #[tauri::command]
-pub async fn sync_reset_for_new_user(
+pub async fn switch_db_to_user(
+    app: AppHandle,
     db: State<'_, DbState>,
     new_uid: String,
 ) -> CmdResult<bool> {
     if new_uid.is_empty() {
         return Err(CmdError::msg("new_uid rỗng — phải là Firebase UID hợp lệ"));
     }
-    let mut conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let current_owner: Option<String> = conn
-        .query_row(
+
+    // 1. Resolve path của user DB mới.
+    let user_db_path = crate::db::resolve_db_path_for_user(&app, &new_uid)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    let user_imports_dir = crate::db::resolve_imports_dir_for_user(&app, &new_uid)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+
+    // 2. Migration từ legacy root DB (chỉ lần đầu sau khi upgrade lên v7+).
+    //    Điều kiện an toàn: user folder chưa có DB VÀ root DB tồn tại VÀ
+    //    root.owner_uid khớp new_uid (hoặc null). Nếu root thuộc user khác
+    //    thì KHÔNG đụng — để lần họ login sau tự migrate.
+    use std::fs as std_fs;
+    if !user_db_path.exists() {
+        if let Ok(legacy_db) = crate::db::resolve_legacy_db_path(&app) {
+            if legacy_db.exists() && legacy_db != user_db_path {
+                let legacy_owner: Option<String> =
+                    rusqlite::Connection::open(&legacy_db)
+                        .ok()
+                        .and_then(|c| {
+                            c.query_row(
+                                "SELECT owner_uid FROM sync_state WHERE id = 1",
+                                [],
+                                |r| r.get::<_, Option<String>>(0),
+                            )
+                            .ok()
+                            .flatten()
+                        });
+                let can_migrate = match legacy_owner.as_deref() {
+                    Some(owner) => owner == new_uid,
+                    None => true, // pre-v7 DB không có owner_uid → assume current user
+                };
+                if can_migrate {
+                    eprintln!(
+                        "[switch_db] migrating legacy root DB → {}",
+                        user_db_path.display()
+                    );
+                    // Move DB file + WAL/SHM aux files.
+                    let _ = std_fs::rename(&legacy_db, &user_db_path);
+                    for ext in &["db-wal", "db-shm"] {
+                        let src = legacy_db.with_extension(ext);
+                        if src.exists() {
+                            let _ = std_fs::rename(&src, user_db_path.with_extension(ext));
+                        }
+                    }
+                    // Move imports folder.
+                    if let Ok(legacy_imports) = crate::db::resolve_legacy_imports_dir(&app) {
+                        if legacy_imports.exists() && legacy_imports != user_imports_dir {
+                            // Move từng file để tránh fail nếu target dir tồn tại.
+                            if let Ok(entries) = std_fs::read_dir(&legacy_imports) {
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name();
+                                    let dst = user_imports_dir.join(&name);
+                                    let _ = std_fs::rename(entry.path(), &dst);
+                                }
+                                let _ = std_fs::remove_dir(&legacy_imports);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Apply pending.db nếu có (user download DB lần trước, chưa apply).
+    apply_pending_sync(&user_db_path).map_err(|e| CmdError::msg(e.to_string()))?;
+
+    // 4. Check owner hiện tại trong DbState (để trả flag owner_changed cho FE).
+    let old_owner: Option<String> = {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        conn.query_row(
             "SELECT owner_uid FROM sync_state WHERE id = 1",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, Option<String>>(0),
         )
-        .unwrap_or(None);
+        .ok()
+        .flatten()
+    };
+    let owner_changed = old_owner.as_deref() != Some(new_uid.as_str());
 
-    // Same user → chỉ đảm bảo owner stamped (pre-migration DB có thể null).
-    if current_owner.as_deref() == Some(new_uid.as_str()) {
-        return Ok(false);
+    // 5. Open user DB với schema + migrations.
+    let new_conn = crate::db::init_db_at(&user_db_path)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+
+    // 6. Stamp owner_uid (fresh DB từ migrations đã có sync_state row seed).
+    new_conn.execute(
+        "UPDATE sync_state SET owner_uid = ?1 WHERE id = 1",
+        params![new_uid],
+    )?;
+
+    // 7. Swap vào DbState — connection cũ drop, lock release files.
+    {
+        let mut slot = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        *slot = new_conn;
     }
 
-    let need_wipe = current_owner.is_some();
-
-    if need_wipe {
-        eprintln!(
-            "[sync_reset] owner change: {} → {} — wipe local DB",
-            current_owner.as_deref().unwrap_or("<none>"),
-            new_uid,
-        );
-        let tx = conn.transaction().map_err(CmdError::from)?;
-        // Thứ tự DELETE: leaf tables trước (triggers tăng change_id nhưng ta
-        // sẽ reset về 0 ở UPDATE sync_state cuối). `days` DELETE CASCADE xóa
-        // imported_files, raw_*, manual_entries — nhưng triggers chạy sao chắc,
-        // ta explicit DELETE từng bảng để không dính FK issue.
-        tx.execute("DELETE FROM raw_shopee_clicks", [])?;
-        tx.execute("DELETE FROM raw_shopee_order_items", [])?;
-        tx.execute("DELETE FROM raw_fb_ads", [])?;
-        tx.execute("DELETE FROM manual_entries", [])?;
-        tx.execute("DELETE FROM imported_files", [])?;
-        tx.execute("DELETE FROM days", [])?;
-        tx.execute("DELETE FROM tombstones", [])?;
-        // Reset sync_state — change_id bị trigger tăng vì DELETE ở trên, ta
-        // force về 0 + stamp owner mới.
-        tx.execute(
-            "UPDATE sync_state SET
-                dirty = 1,
-                change_id = 0,
-                last_uploaded_change_id = 0,
-                last_synced_at_ms = NULL,
-                last_synced_remote_mtime_ms = NULL,
-                last_error = NULL,
-                owner_uid = ?1
-             WHERE id = 1",
-            params![new_uid],
-        )?;
-        tx.commit().map_err(CmdError::from)?;
-    } else {
-        // Pre-migration DB / fresh install — chỉ stamp owner, không wipe.
-        conn.execute(
-            "UPDATE sync_state SET owner_uid = ?1 WHERE id = 1",
-            params![new_uid],
-        )?;
-    }
-
-    Ok(need_wipe)
+    Ok(owner_changed)
 }
 
 /// Ghi lỗi sync vào sync_state.last_error (không đổi dirty). Dùng khi upload fail.
@@ -362,11 +406,11 @@ pub async fn sync_upload_db(
     })
 }
 
-/// Download DB từ R2, ghi vào `pending_db_path` trong app_data_dir.
+/// Download DB từ R2, ghi vào `<active_db>.pending.db` (cùng folder user).
 /// KHÔNG ghi đè DB đang live — FE phải prompt user restart app để apply.
 #[tauri::command]
 pub async fn sync_download_db(
-    app: AppHandle,
+    db: State<'_, DbState>,
     sync_api_url: String,
     id_token: String,
 ) -> CmdResult<SyncDownloadResult> {
@@ -383,7 +427,7 @@ pub async fn sync_download_db(
         bytes.len() / 1024,
     );
 
-    let target = pending_db_path(&app)?;
+    let target = pending_db_path(&db)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).await.map_err(CmdError::from)?;
     }
@@ -397,22 +441,26 @@ pub async fn sync_download_db(
 }
 
 /// Apply pending DB file (từ `sync_download_db`) — rename thành DB chính.
+/// Dùng user-scoped pending path (resolve từ active DB path).
 #[tauri::command]
-pub async fn sync_apply_pending(app: AppHandle) -> CmdResult<bool> {
-    apply_pending_sync(&app).map_err(|e| CmdError::msg(e.to_string()))
+pub async fn sync_apply_pending(db: State<'_, DbState>) -> CmdResult<bool> {
+    let live = {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        crate::db::resolve_active_db_path(&conn)
+            .map_err(|e| CmdError::msg(e.to_string()))?
+    };
+    apply_pending_sync(&live).map_err(|e| CmdError::msg(e.to_string()))
 }
 
-/// Sync version dùng trong `tauri::Builder.setup()` — chạy TRƯỚC `db::setup`.
-/// Nếu có file pending → backup live + rename pending → live. Không lỗi nếu không có pending.
-pub fn apply_pending_sync(app: &AppHandle) -> anyhow::Result<bool> {
+/// Swap `<live>.pending.db` → `<live>` sau khi user download DB về.
+/// Pending nằm cùng folder với live để rename atomic trong filesystem.
+/// Gọi từ `sync_apply_pending` (manual trigger) hoặc `switch_db_to_user`
+/// (apply trước khi open user DB nếu download đã xảy ra lần login trước).
+pub fn apply_pending_sync(live_path: &std::path::Path) -> anyhow::Result<bool> {
     use rusqlite::Connection;
     use std::fs as std_fs;
 
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| anyhow::anyhow!("app_data_dir: {e}"))?;
-    let pending = base.join("thongkeshopee.pending.db");
+    let pending = live_path.with_extension("pending.db");
     if !pending.exists() {
         return Ok(false);
     }
@@ -434,22 +482,20 @@ pub fn apply_pending_sync(app: &AppHandle) -> anyhow::Result<bool> {
         }
     }
 
-    let live = crate::db::resolve_db_path(app)?;
-
     // Backup live DB sang .pre-restore.db để user rollback nếu muốn.
-    if live.exists() {
-        let backup = live.with_extension("pre-restore.db");
+    if live_path.exists() {
+        let backup = live_path.with_extension("pre-restore.db");
         let _ = std_fs::remove_file(&backup);
-        std_fs::rename(&live, &backup)?;
+        std_fs::rename(live_path, &backup)?;
     }
 
     // WAL và SHM cũ không còn hợp lệ với DB mới → xóa.
     for ext in &["db-wal", "db-shm"] {
-        let aux = live.with_extension(ext);
+        let aux = live_path.with_extension(ext);
         let _ = std_fs::remove_file(aux);
     }
 
-    std_fs::rename(&pending, &live)?;
+    std_fs::rename(&pending, live_path)?;
     Ok(true)
 }
 
@@ -461,7 +507,7 @@ pub fn restart_app(app: AppHandle) {
 }
 
 /// Admin-only: list toàn bộ users + metadata file trên R2.
-/// Worker verify admin qua `ADMIN_UIDS` secret.
+/// Worker verify admin qua claim/Firestore/env `ADMIN_UIDS` (multi-source).
 #[tauri::command]
 pub async fn admin_list_users(
     sync_api_url: String,
@@ -470,12 +516,24 @@ pub async fn admin_list_users(
     sync_client::admin_list_users(&sync_api_url, &id_token).await
 }
 
-fn pending_db_path(app: &AppHandle) -> CmdResult<PathBuf> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| CmdError::msg(format!("app_data_dir: {e}")))?;
-    Ok(base.join("thongkeshopee.pending.db"))
+/// Admin-only: xóa R2 orphan files (UID không còn trong Firestore).
+/// Dọn data cũ sau khi đổi Firebase project. Trả list UIDs đã xóa.
+#[tauri::command]
+pub async fn admin_cleanup_orphans(
+    sync_api_url: String,
+    id_token: String,
+) -> CmdResult<Vec<String>> {
+    sync_client::admin_cleanup_orphans(&sync_api_url, &id_token).await
+}
+
+/// Resolve pending DB path từ active DB path (user-scoped folder).
+/// Dùng ở sync_download: ghi file tạm cùng folder với DB live để khi
+/// `apply_pending_sync` rename → swap trong cùng filesystem (atomic).
+fn pending_db_path(db: &State<'_, DbState>) -> CmdResult<PathBuf> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let live = crate::db::resolve_active_db_path(&conn)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    Ok(live.with_extension("pending.db"))
 }
 
 fn now_ms() -> i64 {
@@ -793,41 +851,56 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
 
     // 4. raw_shopee_order_items — UNIQUE (checkout_id, item_id, model_id).
     let remote_orders_has_account = remote_table_has_column(tx, "raw_shopee_order_items", "shopee_account_id")?;
+    // v7 columns: remote DB cũ (pre-v7) chưa có 2 cột này — dùng NULL fallback.
+    let remote_has_mcn = remote_table_has_column(tx, "raw_shopee_order_items", "mcn_fee")?;
+    let mcn_select = if remote_has_mcn {
+        "r.order_commission_total, r.mcn_fee"
+    } else {
+        "NULL, NULL"
+    };
     if remote_orders_has_account && remote_has_accounts {
         tx.execute(
-            "INSERT OR IGNORE INTO main.raw_shopee_order_items
-             (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
-              click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
-              price, quantity, order_value, refund_amount, net_commission, commission_total,
-              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
-              shopee_account_id)
-             SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
-                    r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
-                    r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
-                    r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id,
-                    COALESCE(la.id, 1)
-             FROM remote.raw_shopee_order_items r
-             JOIN remote.imported_files rif ON rif.id = r.source_file_id
-             JOIN main.imported_files lif ON lif.file_hash = rif.file_hash
-             LEFT JOIN remote.shopee_accounts ra ON ra.id = r.shopee_account_id
-             LEFT JOIN main.shopee_accounts la ON la.name = ra.name",
+            &format!(
+                "INSERT OR IGNORE INTO main.raw_shopee_order_items
+                 (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
+                  click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
+                  price, quantity, order_value, refund_amount, net_commission, commission_total,
+                  order_commission_total, mcn_fee,
+                  sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
+                  shopee_account_id)
+                 SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
+                        r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
+                        r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
+                        {mcn_select},
+                        r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id,
+                        COALESCE(la.id, 1)
+                 FROM remote.raw_shopee_order_items r
+                 JOIN remote.imported_files rif ON rif.id = r.source_file_id
+                 JOIN main.imported_files lif ON lif.file_hash = rif.file_hash
+                 LEFT JOIN remote.shopee_accounts ra ON ra.id = r.shopee_account_id
+                 LEFT JOIN main.shopee_accounts la ON la.name = ra.name"
+            ),
             [],
         )?;
     } else {
         tx.execute(
-            "INSERT OR IGNORE INTO main.raw_shopee_order_items
-             (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
-              click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
-              price, quantity, order_value, refund_amount, net_commission, commission_total,
-              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
-              shopee_account_id)
-             SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
-                    r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
-                    r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
-                    r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id, 1
-             FROM remote.raw_shopee_order_items r
-             JOIN remote.imported_files rif ON rif.id = r.source_file_id
-             JOIN main.imported_files lif ON lif.file_hash = rif.file_hash",
+            &format!(
+                "INSERT OR IGNORE INTO main.raw_shopee_order_items
+                 (order_id, checkout_id, item_id, model_id, order_status, order_time, completed_time,
+                  click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
+                  price, quantity, order_value, refund_amount, net_commission, commission_total,
+                  order_commission_total, mcn_fee,
+                  sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
+                  shopee_account_id)
+                 SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
+                        r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
+                        r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
+                        {mcn_select},
+                        r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id, 1
+                 FROM remote.raw_shopee_order_items r
+                 JOIN remote.imported_files rif ON rif.id = r.source_file_id
+                 JOIN main.imported_files lif ON lif.file_hash = rif.file_hash"
+            ),
             [],
         )?;
     }

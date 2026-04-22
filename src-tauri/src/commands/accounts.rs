@@ -7,10 +7,13 @@
 //!
 //! Safety: không cho xóa account còn data → FE phải reassign/xóa rows trước.
 
+use std::collections::{HashMap, HashSet};
+
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use super::query::{is_prefix, to_canonical, Canonical};
 use super::{CmdError, CmdResult};
 use crate::db::DbState;
 
@@ -142,35 +145,227 @@ pub fn update_shopee_account_color(
     Ok(())
 }
 
-/// Xóa account. Block nếu còn bất kỳ row data nào FK về account (Shopee clicks/
-/// orders/manual). User phải reassign hoặc xóa rows trước qua UI riêng.
-/// Account default (id=1) có thể xóa nếu user muốn — chỉ khi rỗng.
+/// Load map `day_date → HashSet<Canonical>` từ 3 bảng Shopee filter theo predicate.
+/// `include_account` predicate: true = include row, false = skip.
+fn load_shopee_canonicals_by_day(
+    conn: &rusqlite::Connection,
+    include_account: impl Fn(i64) -> bool,
+) -> CmdResult<HashMap<String, HashSet<Canonical>>> {
+    let mut out: HashMap<String, HashSet<Canonical>> = HashMap::new();
+    for sql in [
+        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+         FROM raw_shopee_clicks",
+        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+         FROM raw_shopee_order_items",
+        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+         FROM manual_entries",
+    ] {
+        let mut stmt = conn.prepare(sql)?;
+        let iter = stmt.query_map([], |r| {
+            let day: String = r.get(0)?;
+            let tuple: [String; 5] =
+                [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+            let acc: i64 = r.get(6)?;
+            Ok((day, tuple, acc))
+        })?;
+        for row in iter {
+            let (day, tuple, acc) = row?;
+            if !include_account(acc) {
+                continue;
+            }
+            out.entry(day)
+                .or_default()
+                .insert(to_canonical(tuple));
+        }
+    }
+    Ok(out)
+}
+
+/// Count FB ads sẽ bị "cuốn theo" khi xóa account `id`: FB ad có canonical
+/// prefix-compatible với Shopee row của account này trên cùng day, VÀ
+/// không còn prefix-compatible với Shopee row của account khác (safeguard
+/// tránh xóa FB dùng chung cho nhiều TK).
 #[tauri::command]
-pub fn delete_shopee_account(state: State<'_, DbState>, id: i64) -> CmdResult<()> {
+pub fn count_fb_linked_to_account(
+    state: State<'_, DbState>,
+    id: i64,
+) -> CmdResult<i64> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let shop_target = load_shopee_canonicals_by_day(&conn, |a| a == id)?;
+    if shop_target.is_empty() {
+        return Ok(0);
+    }
+    let shop_other = load_shopee_canonicals_by_day(&conn, |a| a != id)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+         FROM raw_fb_ads",
+    )?;
+    let iter = stmt.query_map([], |r| {
+        let day: String = r.get(0)?;
+        let tuple: [String; 5] =
+            [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+        Ok((day, to_canonical(tuple)))
+    })?;
+    let mut count: i64 = 0;
+    for row in iter {
+        let (day, fb_canon) = row?;
+        let Some(targets) = shop_target.get(&day) else {
+            continue;
+        };
+        let linked_to_target = targets
+            .iter()
+            .any(|c| is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon));
+        if !linked_to_target {
+            continue;
+        }
+        let linked_to_other = shop_other
+            .get(&day)
+            .map(|s| {
+                s.iter()
+                    .any(|c| is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon))
+            })
+            .unwrap_or(false);
+        if !linked_to_other {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Xóa account + toàn bộ data Shopee FK về account (clicks/orders/manual).
+/// `also_delete_fb = true` → xóa thêm FB ads khớp sub_id prefix với Shopee
+/// data của account này (và KHÔNG khớp account khác) — tránh orphan FB
+/// spend hiển thị như data lạc sau khi xóa TK Shopee.
+/// Account default (id=1) bảo vệ không cho xóa.
+/// Atomic qua transaction: fail giữa chừng → rollback.
+/// Cleanup: dọn orphan imported_files + orphan days + bump sync_state.
+#[tauri::command]
+pub fn delete_shopee_account(
+    state: State<'_, DbState>,
+    id: i64,
+    also_delete_fb: Option<bool>,
+) -> CmdResult<()> {
     if id == DEFAULT_ACCOUNT_ID {
         return Err(CmdError::msg("TK hệ thống 'Mặc định' không thể xóa"));
     }
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let row_count: i64 = conn.query_row(
-        "SELECT
-            COALESCE((SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?1), 0) +
-            COALESCE((SELECT COUNT(*) FROM raw_shopee_order_items WHERE shopee_account_id = ?1), 0) +
-            COALESCE((SELECT COUNT(*) FROM manual_entries WHERE shopee_account_id = ?1), 0)",
-        params![id],
-        |r| r.get(0),
-    )?;
-    if row_count > 0 {
-        return Err(CmdError::msg(format!(
-            "Account còn {row_count} dòng data — hãy chuyển sang account khác hoặc xóa data trước khi xóa account"
-        )));
+    let also_delete_fb = also_delete_fb.unwrap_or(false);
+
+    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+
+    // Pre-compute FB ads cần xóa TRƯỚC khi DELETE Shopee rows (sau DELETE thì
+    // shop_target rỗng → không match được). Collect list (day, tuple) để
+    // DELETE trong transaction.
+    let fb_to_delete: Vec<(String, [String; 5])> = if also_delete_fb {
+        let shop_target = load_shopee_canonicals_by_day(&conn, |a| a == id)?;
+        let shop_other = load_shopee_canonicals_by_day(&conn, |a| a != id)?;
+        let mut out: Vec<(String, [String; 5])> = Vec::new();
+        if !shop_target.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+                 FROM raw_fb_ads",
+            )?;
+            let iter = stmt.query_map([], |r| {
+                let day: String = r.get(0)?;
+                let tuple: [String; 5] =
+                    [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+                Ok((day, tuple))
+            })?;
+            for row in iter {
+                let (day, tuple) = row?;
+                let fb_canon = to_canonical(tuple.clone());
+                let Some(targets) = shop_target.get(&day) else {
+                    continue;
+                };
+                let linked_to_target = targets
+                    .iter()
+                    .any(|c| is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon));
+                if !linked_to_target {
+                    continue;
+                }
+                let linked_to_other = shop_other
+                    .get(&day)
+                    .map(|s| {
+                        s.iter().any(|c| {
+                            is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon)
+                        })
+                    })
+                    .unwrap_or(false);
+                if !linked_to_other {
+                    out.push((day, tuple));
+                }
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    let tx = conn.transaction()?;
+
+    // DELETE FB ads đã xác định (exact match theo day + 5 sub_ids).
+    if !fb_to_delete.is_empty() {
+        let mut stmt = tx.prepare(
+            "DELETE FROM raw_fb_ads
+             WHERE day_date = ?1
+               AND sub_id1 = ?2 AND sub_id2 = ?3
+               AND sub_id3 = ?4 AND sub_id4 = ?5 AND sub_id5 = ?6",
+        )?;
+        for (day, tuple) in &fb_to_delete {
+            stmt.execute(params![
+                day, tuple[0], tuple[1], tuple[2], tuple[3], tuple[4]
+            ])?;
+        }
     }
-    let affected = conn.execute(
+
+    tx.execute(
+        "DELETE FROM raw_shopee_clicks WHERE shopee_account_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM raw_shopee_order_items WHERE shopee_account_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM manual_entries WHERE shopee_account_id = ?1",
+        params![id],
+    )?;
+    let affected = tx.execute(
         "DELETE FROM shopee_accounts WHERE id = ?1",
         params![id],
     )?;
     if affected == 0 {
         return Err(CmdError::msg(format!("Account id={id} không tồn tại")));
     }
+
+    // Cleanup orphan imported_files (không còn raw rows nào refer) để user
+    // có thể re-import lại file sau này.
+    tx.execute(
+        "DELETE FROM imported_files
+         WHERE id NOT IN (
+             SELECT source_file_id FROM raw_shopee_clicks UNION
+             SELECT source_file_id FROM raw_shopee_order_items UNION
+             SELECT source_file_id FROM raw_fb_ads
+         )",
+        [],
+    )?;
+    // Cleanup orphan days (không còn raw/manual nào refer).
+    tx.execute(
+        "DELETE FROM days WHERE date NOT IN (
+            SELECT day_date FROM raw_shopee_clicks UNION
+            SELECT day_date FROM raw_shopee_order_items UNION
+            SELECT day_date FROM raw_fb_ads UNION
+            SELECT day_date FROM manual_entries
+         )",
+        [],
+    )?;
+    // Explicit bump sync_state — đảm bảo UI báo dirty + auto upload.
+    tx.execute(
+        "UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1",
+        [],
+    )?;
+
+    tx.commit()?;
     Ok(())
 }
 

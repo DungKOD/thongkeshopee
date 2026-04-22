@@ -72,7 +72,7 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Counter bump mỗi khi DB được ghi thành công. Dùng cho auto-sync Drive.
+  // Counter bump mỗi khi DB được ghi thành công. Dùng cho auto-sync R2.
   // KHÔNG bump khi chỉ load (refetch) — chỉ bump sau mutation thực sự.
   const [mutationVersion, setMutationVersion] = useState(0);
   const markMutation = useCallback(() => {

@@ -7,7 +7,7 @@ binding = "DB_BUCKET"
 bucket_name = "thongkeshopee-db"
 
 [vars]
-FIREBASE_PROJECT_ID = "thongkeshopee-62d61"
+FIREBASE_PROJECT_ID = "thongkeshopee-9b2d9"
 
 # Secrets (set via: wrangler secret put <name>):
 #   ADMIN_UIDS — comma-separated Firebase UIDs có quyền admin

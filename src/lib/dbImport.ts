@@ -55,6 +55,11 @@ export interface ShopeeOrderRow {
   refundAmount: number | null;
   netCommission: number | null;
   commissionTotal: number | null;
+  /** CSV col 31 "Tổng hoa hồng đơn hàng(₫)" — trước khi trừ phí MCN.
+   *  Relationship: netCommission = orderCommissionTotal − mcnFee. */
+  orderCommissionTotal: number | null;
+  /** CSV col 35 "Phí quản lý MCN(₫)" — Shopee đã cắt sẵn khỏi netCommission. */
+  mcnFee: number | null;
   subIds: SubIds;
   channel: string | null;
   rawJson: string | null;
@@ -230,6 +235,8 @@ const SHOPEE_ORDER_USED = new Set([
   "Giá trị đơn hàng (₫)",
   "Số tiền hoàn trả (₫)",
   "Tổng hoa hồng sản phẩm(₫)",
+  "Tổng hoa hồng đơn hàng(₫)",
+  "Phí quản lý MCN(₫)",
   "Hoa hồng ròng tiếp thị liên kết(₫)",
   "Sub_id1",
   "Sub_id2",
@@ -274,6 +281,8 @@ function toShopeeOrderRow(r: Record<string, string>): ShopeeOrderRow | null {
     refundAmount: parseNumOrNull(r["Số tiền hoàn trả (₫)"]),
     netCommission: parseNumOrNull(r["Hoa hồng ròng tiếp thị liên kết(₫)"]),
     commissionTotal: parseNumOrNull(r["Tổng hoa hồng sản phẩm(₫)"]),
+    orderCommissionTotal: parseNumOrNull(r["Tổng hoa hồng đơn hàng(₫)"]),
+    mcnFee: parseNumOrNull(r["Phí quản lý MCN(₫)"]),
     subIds,
     channel: strOrNull(r["Kênh"]),
     rawJson: buildRawJson(r, SHOPEE_ORDER_USED),
@@ -394,9 +403,14 @@ export interface ImportPreview {
   replaceRows: number;
   sampleReplace: string[];
   dayHasData: boolean;
-  /** File đã import (hash match trong DB) — FE highlight + skip khỏi commit. */
+  /** File này đã có trong DB VÀ mọi row đã tồn tại — re-import không thêm gì.
+   *  FE skip commit. Nếu hash match nhưng có row thiếu (backfill scenario),
+   *  field này = false và commit sẽ reuse entry cũ + UPSERT rows thiếu. */
   alreadyImported: boolean;
-  /** Nếu alreadyImported=true: day_date của lần import trước. */
+  /** Hash file đã có trong DB, bất kể có row thiếu không. FE dùng show note
+   *  "đã import trước đó — đang backfill N dòng". */
+  hashMatch: boolean;
+  /** Nếu hashMatch=true: day_date của lần import trước. */
   existingDayDate: string | null;
   /** Rows không parse được date (Shopee multi-day only). */
   skipped: number;
@@ -632,9 +646,12 @@ export async function commitCsvBatch(
 ): Promise<ImportResult[]> {
   const results: ImportResult[] = [];
   for (const { parsed, preview } of batch.files) {
-    // Skip file đã import trước (hash match DB) hoặc trùng với file khác trong
-    // batch này (FE detect) — 2 case đều sẽ fail UNIQUE(file_hash) nếu commit.
-    if (preview.alreadyImported || preview.batchDuplicate) continue;
+    // Chỉ skip file duplicate trong CÙNG batch (FE detect) — commit cả 2 sẽ
+    // redundant. File hash match với DB vẫn commit: Rust reuse imported_files
+    // entry cũ + UPSERT raw rows (idempotent). Cho phép user re-import để
+    // refresh data (vd Shopee update trạng thái đơn trong file mới) hoặc
+    // backfill rows đã bị xóa.
+    if (preview.batchDuplicate) continue;
     const payload =
       parsed.kind === "shopee_clicks" || parsed.kind === "shopee_commission"
         ? { ...parsed.payload, shopeeAccountId }

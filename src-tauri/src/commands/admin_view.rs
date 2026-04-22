@@ -30,7 +30,7 @@ use tokio::fs;
 use super::sync::gunzip_if_needed;
 use super::sync_client;
 use super::{CmdError, CmdResult};
-use crate::db::{DbState, resolve_db_path};
+use crate::db::{resolve_active_db_path, DbState};
 
 /// Tauri managed state — track user đang được admin xem.
 /// `None` = chế độ bình thường (DB của chính admin).
@@ -46,6 +46,11 @@ pub struct AdminViewInfo {
     pub size_bytes: u64,
     pub last_modified_ms: i64,
     pub entered_at_ms: i64,
+    /// Path DB của chính admin TRƯỚC khi swap sang snapshot — dùng ở
+    /// `admin_exit_view_user_db` để reopen đúng folder (multi-tenant layout
+    /// `users/{admin_uid}/thongkeshopee.db`, không hardcode root path).
+    #[serde(skip)]
+    pub admin_db_path_backup: PathBuf,
 }
 
 /// Resolve folder chứa snapshot DB của user đang được admin xem.
@@ -118,11 +123,16 @@ pub async fn admin_view_user_db(
         .execute_batch("PRAGMA query_only = ON;")
         .map_err(CmdError::from)?;
 
-    // 4. Swap DbState — connection cũ drop khi out-of-scope.
-    {
+    // 4. Swap DbState — connection cũ drop khi out-of-scope. Lưu path DB
+    //    của admin TRƯỚC khi swap để `admin_exit` reopen đúng (không hardcode
+    //    root path, compatible với layout `users/{uid}/`).
+    let admin_db_path_backup: PathBuf = {
         let mut slot = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        let backup = resolve_active_db_path(&slot)
+            .map_err(|e| CmdError::msg(e.to_string()))?;
         *slot = new_conn;
-    }
+        backup
+    };
 
     // 5. Ghi AdminViewState.
     let info = AdminViewInfo {
@@ -133,6 +143,7 @@ pub async fn admin_view_user_db(
         size_bytes,
         last_modified_ms,
         entered_at_ms: now_ms(),
+        admin_db_path_backup,
     };
     {
         let mut slot = view_state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
@@ -145,11 +156,17 @@ pub async fn admin_view_user_db(
 /// Exit admin-view mode — reopen DB gốc read-write, swap lại, clear state.
 #[tauri::command]
 pub async fn admin_exit_view_user_db(
-    app: AppHandle,
     db: State<'_, DbState>,
     view_state: State<'_, AdminViewState>,
 ) -> CmdResult<()> {
-    let path = resolve_db_path(&app).map_err(|e| CmdError::msg(e.to_string()))?;
+    // Lấy path DB admin đã lưu ở lúc enter. Nếu không có → không thể exit clean
+    // (fallback không safe với layout per-user — user phải restart app).
+    let path = {
+        let slot = view_state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        slot.as_ref()
+            .map(|info| info.admin_db_path_backup.clone())
+            .ok_or_else(|| CmdError::msg("Không ở chế độ admin-view, không có path để reopen"))?
+    };
 
     // Open DB gốc + apply PRAGMA như `db::init_db` (không migrate — đã làm lúc startup).
     let new_conn = Connection::open(&path)

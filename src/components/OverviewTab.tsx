@@ -176,6 +176,27 @@ export function OverviewTab({
       {/* ============ KPI primary (lớn) ============ */}
       <PrimaryKpiRow totals={totals} source={source} />
 
+      {/* ============ MCN fee banner (chỉ show khi có) ============ */}
+      {totals.mcnFeeTotal > 0 && (
+        <section
+          className="flex items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-100/90"
+          title="Shopee đã cắt phí MCN trước khi payout. Hoa hồng hiển thị là NET (đã trừ phí MCN). Số này chỉ minh bạch, KHÔNG bị trừ lần nữa vào lợi nhuận."
+        >
+          <span className="material-symbols-rounded text-amber-300">info</span>
+          <div className="flex flex-col">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-amber-300/80">
+              Phí quản lý MCN đã bị cắt
+            </span>
+            <span className="mt-0.5 text-lg font-bold tabular-nums text-amber-100">
+              {fmtVnd(totals.mcnFeeTotal)}
+            </span>
+          </div>
+          <span className="ml-auto text-xs text-amber-200/60">
+            đã trừ sẵn trong Hoa hồng gross
+          </span>
+        </section>
+      )}
+
       {/* ============ KPI secondary (nhỏ) ============ */}
       <SecondaryKpiRow totals={totals} source={source} />
 

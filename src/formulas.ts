@@ -26,6 +26,9 @@ export function rowMatchesSource(row: UiRow, source: SourceFilter): boolean {
 export type OverviewTotals = DayTotals & {
   orderValueTotal: number;
   netCommission: number;
+  /** Tổng phí quản lý MCN Shopee đã cắt (đã trừ sẵn trong commission —
+   *  chỉ dùng hiển thị minh bạch, không tính lại profit). */
+  mcnFeeTotal: number;
   daysCount: number;
   rowsCount: number;
 };
@@ -62,9 +65,12 @@ export function uiRowKey(dayDate: string, subIds: readonly string[]): string {
  * - `netCommission`, `profit`, `profitMargin`: luôn tính (không có field DB sẵn)
  */
 /// SINGLE SOURCE OF TRUTH cho công thức net commission.
-/// - `commission`: hoa hồng gross (gross commission).
-/// - `commissionPending`: subset commission từ đơn status "Đang chờ xử lý"
-///   (raw Shopee orders only — manual override có pending=0).
+/// - `commission`: commission từ DB column `net_commission` — thực chất là
+///   "Hoa hồng ròng tiếp thị liên kết" từ CSV col 37, Shopee ĐÃ TRỪ phí MCN
+///   trong số này. Tên `commission` giữ lại vì legacy, không rename để tránh
+///   đụng callsite. `UiDayTotals.mcnFeeTotal` lưu phí MCN đã bị cắt để UI hiển thị.
+/// - `commissionPending`: subset commission từ đơn rủi ro huỷ: "Đang chờ xử lý"
+///   + "Chưa thanh toán" (raw Shopee orders only — manual override có pending=0).
 ///
 /// Logic:
 ///   net = commission × (1 - taxRate) - commissionPending × reserveRate
@@ -74,6 +80,8 @@ export function uiRowKey(dayDate: string, subIds: readonly string[]): string {
 ///   trừ trước khi payout).
 /// - `reserveRate` (dự phòng hoàn huỷ): CHỈ trừ từ pending — đơn chưa chắc
 ///   ăn, có rủi ro bị huỷ/hoàn. Completed order đã chắc → không cần reserve.
+/// - Phí MCN: KHÔNG trừ ở đây vì đã bị Shopee cắt sẵn trong `commission`.
+///   Trừ lần nữa = double-count.
 ///
 /// MỌI nơi tính net commission PHẢI gọi hàm này. Đổi công thức → sửa 1 chỗ.
 export function computeNetCommission(
@@ -156,6 +164,7 @@ export function computeOverviewTotals(
     profit: 0,
     orderValueTotal: 0,
     netCommission: 0,
+    mcnFeeTotal: 0,
     daysCount: 0,
     rowsCount: 0,
   };
@@ -178,6 +187,7 @@ export function computeOverviewTotals(
     acc.netCommission += net;
     acc.profit += net - spend;
     acc.orderValueTotal += t.orderValueTotal;
+    acc.mcnFeeTotal += t.mcnFeeTotal;
 
     // daysCount/rowsCount vẫn dựa vào row-level vì là metrics hiển thị UI.
     let dayContributed = false;
@@ -339,6 +349,24 @@ export function buildDayTsv(
   ].join("\t");
 
   return [header.join("\t"), ...rowLines, totalLine].join("\n");
+}
+
+/// Format "X phút trước" / "X giờ trước" / "X ngày trước" cho presence UI.
+/// Dùng cho "lần cuối online" timestamp. Tuần+ → hiện date tuyệt đối.
+export function fmtTimeAgo(ms: number | null | undefined): string {
+  if (!ms) return "—";
+  const diff = Date.now() - ms;
+  if (diff < 0) return "vừa xong";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return "vừa xong";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} phút trước`;
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour} giờ trước`;
+  const day = Math.floor(hour / 24);
+  if (day < 7) return `${day} ngày trước`;
+  // > 1 tuần → date tuyệt đối.
+  return new Date(ms).toLocaleDateString("vi-VN");
 }
 
 /**

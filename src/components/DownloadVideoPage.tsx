@@ -253,7 +253,7 @@ export function DownloadVideoPage() {
                 loading ? "animate-spin" : ""
               }`}
             >
-              {loading ? "progress_activity" : "search"}
+              {loading ? "sync" : "search"}
             </span>
             {loading ? "Đang tìm..." : "Tìm video"}
           </button>
@@ -393,7 +393,7 @@ export function DownloadVideoPage() {
                       downloading ? "animate-spin" : ""
                     }`}
                   >
-                    {downloading ? "progress_activity" : "download"}
+                    {downloading ? "sync" : "download"}
                   </span>
                   {downloading ? "Đang tải..." : "Tải video HD"}
                 </button>

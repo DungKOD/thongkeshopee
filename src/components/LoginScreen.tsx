@@ -63,7 +63,7 @@ export function LoginScreen() {
             draggable={false}
           />
           <h1 className="mt-3 text-xl font-semibold text-white/90">
-            Thống kê Shopee Affiliate
+            Shopee Affiliate Tracker
           </h1>
           <p className="mt-1 text-sm text-white/60">
             {mode === "signin" ? "Đăng nhập để tiếp tục" : "Tạo tài khoản mới"}

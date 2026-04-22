@@ -81,7 +81,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               key={t.id}
               className="pointer-events-auto flex min-w-[320px] max-w-md items-center gap-3 rounded-xl bg-surface-12 px-4 py-3 shadow-elev-8"
             >
-              <span className="material-symbols-rounded text-shopee-400">
+              <span
+                className={`material-symbols-rounded ${t.undo ? "text-shopee-400" : "text-green-400"}`}
+              >
                 {t.undo ? "undo" : "check_circle"}
               </span>
               <span className="flex-1 text-sm text-white/90">{t.message}</span>

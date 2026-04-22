@@ -17,6 +17,28 @@ export type SyncStatus =
   | "error"
   | "offline";
 
+/// Xóa localStorage keys mang dữ liệu user — gọi khi đổi owner (user B
+/// login trên máy vừa dùng user A). Không touch key của Firebase SDK /
+/// Tauri / browser (vd `firebase:*`, `__tauri__*`) — chúng có scope riêng.
+/// Nếu thêm key mới mang dữ liệu user, BẮT BUỘC thêm vào list này.
+function wipeUserLocalStorage(): void {
+  const prefixes = ["smartcalc:", "thongkeshopee."];
+  const toRemove: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && prefixes.some((p) => key.startsWith(p))) {
+      toRemove.push(key);
+    }
+  }
+  for (const k of toRemove) {
+    try {
+      localStorage.removeItem(k);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export type SyncPhase = "downloading" | "merging" | "uploading" | null;
 
 interface SyncStateDto {
@@ -333,16 +355,27 @@ export function useCloudSync({
     startupDoneRef.current = true;
     void (async () => {
       try {
-        const wiped = await invoke<boolean>("sync_reset_for_new_user", {
+        const ownerChanged = await invoke<boolean>("switch_db_to_user", {
           newUid: authUid,
         });
-        if (wiped) {
-          console.log("[sync] owner change detected → local DB wiped");
-          try {
-            await onRemoteAppliedRef.current?.();
-          } catch {
-            // ignore — UI sẽ refresh sau startup check.
-          }
+        if (ownerChanged) {
+          console.log(
+            "[sync] swapped DB to users/" + authUid + "/ folder",
+          );
+          // Clear localStorage scoped per-app (calculator history + filter +
+          // settings) vì toàn bộ đều mang dấu vết user cũ. KHÔNG clear all
+          // localStorage vì Firebase SDK / Tauri có key riêng — chỉ key app.
+          wipeUserLocalStorage();
+        }
+        // CRITICAL phân quyền: LUÔN refetch FE state sau khi switch_db_to_user
+        // xong (bất kể ownerChanged), vì DbState connection đã trỏ sang DB mới
+        // của user hiện tại. AccountContext + useDbStats gọi list/query trước
+        // khi switch xong sẽ đọc từ DB cũ (race condition) — refresh ở đây
+        // overwrite state với data từ DB đúng.
+        try {
+          await onRemoteAppliedRef.current?.();
+        } catch {
+          // ignore — UI sẽ refresh sau startup check.
         }
         await doStartupCheck();
       } finally {

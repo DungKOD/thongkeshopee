@@ -7,6 +7,7 @@ import {
   setPersistence,
 } from "firebase/auth";
 import { getFirestore, type Firestore } from "firebase/firestore";
+import { getDatabase, type Database } from "firebase/database";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -15,11 +16,17 @@ const firebaseConfig = {
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  databaseURL: import.meta.env.VITE_FIREBASE_DATABASE_URL,
 };
 
 export const firebaseApp: FirebaseApp = initializeApp(firebaseConfig);
 export const auth: Auth = getAuth(firebaseApp);
 export const db: Firestore = getFirestore(firebaseApp);
+/// RTDB cho presence tracking (online/offline). Chỉ init nếu env có URL —
+/// feature optional, app vẫn work nếu chưa setup RTDB.
+export const rtdb: Database | null = import.meta.env.VITE_FIREBASE_DATABASE_URL
+  ? getDatabase(firebaseApp)
+  : null;
 export const googleProvider = new GoogleAuthProvider();
 
 void setPersistence(auth, browserLocalPersistence);

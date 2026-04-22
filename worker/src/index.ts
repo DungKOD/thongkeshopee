@@ -4,7 +4,11 @@ import { jsonError } from './response';
 import { metadataRoute } from './routes/metadata';
 import { uploadRoute } from './routes/upload';
 import { downloadRoute } from './routes/download';
-import { adminUsersRoute, adminDownloadRoute } from './routes/admin';
+import {
+  adminUsersRoute,
+  adminDownloadRoute,
+  adminCleanupOrphansRoute,
+} from './routes/admin';
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -32,6 +36,7 @@ export default {
       if (req.method === 'POST' && path === '/download') return downloadRoute(req, auth, env);
       if (req.method === 'POST' && path === '/admin/users') return adminUsersRoute(req, auth, env);
       if (req.method === 'GET' && path === '/admin/download') return adminDownloadRoute(req, auth, env);
+      if (req.method === 'POST' && path === '/admin/cleanup-orphans') return adminCleanupOrphansRoute(req, auth, env);
       return jsonError(404, `No route: ${req.method} ${path}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Internal error';

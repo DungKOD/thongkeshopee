@@ -14,7 +14,7 @@ use rusqlite::params;
 use tauri::State;
 
 use crate::db::types::BatchDeletePayload;
-use crate::db::{tombstone_key_sub, DbState};
+use crate::db::{resolve_active_imports_dir, tombstone_key_sub, DbState};
 
 use super::query::{is_prefix, to_canonical, Canonical};
 use super::{CmdError, CmdResult};
@@ -90,7 +90,57 @@ pub fn batch_commit_deletes(
         [],
     )?;
 
+    // Cleanup imported_files orphan — file không còn raw row nào reference.
+    // Bắt buộc làm để user có thể re-import lại file sau khi xóa data: file_hash
+    // UNIQUE sẽ chặn import nếu entry cũ còn nằm đó dù data đã bị xóa hết.
+    // Multi-day file an toàn: chỉ xóa khi MỌI day trong file đã hết data.
+    let orphan_files: Vec<(i64, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, stored_path FROM imported_files
+             WHERE id NOT IN (
+                 SELECT source_file_id FROM raw_shopee_clicks UNION
+                 SELECT source_file_id FROM raw_shopee_order_items UNION
+                 SELECT source_file_id FROM raw_fb_ads
+             )",
+        )?;
+        let iter = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?;
+        iter.collect::<std::result::Result<_, _>>()?
+    };
+    for (id, _) in &orphan_files {
+        tx.execute("DELETE FROM imported_files WHERE id = ?", params![id])?;
+    }
+
+    // Explicit bump sync_state — FK CASCADE DELETE trên raw tables có thể
+    // không fire user triggers tùy SQLite config. Đảm bảo mọi thao tác xóa
+    // của `batch_commit_deletes` đều mark dirty để sync flow upload.
+    tx.execute(
+        "UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1",
+        [],
+    )?;
+
     tx.commit()?;
+
+    // Best-effort: xóa physical CSV file của orphan imported_files khỏi disk.
+    // Resolve imports_dir từ connection đang mở (user-scoped folder hiện tại),
+    // KHÔNG hardcode root app_data_dir vì sau v7+ DB ở `users/{uid}/`.
+    let imports_base = resolve_active_imports_dir(&conn).ok();
+    drop(conn);
+    if let Some(base) = imports_base {
+        for (_, path_opt) in orphan_files {
+            if let Some(rel) = path_opt {
+                let filename = rel.strip_prefix("imports/").unwrap_or(&rel);
+                let abs = base.join(filename);
+                if let Err(e) = std::fs::remove_file(&abs) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "[batch_commit_deletes] failed to remove orphan file {}: {e}",
+                            abs.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     Ok(BatchResult {
         days_deleted,
