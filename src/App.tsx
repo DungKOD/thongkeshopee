@@ -29,6 +29,7 @@ import { AccountProvider, useAccounts } from "./contexts/AccountContext";
 import { AccountFilterDropdown } from "./components/AccountFilterDropdown";
 import { AccountManagerDialog } from "./components/AccountManagerDialog";
 import { ImportAccountPickerDialog } from "./components/ImportAccountPickerDialog";
+import { ScrollToTopButton } from "./components/ScrollToTopButton";
 import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
 import { LoginScreen } from "./components/LoginScreen";
@@ -890,6 +891,9 @@ function AppInner() {
         isOpen={accountMgrOpen}
         onClose={() => setAccountMgrOpen(false)}
       />
+
+      {/* FAB — hiện khi scroll sâu, click về đầu page */}
+      <ScrollToTopButton />
 
       <PendingChangesBar
         count={pendingCount}

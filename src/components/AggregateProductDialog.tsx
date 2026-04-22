@@ -17,6 +17,7 @@ import {
   prefetchFontEmbedCSS,
 } from "../lib/screenshot";
 import { DayScreenshotDialog } from "./DayScreenshotDialog";
+import { ScrollToTopButton } from "./ScrollToTopButton";
 
 interface AggregateProductDialogProps {
   isOpen: boolean;
@@ -38,6 +39,7 @@ export function AggregateProductDialog({
   const [capturing, setCapturing] = useState(false);
   const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Body scroll lock.
   useEffect(() => {
@@ -195,7 +197,7 @@ export function AggregateProductDialog({
     >
       <div
         ref={dialogRef}
-        className={`flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-surface-2 shadow-elev-24 ${
+        className={`relative flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-surface-2 shadow-elev-24 ${
           capturing ? "capture-mode" : ""
         }`}
         role="dialog"
@@ -248,7 +250,10 @@ export function AggregateProductDialog({
           </div>
         </header>
 
-        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto bg-surface-0 px-6 py-5">
+        <div
+          ref={scrollRef}
+          className="min-h-0 flex-1 space-y-6 overflow-y-auto bg-surface-0 px-6 py-5"
+        >
           {/* ============ KPI cards ============ */}
           <section className={`grid grid-cols-2 gap-3 ${showAds ? "md:grid-cols-4" : "md:grid-cols-3"}`}>
             <KpiCard
@@ -515,6 +520,11 @@ export function AggregateProductDialog({
             Đóng
           </button>
         </footer>
+
+        <ScrollToTopButton
+          targetRef={scrollRef}
+          className="absolute bottom-20 right-6"
+        />
       </div>
 
       <DayScreenshotDialog

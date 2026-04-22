@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth } from "../lib/firebase";
 import { adminListUsers, type UserListEntry } from "../lib/sync";
 import { useAdminView } from "../contexts/AdminViewContext";
+import { ScrollToTopButton } from "./ScrollToTopButton";
 
 interface UserListDialogProps {
   isOpen: boolean;
@@ -17,6 +18,7 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("createdAt");
   const [sortDesc, setSortDesc] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
     const currentUser = auth.currentUser;
@@ -82,7 +84,7 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
       onClick={onClose}
     >
       <div
-        className="flex w-full max-w-[95vw] flex-col overflow-hidden rounded-2xl border border-surface-8 bg-surface-1 shadow-elev-16 xl:max-w-[88vw] 2xl:max-w-[1600px]"
+        className="relative flex w-full max-w-[95vw] flex-col overflow-hidden rounded-2xl border border-surface-8 bg-surface-1 shadow-elev-16 xl:max-w-[88vw] 2xl:max-w-[1600px]"
         style={{ maxHeight: "92vh" }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -139,7 +141,7 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
           </button>
         </div>
 
-        <div className="flex-1 overflow-auto">
+        <div ref={scrollRef} className="flex-1 overflow-auto">
           {loading && !users ? (
             <LoadingState />
           ) : error ? (
@@ -187,6 +189,11 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
             </table>
           )}
         </div>
+
+        <ScrollToTopButton
+          targetRef={scrollRef}
+          className="absolute bottom-4 right-4"
+        />
       </div>
     </div>
   );

@@ -16,6 +16,7 @@ import {
   prefetchFontEmbedCSS,
 } from "../lib/screenshot";
 import { DayScreenshotDialog } from "./DayScreenshotDialog";
+import { ScrollToTopButton } from "./ScrollToTopButton";
 
 interface ProductDetailDialogProps {
   isOpen: boolean;
@@ -34,6 +35,7 @@ export function ProductDetailDialog({
   const [capturing, setCapturing] = useState(false);
   const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const handleScreenshot = async () => {
     if (!dialogRef.current || capturing) return;
@@ -157,7 +159,7 @@ export function ProductDetailDialog({
     >
       <div
         ref={dialogRef}
-        className={`flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-surface-2 shadow-elev-24 ${
+        className={`relative flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-surface-2 shadow-elev-24 ${
           capturing ? "capture-mode" : ""
         }`}
         role="dialog"
@@ -224,7 +226,10 @@ export function ProductDetailDialog({
           </div>
         </header>
 
-        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto bg-surface-0 px-6 py-5">
+        <div
+          ref={scrollRef}
+          className="relative min-h-0 flex-1 space-y-6 overflow-y-auto bg-surface-0 px-6 py-5"
+        >
           {/* ============ KPI cards ============ */}
           <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <KpiCard
@@ -615,6 +620,11 @@ export function ProductDetailDialog({
             Đóng
           </button>
         </footer>
+
+        <ScrollToTopButton
+          targetRef={scrollRef}
+          className="absolute bottom-20 right-6"
+        />
       </div>
 
       <DayScreenshotDialog
