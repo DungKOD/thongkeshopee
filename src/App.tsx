@@ -498,18 +498,20 @@ function AppInner() {
                 onForce={forceSync}
               />
             )}
-            <button
-              onClick={() => setRulesOpen(true)}
-              className="btn-ripple flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
-              title="Quy tắc sử dụng"
-              aria-label="Quy tắc"
-            >
-              <span className="material-symbols-rounded text-base">
-                menu_book
-              </span>
-              Quy tắc
-            </button>
-            {isAdmin && (
+            {!inAdminView && (
+              <button
+                onClick={() => setRulesOpen(true)}
+                className="btn-ripple flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
+                title="Quy tắc sử dụng"
+                aria-label="Quy tắc"
+              >
+                <span className="material-symbols-rounded text-base">
+                  menu_book
+                </span>
+                Quy tắc
+              </button>
+            )}
+            {isAdmin && !inAdminView && (
               <button
                 onClick={() => setUserListOpen(true)}
                 className="btn-ripple flex items-center gap-1.5 rounded-lg border border-white/40 px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
@@ -533,15 +535,17 @@ function AppInner() {
             >
               <span className="material-symbols-rounded">calculate</span>
             </button>
-            <button
-              onClick={() => setSettingsOpen(true)}
-              className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
-              title="Cài đặt"
-              aria-label="Cài đặt"
-            >
-              <span className="material-symbols-rounded">settings</span>
-            </button>
-            <UserMenu />
+            {!inAdminView && (
+              <button
+                onClick={() => setSettingsOpen(true)}
+                className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
+                title="Cài đặt"
+                aria-label="Cài đặt"
+              >
+                <span className="material-symbols-rounded">settings</span>
+              </button>
+            )}
+            {!inAdminView && <UserMenu />}
             {activeTab === "stats" && !inAdminView && (
               <button
                 onClick={handleImportClick}
