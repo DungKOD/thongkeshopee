@@ -394,12 +394,15 @@ export interface ImportPreview {
   replaceRows: number;
   sampleReplace: string[];
   dayHasData: boolean;
-  /** File đã import (hash match) — FE highlight + skip khỏi commit. */
+  /** File đã import (hash match trong DB) — FE highlight + skip khỏi commit. */
   alreadyImported: boolean;
   /** Nếu alreadyImported=true: day_date của lần import trước. */
   existingDayDate: string | null;
   /** Rows không parse được date (Shopee multi-day only). */
   skipped: number;
+  /** File này trùng nội dung với file khác trong CÙNG batch này (FE detect
+   *  client-side, tránh commit 2 file giống nhau → UNIQUE constraint fail). */
+  batchDuplicate: boolean;
 }
 
 /** Parsed + typed payload của 1 file, giữ trong RAM để commit sau preview. */
@@ -557,12 +560,32 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
     parsed.push(await parseFile(f));
   }
 
+  // Detect batch-local duplicate hash TRƯỚC khi preview — nếu user lỡ pick
+  // cùng 1 file 2 lần (drag-drop + OS picker, hoặc clone tên khác), commit
+  // sẽ fail UNIQUE(file_hash) ở file thứ 2. Mark flag để dialog hiện rõ +
+  // commit skip.
+  const hashSeen = new Set<string>();
+  const batchDupIndices = new Set<number>();
+  for (let i = 0; i < parsed.length; i++) {
+    const hash = await hashSha256(parsed[i].payload.rawContent);
+    if (hashSeen.has(hash)) {
+      batchDupIndices.add(i);
+    } else {
+      hashSeen.add(hash);
+    }
+  }
+
   // Preview song song (mỗi file gọi 1 command khác nhau).
   const previews = await Promise.all(
     parsed.map((p) =>
       invoke<ImportPreview>(PREVIEW_CMD[p.kind], { payload: p.payload }),
     ),
   );
+
+  // Merge batch-local duplicate flag vào previews.
+  previews.forEach((p, i) => {
+    (p as ImportPreview).batchDuplicate = batchDupIndices.has(i);
+  });
 
   // Validate cross-date CHỈ cho FB (single-date). Shopee multi-day OK.
   // Mỗi FB file phải share cùng ngày với các FB file khác nếu có nhiều; và
@@ -609,8 +632,9 @@ export async function commitCsvBatch(
 ): Promise<ImportResult[]> {
   const results: ImportResult[] = [];
   for (const { parsed, preview } of batch.files) {
-    // Skip file đã import trước (hash match). FE dialog đã báo user rồi.
-    if (preview.alreadyImported) continue;
+    // Skip file đã import trước (hash match DB) hoặc trùng với file khác trong
+    // batch này (FE detect) — 2 case đều sẽ fail UNIQUE(file_hash) nếu commit.
+    if (preview.alreadyImported || preview.batchDuplicate) continue;
     const payload =
       parsed.kind === "shopee_clicks" || parsed.kind === "shopee_commission"
         ? { ...parsed.payload, shopeeAccountId }
@@ -619,6 +643,16 @@ export async function commitCsvBatch(
     results.push(r);
   }
   return results;
+}
+
+/// Compute SHA-256 hex của string qua Web Crypto. Dùng detect batch-local dup.
+/// Cùng thuật toán với `compute_hash` ở Rust (imports.rs) → cùng kết quả.
+async function hashSha256(content: string): Promise<string> {
+  const buf = new TextEncoder().encode(content);
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 export function kindLabel(kind: CsvKind): string {

@@ -60,8 +60,10 @@ export function ImportPreviewDialog({
     if (e.target === e.currentTarget && !committing) onCancel();
   };
 
-  const activeFiles = batch.files.filter((f) => !f.preview.alreadyImported);
-  const duplicateFiles = batch.files.filter((f) => f.preview.alreadyImported);
+  const isSkipped = (p: typeof batch.files[0]["preview"]) =>
+    p.alreadyImported || p.batchDuplicate;
+  const activeFiles = batch.files.filter((f) => !isSkipped(f.preview));
+  const duplicateFiles = batch.files.filter((f) => isSkipped(f.preview));
   const totalReplace = activeFiles.reduce(
     (a, f) => a + f.preview.replaceRows,
     0,
@@ -143,15 +145,23 @@ export function ImportPreviewDialog({
                 <span className="material-symbols-rounded align-middle text-base">
                   content_copy
                 </span>{" "}
-                {duplicateFiles.length} file đã import trước — sẽ bỏ qua:
+                {duplicateFiles.length} file sẽ bỏ qua:
               </p>
               <ul className="space-y-0.5 pl-6 text-xs text-white/70">
                 {duplicateFiles.map((f, i) => (
                   <li key={i} className="truncate" title={f.preview.filename}>
                     • {f.preview.filename}
-                    {f.preview.existingDayDate && (
+                    {f.preview.alreadyImported && f.preview.existingDayDate && (
                       <span className="text-white/40">
                         {" "}— đã import ngày {fmtDate(f.preview.existingDayDate)}
+                      </span>
+                    )}
+                    {f.preview.alreadyImported && !f.preview.existingDayDate && (
+                      <span className="text-white/40"> — đã import trước đó</span>
+                    )}
+                    {f.preview.batchDuplicate && (
+                      <span className="text-white/40">
+                        {" "}— trùng nội dung với file khác trong batch
                       </span>
                     )}
                   </li>
@@ -216,7 +226,7 @@ export function ImportPreviewDialog({
               </thead>
               <tbody>
                 {batch.files.map(({ preview }, i) => {
-                  const isDup = preview.alreadyImported;
+                  const isDup = isSkipped(preview);
                   const dateCell =
                     preview.dayDateFrom === preview.dayDateTo
                       ? fmtDate(preview.dayDateFrom)
