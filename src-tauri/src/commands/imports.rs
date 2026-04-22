@@ -452,7 +452,8 @@ pub fn import_shopee_orders(
                 commission_total = excluded.commission_total,
                 raw_json       = excluded.raw_json,
                 source_file_id = excluded.source_file_id,
-                shopee_account_id = excluded.shopee_account_id",
+                shopee_account_id = excluded.shopee_account_id,
+                day_date       = excluded.day_date",
         )?;
         for (r, date_opt) in &rows_with_dates {
             let Some(day_date) = date_opt else {

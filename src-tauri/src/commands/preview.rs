@@ -163,18 +163,24 @@ pub fn preview_import_shopee_clicks(
         });
     }
 
-    // Load existing click_ids ACROSS all days in file range (multi-day aware).
-    let placeholders = std::iter::repeat("?")
-        .take(distinct_dates.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT click_id FROM raw_shopee_clicks WHERE day_date IN ({placeholders})"
-    );
-    let params_vec: Vec<&dyn rusqlite::ToSql> =
-        distinct_dates.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    // Replace detection: check từng click_id trong file với DB — KHÔNG filter
+    // theo day_date. Click_id là PK natural (INSERT OR IGNORE): nếu click_id
+    // đã tồn tại trên ngày BẤT KỲ (kể cả ngoài date range của file), re-import
+    // → IGNORE. Preview phải count đúng để user biết bao nhiêu "thật sự mới".
+    //
+    // Chiến lược: load HashSet tất cả click_id từ DB (filter theo file click_id
+    // chunked IN để tránh load toàn DB khi scale lớn).
+    let file_click_ids: Vec<&str> =
+        payload.rows.iter().map(|r| r.click_id.as_str()).collect();
     let mut existing: HashSet<String> = HashSet::new();
-    {
+    const CHUNK: usize = 500;
+    for chunk in file_click_ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT click_id FROM raw_shopee_clicks WHERE click_id IN ({placeholders})"
+        );
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let mut stmt = conn.prepare(&sql)?;
         for row in stmt.query_map(params_vec.as_slice(), |r| r.get::<_, String>(0))? {
             existing.insert(row?);
@@ -246,18 +252,28 @@ pub fn preview_import_shopee_orders(
         });
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(distinct_dates.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT checkout_id, item_id, model_id FROM raw_shopee_order_items
-         WHERE day_date IN ({placeholders})"
-    );
-    let params_vec: Vec<&dyn rusqlite::ToSql> =
-        distinct_dates.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    // Replace detection: tương tự clicks, check key `(checkout_id, item_id,
+    // model_id)` xuyên tất cả ngày trong DB. UPSERT update theo key này bất
+    // kể day_date hiện tại của row, preview phải count chính xác.
+    //
+    // Triple key không hỗ trợ IN tuples tự nhiên ở SQLite → encode key thành
+    // concatenated string "checkout|item|model" + IN chunked.
+    let file_keys: Vec<String> = payload
+        .rows
+        .iter()
+        .map(|r| format!("{}|{}|{}", r.checkout_id, r.item_id, r.model_id))
+        .collect();
     let mut existing: HashSet<(String, String, String)> = HashSet::new();
-    {
+    const CHUNK: usize = 500;
+    for chunk in file_keys.chunks(CHUNK) {
+        let placeholders =
+            std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT checkout_id, item_id, model_id FROM raw_shopee_order_items
+             WHERE checkout_id || '|' || item_id || '|' || model_id IN ({placeholders})"
+        );
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let mut stmt = conn.prepare(&sql)?;
         for row in stmt.query_map(params_vec.as_slice(), |r| {
             Ok((
