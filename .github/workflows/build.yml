@@ -71,6 +71,7 @@ jobs:
           EOF
 
       - name: Build Tauri app
+        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,8 +86,17 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo "=== src-tauri/target bundle tree ==="
-          find src-tauri/target -type d -name bundle -exec ls -laR {} + 2>/dev/null || true
+          echo "=== tauri-action artifactPaths ==="
+          echo '${{ steps.tauri.outputs.artifactPaths }}'
+          echo "=== pwd ==="
+          pwd
+          echo "=== src-tauri/target top-level ==="
+          ls -la src-tauri/target/ || echo "(no target dir)"
+          echo "=== release dirs ==="
+          ls -la src-tauri/target/release/ 2>/dev/null || true
+          ls -la src-tauri/target/*/release/ 2>/dev/null || true
+          echo "=== bundle dirs (if any) ==="
+          find src-tauri/target -type d -name bundle -print -exec ls -laR {} + || echo "(no bundle dir found)"
 
       - name: Upload build artifacts
         if: always()
