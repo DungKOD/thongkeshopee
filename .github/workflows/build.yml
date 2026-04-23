@@ -57,19 +57,53 @@ jobs:
 
       - name: Create .env.local from secrets
         shell: bash
+        env:
+          SECRET_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
+          SECRET_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
+          SECRET_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+          SECRET_STORAGE_BUCKET: ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
+          SECRET_SENDER_ID: ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
+          SECRET_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
+          SECRET_DB_URL: ${{ secrets.VITE_FIREBASE_DATABASE_URL }}
+          SECRET_APPS_SCRIPT: ${{ secrets.VITE_APPS_SCRIPT_URL }}
+          SECRET_SYNC_URL: ${{ secrets.VITE_SYNC_API_URL }}
+          SECRET_ZALO: ${{ secrets.VITE_ADMIN_ZALO }}
+          SECRET_NOTE: ${{ secrets.VITE_ADMIN_NOTE }}
         run: |
+          # Sanity check: in độ dài từng secret (không leak value)
+          check() {
+            local name="$1"; local val="$2"
+            if [ -z "$val" ]; then
+              echo "  ❌ $name: EMPTY"
+            else
+              echo "  ✓  $name: ${#val} chars"
+            fi
+          }
+          echo "=== Secret presence check ==="
+          check VITE_FIREBASE_API_KEY "$SECRET_API_KEY"
+          check VITE_FIREBASE_AUTH_DOMAIN "$SECRET_AUTH_DOMAIN"
+          check VITE_FIREBASE_PROJECT_ID "$SECRET_PROJECT_ID"
+          check VITE_FIREBASE_STORAGE_BUCKET "$SECRET_STORAGE_BUCKET"
+          check VITE_FIREBASE_MESSAGING_SENDER_ID "$SECRET_SENDER_ID"
+          check VITE_FIREBASE_APP_ID "$SECRET_APP_ID"
+          check VITE_FIREBASE_DATABASE_URL "$SECRET_DB_URL"
+          check VITE_APPS_SCRIPT_URL "$SECRET_APPS_SCRIPT"
+          check VITE_SYNC_API_URL "$SECRET_SYNC_URL"
+          check VITE_ADMIN_ZALO "$SECRET_ZALO"
+          check VITE_ADMIN_NOTE "$SECRET_NOTE"
+
           cat > .env.local <<EOF
-          VITE_FIREBASE_API_KEY=${{ secrets.VITE_FIREBASE_API_KEY }}
-          VITE_FIREBASE_AUTH_DOMAIN=${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
-          VITE_FIREBASE_PROJECT_ID=${{ secrets.VITE_FIREBASE_PROJECT_ID }}
-          VITE_FIREBASE_STORAGE_BUCKET=${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
-          VITE_FIREBASE_MESSAGING_SENDER_ID=${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
-          VITE_FIREBASE_APP_ID=${{ secrets.VITE_FIREBASE_APP_ID }}
-          VITE_FIREBASE_DATABASE_URL=${{ secrets.VITE_FIREBASE_DATABASE_URL }}
-          VITE_APPS_SCRIPT_URL=${{ secrets.VITE_APPS_SCRIPT_URL }}
-          VITE_SYNC_API_URL=${{ secrets.VITE_SYNC_API_URL }}
-          VITE_ADMIN_ZALO=${{ secrets.VITE_ADMIN_ZALO }}
-          VITE_ADMIN_NOTE=${{ secrets.VITE_ADMIN_NOTE }}
+          VITE_FIREBASE_API_KEY=$SECRET_API_KEY
+          VITE_FIREBASE_AUTH_DOMAIN=$SECRET_AUTH_DOMAIN
+          VITE_FIREBASE_PROJECT_ID=$SECRET_PROJECT_ID
+          VITE_FIREBASE_STORAGE_BUCKET=$SECRET_STORAGE_BUCKET
+          VITE_FIREBASE_MESSAGING_SENDER_ID=$SECRET_SENDER_ID
+          VITE_FIREBASE_APP_ID=$SECRET_APP_ID
+          VITE_FIREBASE_DATABASE_URL=$SECRET_DB_URL
+          VITE_APPS_SCRIPT_URL=$SECRET_APPS_SCRIPT
+          VITE_SYNC_API_URL=$SECRET_SYNC_URL
+          VITE_ADMIN_ZALO=$SECRET_ZALO
+          VITE_ADMIN_NOTE=$SECRET_NOTE
           EOF
 
       - name: Build Tauri app
