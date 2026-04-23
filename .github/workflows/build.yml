@@ -49,7 +49,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ./src-tauri -> target
+          workspaces: . -> target
           key: ${{ matrix.name }}
 
       - name: Install npm dependencies
@@ -88,15 +88,8 @@ jobs:
         run: |
           echo "=== tauri-action artifactPaths ==="
           echo '${{ steps.tauri.outputs.artifactPaths }}'
-          echo "=== pwd ==="
-          pwd
-          echo "=== src-tauri/target top-level ==="
-          ls -la src-tauri/target/ || echo "(no target dir)"
-          echo "=== release dirs ==="
-          ls -la src-tauri/target/release/ 2>/dev/null || true
-          ls -la src-tauri/target/*/release/ 2>/dev/null || true
-          echo "=== bundle dirs (if any) ==="
-          find src-tauri/target -type d -name bundle -print -exec ls -laR {} + || echo "(no bundle dir found)"
+          echo "=== bundle dirs ==="
+          find target -type d -name bundle -print 2>/dev/null || echo "(no bundle dir found)"
 
       - name: Upload build artifacts
         if: always()
@@ -104,7 +97,7 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: |
-            src-tauri/target/release/bundle/**
-            src-tauri/target/*/release/bundle/**
+            target/release/bundle/**
+            target/*/release/bundle/**
           if-no-files-found: warn
           retention-days: 14
