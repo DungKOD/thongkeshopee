@@ -575,6 +575,7 @@ pub fn import_shopee_orders(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct FbAdGroupRow {
     pub ad_group_name: String,
     pub sub_ids: [String; 5],
@@ -597,6 +598,8 @@ pub struct FbAdGroupRow {
     pub result_count: Option<i64>,
     pub cost_per_result: Option<f64>,
     // raw_json removed v9 — CSV gốc lưu imports/<hash>.csv.
+    // Các field unused (frequency/shop_clicks/ctr/cpm/landing_views) giữ lại để
+    // FE parse CSV đầy đủ + future-proof khi muốn persist thêm metric.
 }
 
 /// Normalize click count: ưu tiên link_clicks → all_clicks → result_count.
@@ -769,6 +772,7 @@ const FB_ADS_UPSERT_SQL: &str = "
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct FbCampaignRow {
     pub campaign_name: String,
     pub sub_ids: [String; 5],
@@ -786,6 +790,7 @@ pub struct FbCampaignRow {
     pub all_cpc: Option<f64>,
     pub cost_per_result: Option<f64>,
     // raw_json removed v9 — CSV gốc lưu imports/<hash>.csv.
+    // result_indicator unused: FE parse CSV cột "Chỉ báo kết quả" nhưng BE chưa persist.
 }
 
 #[derive(Debug, Deserialize)]
