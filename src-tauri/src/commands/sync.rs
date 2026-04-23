@@ -4,18 +4,13 @@
 //! - Tauri command handlers (`sync_*`, `admin_*`)
 //! - sync_state CRUD (dirty flag, change_id, last_synced_*)
 //! - Snapshot tạo bằng `VACUUM INTO` (consistent, không đụng WAL)
-//! - gzip compress/decompress với backward-compat cho SQLite raw cũ
+//! - zstd multi-thread compress/decompress (v8.1+, replaces gzip)
 //! - Pull-merge-push flow (cross-device safe, tombstones CASCADE)
 //! - Guard: fresh-install + remote có data → reject upload, route sang merge
+//! - Skip-identical: hash compressed bytes trước upload, skip nếu match lần trước
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
 use md5::{Digest, Md5};
 use rusqlite::params;
 use serde::Serialize;
@@ -24,47 +19,150 @@ use tokio::fs;
 
 use super::sync_client::{self, UserListEntry};
 use super::{CmdError, CmdResult};
-use crate::db::DbState;
+use crate::db::{DbState, VideoDbState};
 
-/// Magic bytes đầu file SQLite — "SQLite format 3\0". Backward-compat detection:
-/// file cũ (uncompressed) bắt đầu bằng magic này, file mới (gzipped) bằng `1f 8b`.
-const SQLITE_MAGIC: [u8; 6] = [0x53, 0x51, 0x4C, 0x69, 0x74, 0x65];
-const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+// =============================================================
+// HLC-lite — timestamp monotonic cross-machine
+// =============================================================
+//
+// Problem: 2 máy cùng account, clock drift 5 phút → edit UTC ISO8601 timestamp
+// so sánh lexicographic → máy clock chậm hơn luôn lose merge UPSERT.
+//
+// Solution: mỗi DB giữ `sync_state.last_known_clock_ms`. Mỗi edit lấy:
+//   ts = max(now_ms, last_known_clock_ms + 1)
+//   last_known_clock_ms = ts
+//
+// Sau merge remote, absorb: last_known_clock_ms = max(local, max remote ts).
+// Kết quả: edit sau merge luôn > mọi edit remote, không bao giờ flip thứ tự
+// bởi clock drift. Wall clock vẫn dùng khi forward-flowing, chỉ clamp lên khi
+// remote ahead.
+//
+// Trade-off: nếu máy A clock rất nhanh → timestamp xa tương lai → máy B cũng
+// ăn theo sau khi sync. Không "đúng" wall time nhưng consistent ordering.
 
-/// Gzip compress level 3 — fast, SQLite (nhiều repetition) nén ~3-4× là đủ.
-fn gzip_compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::with_capacity(input.len() / 3), Compression::new(3));
-    encoder.write_all(input)?;
-    encoder.finish()
+/// Next monotonic ms — caller phải hold DB lock (modifies sync_state).
+/// Return value + tự update `last_known_clock_ms` atomically.
+pub fn next_hlc_ms(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let last: i64 = conn
+        .query_row(
+            "SELECT last_known_clock_ms FROM sync_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let next = std::cmp::max(now, last + 1);
+    conn.execute(
+        "UPDATE sync_state SET last_known_clock_ms = ?1 WHERE id = 1",
+        [next],
+    )?;
+    Ok(next)
 }
 
-/// Detect magic + decompress nếu cần. Backward compat: bản DB cũ (raw SQLite
-/// chưa gzip) upload lên Drive thời kỳ đầu vẫn restore được.
-/// Pub(crate) để `admin_view::admin_view_user_db` reuse — payload base64 từ
-/// Worker luôn gzipped, cần decompress trước khi write làm SQLite file.
-pub(crate) fn gunzip_if_needed(input: &[u8]) -> CmdResult<Vec<u8>> {
-    if input.len() >= 2 && input[0..2] == GZIP_MAGIC {
-        let mut decoder = GzDecoder::new(input);
-        let mut out = Vec::with_capacity(input.len() * 3);
-        decoder
-            .read_to_end(&mut out)
-            .map_err(|e| CmdError::msg(format!("gunzip: {e}")))?;
-        return Ok(out);
+/// Convenience: next HLC timestamp as RFC3339 string (cho manual_entries.updated_at).
+pub fn next_hlc_rfc3339(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
+    let ms = next_hlc_ms(conn)?;
+    Ok(ms_to_rfc3339(ms))
+}
+
+/// Sau merge, absorb max timestamp từ remote → local clock không bao giờ tụt
+/// sau máy khác. Silent no-op nếu remote_max_ms <= local.
+pub fn absorb_remote_clock(
+    conn: &rusqlite::Connection,
+    remote_max_ms: i64,
+) -> rusqlite::Result<()> {
+    if remote_max_ms <= 0 {
+        return Ok(());
     }
-    if input.len() >= SQLITE_MAGIC.len() && input[0..SQLITE_MAGIC.len()] == SQLITE_MAGIC {
-        return Ok(input.to_vec());
+    conn.execute(
+        "UPDATE sync_state
+         SET last_known_clock_ms = MAX(last_known_clock_ms, ?1)
+         WHERE id = 1",
+        [remote_max_ms],
+    )?;
+    Ok(())
+}
+
+/// Convert ms → RFC3339 UTC string. Fallback to Utc::now nếu invalid timestamp.
+pub fn ms_to_rfc3339(ms: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339()
+}
+
+/// Parse RFC3339 → ms. 0 on parse fail (safe default: không ảnh hưởng
+/// absorb_remote_clock vì 0 < mọi real timestamp).
+pub fn rfc3339_to_ms(s: &str) -> i64 {
+    use chrono::DateTime;
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// zstd magic bytes `28 B5 2F FD` — dùng để validate payload là zstd frame
+/// (detect corrupt hoặc wrong-format upload).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// Error message prefix signal FE rằng CAS etag mismatch → nên retry qua
+/// `sync_pull_merge_push`. FE check `msg.startsWith(ETAG_CONFLICT_PREFIX)`.
+pub const ETAG_CONFLICT_PREFIX: &str = "ETAG_CONFLICT";
+
+/// zstd compress level 3 — fast, ratio tương đương gzip L6. Multi-thread
+/// qua `NbWorkers` param để tận dụng CPU — trên laptop 4-8 core, compress
+/// 500MB DB từ ~60s (gzip single-thread) xuống ~15s.
+///
+/// Workers = `num_cpus / 2` để không độc chiếm CPU (UI còn responsive).
+/// Min 1 worker nếu máy 1-2 core.
+fn zstd_compress_mt(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    let workers = std::cmp::max(1, (num_cpus::get() / 2) as u32);
+    let mut compressor = zstd::bulk::Compressor::new(3)?;
+    // NbWorkers=0 = single-thread. >0 = MT mode.
+    let _ = compressor
+        .set_parameter(zstd::stream::raw::CParameter::NbWorkers(workers));
+    compressor.compress(input)
+}
+
+/// Decompress zstd payload. Validate magic trước để error message clear nếu
+/// ai đó upload sai format (vd file raw SQLite hay gzip legacy).
+///
+/// Dùng stream decode (grow buffer dynamic) thay vì bulk với fixed capacity
+/// — tránh fail khi data ratio cao (vd repetitive buffer nén >20×).
+pub(crate) fn zstd_decompress(input: &[u8]) -> CmdResult<Vec<u8>> {
+    use std::io::Read;
+    if input.len() < 4 || input[0..4] != ZSTD_MAGIC {
+        let head_hex: String = input
+            .iter()
+            .take(16)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(CmdError::msg(format!(
+            "payload không phải zstd frame — size={} bytes, head=[{}]",
+            input.len(),
+            head_hex,
+        )));
     }
-    let head_hex: String = input
-        .iter()
-        .take(16)
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Err(CmdError::msg(format!(
-        "payload không phải SQLite/gzip — size={} bytes, head=[{}]",
-        input.len(),
-        head_hex,
-    )))
+    let mut decoder = zstd::stream::read::Decoder::new(input)
+        .map_err(|e| CmdError::msg(format!("zstd decoder init: {e}")))?;
+    let mut out = Vec::with_capacity(input.len() * 5);
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| CmdError::msg(format!("zstd decompress: {e}")))?;
+    Ok(out)
+}
+
+/// Hash helper cho skip-identical: MD5 của compressed bytes → hex string.
+/// MD5 đủ cho dedup (collision practical ~0 với small bucket per-user), không
+/// cần crypto strength.
+fn md5_hex(bytes: &[u8]) -> String {
+    let digest = Md5::digest(bytes);
+    hex::encode(digest)
 }
 
 #[derive(Debug, Serialize)]
@@ -110,21 +208,24 @@ pub struct SyncState {
     pub owner_uid: Option<String>,
 }
 
-/// Compute machine fingerprint: MD5(os | hostname | machine-uid) → hex string.
-/// Ổn định across restarts trên cùng máy, khác giữa các máy khác nhau.
+/// Compute machine fingerprint: MD5(os | machine-uid) → hex string.
+/// Ổn định tối đa qua hardware re-config. Trước đây có kèm `hostname` nhưng bỏ
+/// vì user rename máy (Windows `COMPUTERNAME` đổi) làm fingerprint đổi → trigger
+/// merge loop vô ích mỗi startup.
+///
+/// `machine_uid` crate đọc MachineGuid từ registry (Windows) / /etc/machine-id
+/// (Linux) / IOPlatformUUID (macOS) — stable until OS reinstall. `os` component
+/// giữ để 1 ổ cứng boot dual-boot có fingerprint khác nhau (hiếm).
+///
+/// Migration: user hiện tại đã có fingerprint cũ lưu ở R2 customMetadata →
+/// sau upgrade, fingerprint mới khác cũ → trigger 1 lần pull-merge-push extra
+/// (one-time heal). Không mất data.
 pub fn machine_fingerprint_raw() -> String {
     let os = std::env::consts::OS;
-    let hostname = whoami_hostname().unwrap_or_else(|| "unknown-host".into());
     let machine_id = machine_uid::get().unwrap_or_else(|_| "unknown-uid".into());
-    let input = format!("{os}|{hostname}|{machine_id}");
+    let input = format!("{os}|{machine_id}");
     let digest = Md5::digest(input.as_bytes());
     hex::encode(digest)
-}
-
-fn whoami_hostname() -> Option<String> {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
 }
 
 /// Tauri command — frontend query fingerprint của máy hiện tại.
@@ -137,10 +238,21 @@ pub fn machine_fingerprint() -> String {
 /// khi upload, không cần endpoint "checkOrCreate" như Drive cũ.
 #[tauri::command]
 pub async fn sync_metadata(
+    db: State<'_, DbState>,
     sync_api_url: String,
     id_token: String,
 ) -> CmdResult<SyncMetadataResult> {
     let m = sync_client::metadata(&sync_api_url, &id_token).await?;
+    // Persist etag vào sync_state cho CAS upload kế tiếp. Nếu remote không
+    // tồn tại (etag=None) — giữ nguyên last_remote_etag cũ (có thể là của
+    // prior state trước khi user khác xóa object).
+    if let Some(ref etag) = m.etag {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        conn.execute(
+            "UPDATE sync_state SET last_remote_etag = ?1 WHERE id = 1",
+            params![etag],
+        )?;
+    }
     Ok(SyncMetadataResult {
         exists: m.exists,
         file_id: m.file_id,
@@ -199,6 +311,7 @@ pub async fn sync_state_get(db: State<'_, DbState>) -> CmdResult<SyncState> {
 pub async fn switch_db_to_user(
     app: AppHandle,
     db: State<'_, DbState>,
+    video_db: State<'_, VideoDbState>,
     new_uid: String,
 ) -> CmdResult<bool> {
     if new_uid.is_empty() {
@@ -299,6 +412,41 @@ pub async fn switch_db_to_user(
         *slot = new_conn;
     }
 
+    // 8. Swap video DB tương tự main DB (v8+ multi-tenant video logs).
+    //    Folder per-user: `users/{uid}/video_logs.db`. Isolation để User B login
+    //    cùng máy KHÔNG thấy download history của User A.
+    //    Migration legacy shared `{app_data}/video_logs.db`: chỉ move nếu user
+    //    này là user đầu tiên login sau upgrade (user's video DB chưa tồn tại).
+    //    User tiếp theo trên cùng máy sẽ start fresh (legacy đã bị move đi).
+    let user_video_db_path = crate::db::video_db::resolve_video_db_path_for_user(&app, &new_uid)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    if !user_video_db_path.exists() {
+        if let Ok(legacy_video) = crate::db::video_db::resolve_legacy_video_db_path(&app) {
+            if legacy_video.exists() && legacy_video != user_video_db_path {
+                eprintln!(
+                    "[switch_db] migrating legacy video DB → {}",
+                    user_video_db_path.display()
+                );
+                let _ = std_fs::rename(&legacy_video, &user_video_db_path);
+                for ext in &["db-wal", "db-shm"] {
+                    let src = legacy_video.with_extension(ext);
+                    if src.exists() {
+                        let _ = std_fs::rename(
+                            &src,
+                            user_video_db_path.with_extension(ext),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let new_video_conn = crate::db::video_db::init_video_db_at(&user_video_db_path)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    {
+        let mut slot = video_db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        *slot = new_video_conn;
+    }
+
     Ok(owner_changed)
 }
 
@@ -338,13 +486,16 @@ pub async fn sync_upload_db(
 
     let _ = fs::remove_file(&snapshot_path).await;
 
-    let change_id_at_snapshot: i64 = {
+    // Đọc change_id + expected_etag (CAS) + last_uploaded_hash (skip-identical).
+    let (change_id_at_snapshot, expected_etag, last_uploaded_hash) = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-        let (change_id, last_uploaded): (i64, i64) = conn.query_row(
-            "SELECT change_id, last_uploaded_change_id FROM sync_state WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let (change_id, last_uploaded, etag, hash): (i64, i64, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT change_id, last_uploaded_change_id, last_remote_etag, last_uploaded_hash
+                 FROM sync_state WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
         // Chặn case duy nhất gây mất data: local fresh (chưa có mutation nào
         // từ install này) + remote ĐÃ có data → upload sẽ đè mất backup cũ.
         // User mới hoàn toàn (remote_exists=false) vẫn upload được để khởi tạo.
@@ -358,7 +509,7 @@ pub async fn sync_upload_db(
             .ok_or_else(|| CmdError::msg("snapshot path không phải UTF-8"))?;
         conn.execute("VACUUM INTO ?1", params![path_str])
             .map_err(CmdError::from)?;
-        change_id
+        (change_id, etag, hash)
     };
 
     let bytes = fs::read(&snapshot_path).await.map_err(CmdError::from)?;
@@ -366,24 +517,74 @@ pub async fn sync_upload_db(
     let mtime_ms = now_ms();
     let fingerprint = machine_fingerprint_raw();
 
-    let gzipped = gzip_compress(&bytes)
-        .map_err(|e| CmdError::msg(format!("gzip: {e}")))?;
+    // Compress với zstd multi-thread. Large DB benefit đáng kể từ parallel.
+    let compressed = zstd_compress_mt(&bytes)
+        .map_err(|e| CmdError::msg(format!("zstd compress: {e}")))?;
     eprintln!(
-        "sync upload: raw={} KB → gzipped={} KB ({:.1}%)",
+        "sync upload: raw={} KB → zstd={} KB ({:.1}%)",
         raw_len / 1024,
-        gzipped.len() / 1024,
-        (gzipped.len() as f64 / raw_len.max(1) as f64) * 100.0,
+        compressed.len() / 1024,
+        (compressed.len() as f64 / raw_len.max(1) as f64) * 100.0,
     );
-    let base64 = BASE64.encode(&gzipped);
 
-    let res = sync_client::upload(&sync_api_url, &id_token, &base64, mtime_ms, &fingerprint)
-        .await?;
+    // Skip-identical: compute hash trước upload. Match last_uploaded_hash →
+    // payload giống hệt lần trước → skip upload (save bandwidth + Worker CPU).
+    // Chỉ update last_synced_at_ms để UI show "đã sync", clear dirty flag.
+    let payload_hash = md5_hex(&compressed);
+    if last_uploaded_hash.as_deref() == Some(payload_hash.as_str()) {
+        eprintln!("sync upload: payload identical to last — skip upload");
+        let _ = fs::remove_file(&snapshot_path).await;
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        // Clear dirty (CAS guard: chỉ clear nếu change_id không tăng thêm
+        // trong lúc compute).
+        conn.execute(
+            "UPDATE sync_state
+             SET dirty = CASE WHEN change_id > ?1 THEN 1 ELSE 0 END,
+                 last_uploaded_change_id = ?1,
+                 last_synced_at_ms = ?2,
+                 last_error = NULL
+             WHERE id = 1",
+            params![change_id_at_snapshot, now_ms()],
+        )?;
+        // Return synthetic result — không có upload thực sự nên file_id/size
+        // từ last known state. last_modified_ms = now để UI badge refresh.
+        return Ok(SyncUploadResult {
+            file_id: format!("users/{}/db.zst", "skipped"),
+            size_bytes: compressed.len() as u64,
+            last_modified_ms: now_ms(),
+            fingerprint,
+        });
+    }
+
+    // CAS upload: nếu etag R2 hiện tại khác expected_etag (máy khác upload
+    // trong lúc này), Worker trả 412 → trả lỗi `ETAG_CONFLICT:` để FE route
+    // sang `sync_pull_merge_push` + retry. Tránh ghi đè mất data máy khác.
+    let res = match sync_client::upload(
+        &sync_api_url,
+        &id_token,
+        &compressed,
+        mtime_ms,
+        &fingerprint,
+        expected_etag.as_deref(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(sync_client::UploadError::EtagConflict(msg)) => {
+            let _ = fs::remove_file(&snapshot_path).await;
+            return Err(CmdError::msg(format!("{ETAG_CONFLICT_PREFIX}: {msg}")));
+        }
+        Err(sync_client::UploadError::Other(e)) => {
+            let _ = fs::remove_file(&snapshot_path).await;
+            return Err(e);
+        }
+    };
 
     let _ = fs::remove_file(&snapshot_path).await;
     let remote_mtime = res.last_modified;
 
-    // CAS clear dirty CHỈ KHI change_id chưa tăng từ snapshot — tránh race với
-    // mutation xảy ra trong lúc upload.
+    // CAS clear dirty CHỈ KHI change_id chưa tăng từ snapshot. Lưu etag MỚI
+    // cho CAS upload lần sau + hash để skip-identical lần sau.
     {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         conn.execute(
@@ -392,9 +593,17 @@ pub async fn sync_upload_db(
                  last_uploaded_change_id = ?1,
                  last_synced_at_ms = ?2,
                  last_synced_remote_mtime_ms = ?3,
+                 last_remote_etag = ?4,
+                 last_uploaded_hash = ?5,
                  last_error = NULL
              WHERE id = 1",
-            params![change_id_at_snapshot, now_ms(), remote_mtime],
+            params![
+                change_id_at_snapshot,
+                now_ms(),
+                remote_mtime,
+                res.etag,
+                payload_hash
+            ],
         )?;
     }
 
@@ -416,14 +625,11 @@ pub async fn sync_download_db(
 ) -> CmdResult<SyncDownloadResult> {
     let dl = sync_client::download(&sync_api_url, &id_token).await?;
 
-    let raw_payload = BASE64
-        .decode(dl.base64_data.as_bytes())
-        .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
-
-    let bytes = gunzip_if_needed(&raw_payload)?;
+    // v8.1: payload là raw zstd bytes (không base64, không gzip).
+    let bytes = zstd_decompress(&dl.bytes)?;
     eprintln!(
         "sync_download_db: payload={} KB → sqlite={} KB",
-        raw_payload.len() / 1024,
+        dl.bytes.len() / 1024,
         bytes.len() / 1024,
     );
 
@@ -558,6 +764,11 @@ fn now_ms() -> i64 {
 // qua `imported_files.file_hash` để tìm id local tương ứng.
 // =============================================================
 
+/// Pull-merge-push với CAS retry (max 3 lần). Nếu 2 máy cùng upload song
+/// song, máy thua sẽ bị 412 khi push cuối → loop restart (re-metadata,
+/// re-download, re-merge, re-upload với etag mới). Merge idempotent
+/// (INSERT OR IGNORE + UPSERT by updated_at) nên re-merge không corrupt.
+/// Sau 3 lần thất bại → trả lỗi "ETAG_CONFLICT_EXHAUSTED" cho FE show warning.
 #[tauri::command]
 pub async fn sync_pull_merge_push(
     app: AppHandle,
@@ -565,26 +776,57 @@ pub async fn sync_pull_merge_push(
     sync_api_url: String,
     id_token: String,
 ) -> CmdResult<SyncUploadResult> {
+    const MAX_RETRIES: u32 = 3;
+    for attempt in 1..=MAX_RETRIES {
+        match sync_pull_merge_push_attempt(&app, &db, &sync_api_url, &id_token).await {
+            Ok(res) => return Ok(res),
+            Err(CmdError::Msg(msg)) if msg.starts_with(ETAG_CONFLICT_PREFIX) => {
+                if attempt >= MAX_RETRIES {
+                    return Err(CmdError::msg(format!(
+                        "ETAG_CONFLICT_EXHAUSTED: retried {MAX_RETRIES} lần vẫn bị máy khác đè. \
+                         Thử lại sau vài giây. Gốc: {msg}"
+                    )));
+                }
+                eprintln!(
+                    "[sync] CAS conflict attempt {attempt}/{MAX_RETRIES}, retry pull-merge-push"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("retry loop exits via return")
+}
+
+/// 1 attempt của pull-merge-push. Caller wrapper retry khi return
+/// `ETAG_CONFLICT` error.
+async fn sync_pull_merge_push_attempt(
+    app: &AppHandle,
+    db: &State<'_, DbState>,
+    sync_api_url: &str,
+    id_token: &str,
+) -> CmdResult<SyncUploadResult> {
     eprintln!("=== sync_pull_merge_push: START ===");
     // 1. Metadata check.
-    let meta = sync_client::metadata(&sync_api_url, &id_token).await?;
+    let meta = sync_client::metadata(sync_api_url, id_token).await?;
     let remote_exists = meta.exists;
     eprintln!(
-        "  metadata: exists={}, size={:?}, mtime={:?}",
-        remote_exists, meta.size_bytes, meta.last_modified
+        "  metadata: exists={}, size={:?}, mtime={:?}, etag={:?}",
+        remote_exists, meta.size_bytes, meta.last_modified, meta.etag
     );
 
     // 2. Download remote → temp path (nếu tồn tại).
+    // `expected_etag` = etag tại thời điểm download — upload cuối dùng làm CAS guard.
+    let mut expected_etag: Option<String> = None;
     let temp_path_opt: Option<PathBuf> = if remote_exists {
         let _ = app.emit("sync-phase", "downloading");
-        let dl = sync_client::download(&sync_api_url, &id_token).await?;
-        let raw_payload = BASE64
-            .decode(dl.base64_data.as_bytes())
-            .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
-        let bytes = gunzip_if_needed(&raw_payload)?;
+        let dl = sync_client::download(sync_api_url, id_token).await?;
+        expected_etag = dl.etag.clone();
+        // v8.1: raw zstd bytes — không còn base64/gzip.
+        let bytes = zstd_decompress(&dl.bytes)?;
         eprintln!(
             "  download: payload={} KB → sqlite={} KB",
-            raw_payload.len() / 1024,
+            dl.bytes.len() / 1024,
             bytes.len() / 1024,
         );
         let temp_path = app
@@ -623,44 +865,26 @@ pub async fn sync_pull_merge_push(
                 .map_err(CmdError::from)?;
 
             let merge_res: Result<(), CmdError> = (|| {
-                let before_days: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM main.days",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let remote_days: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM remote.days",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let remote_clicks: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM remote.raw_shopee_clicks",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let remote_orders: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM remote.raw_shopee_order_items",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let remote_fb: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM remote.raw_fb_ads",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let remote_manual: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM remote.manual_entries",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let remote_tombstones: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM remote.tombstones",
-                    [],
-                    |r| r.get(0),
-                )?;
-                eprintln!(
-                    "  pre-merge: local days={}, remote days={}, clicks={}, orders={}, fb_ads={}, manual={}, tombstones={}",
-                    before_days, remote_days, remote_clicks, remote_orders, remote_fb, remote_manual, remote_tombstones,
+                // Read max remote timestamps TRƯỚC merge — HLC absorb step.
+                // Parse RFC3339 → ms để so sánh + update last_known_clock_ms.
+                // Fail silent (0) nếu remote bảng rỗng hoặc format lạ.
+                let remote_max_manual_ts: String = conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(updated_at), '') FROM remote.manual_entries",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let remote_max_tomb_ts: String = conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(deleted_at), '') FROM remote.tombstones",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let remote_max_ms = std::cmp::max(
+                    rfc3339_to_ms(&remote_max_manual_ts),
+                    rfc3339_to_ms(&remote_max_tomb_ts),
                 );
 
                 let tx = conn.transaction().map_err(CmdError::from)?;
@@ -676,37 +900,11 @@ pub async fn sync_pull_merge_push(
                     [],
                 )
                 .map_err(CmdError::from)?;
+                // HLC absorb: bump last_known_clock_ms lên max remote ts.
+                // Mọi edit sau merge trên máy này sẽ > ts này → không flip.
+                absorb_remote_clock(&tx, remote_max_ms)
+                    .map_err(CmdError::from)?;
                 tx.commit().map_err(CmdError::from)?;
-
-                let after_days: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM main.days",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let after_clicks: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM main.raw_shopee_clicks",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let after_orders: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM main.raw_shopee_order_items",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let after_fb: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM main.raw_fb_ads",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let after_manual: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM main.manual_entries",
-                    [],
-                    |r| r.get(0),
-                )?;
-                eprintln!(
-                    "  post-merge: days={}, clicks={}, orders={}, fb_ads={}, manual={}",
-                    after_days, after_clicks, after_orders, after_fb, after_manual,
-                );
                 Ok(())
             })();
 
@@ -739,18 +937,42 @@ pub async fn sync_pull_merge_push(
     let mtime_ms = now_ms();
     let fingerprint = machine_fingerprint_raw();
 
-    let gzipped = gzip_compress(&bytes)
-        .map_err(|e| CmdError::msg(format!("gzip: {e}")))?;
+    let compressed = zstd_compress_mt(&bytes)
+        .map_err(|e| CmdError::msg(format!("zstd compress: {e}")))?;
     eprintln!(
-        "sync upload: raw={} KB → gzipped={} KB ({:.1}%)",
+        "sync upload: raw={} KB → zstd={} KB ({:.1}%)",
         raw_len / 1024,
-        gzipped.len() / 1024,
-        (gzipped.len() as f64 / raw_len.max(1) as f64) * 100.0,
+        compressed.len() / 1024,
+        (compressed.len() as f64 / raw_len.max(1) as f64) * 100.0,
     );
-    let base64 = BASE64.encode(&gzipped);
 
-    let res = sync_client::upload(&sync_api_url, &id_token, &base64, mtime_ms, &fingerprint)
-        .await?;
+    // Hash for skip-identical check trong merge flow: thường merge LUÔN khác
+    // snapshot trước (vì merge bring data mới), nên skip ít khi fire — nhưng
+    // vẫn tính cho edge case "pull-merge-push nhưng không có gì đổi thực sự".
+    let payload_hash = md5_hex(&compressed);
+
+    // Upload với CAS guard — `expected_etag` từ download (nếu remote exists).
+    // Remote không tồn tại → expected_etag=None → unconditional PUT (first init).
+    let res = match sync_client::upload(
+        sync_api_url,
+        id_token,
+        &compressed,
+        mtime_ms,
+        &fingerprint,
+        expected_etag.as_deref(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(sync_client::UploadError::EtagConflict(msg)) => {
+            let _ = fs::remove_file(&snapshot_path).await;
+            return Err(CmdError::msg(format!("{ETAG_CONFLICT_PREFIX}: {msg}")));
+        }
+        Err(sync_client::UploadError::Other(e)) => {
+            let _ = fs::remove_file(&snapshot_path).await;
+            return Err(e);
+        }
+    };
 
     let _ = fs::remove_file(&snapshot_path).await;
     let remote_mtime = res.last_modified;
@@ -763,9 +985,17 @@ pub async fn sync_pull_merge_push(
                  last_uploaded_change_id = ?1,
                  last_synced_at_ms = ?2,
                  last_synced_remote_mtime_ms = ?3,
+                 last_remote_etag = ?4,
+                 last_uploaded_hash = ?5,
                  last_error = NULL
              WHERE id = 1",
-            params![change_id_at_snapshot, now_ms(), remote_mtime],
+            params![
+                change_id_at_snapshot,
+                now_ms(),
+                remote_mtime,
+                res.etag,
+                payload_hash
+            ],
         )?;
     }
 
@@ -866,13 +1096,13 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
                   click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
                   price, quantity, order_value, refund_amount, net_commission, commission_total,
                   order_commission_total, mcn_fee,
-                  sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
+                  sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, day_date, source_file_id,
                   shopee_account_id)
                  SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
                         r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
                         r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
                         {mcn_select},
-                        r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id,
+                        r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.day_date, lif.id,
                         COALESCE(la.id, 1)
                  FROM remote.raw_shopee_order_items r
                  JOIN remote.imported_files rif ON rif.id = r.source_file_id
@@ -890,13 +1120,13 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
                   click_time, shop_id, shop_name, shop_type, item_name, category_l1, category_l2, category_l3,
                   price, quantity, order_value, refund_amount, net_commission, commission_total,
                   order_commission_total, mcn_fee,
-                  sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, raw_json, day_date, source_file_id,
+                  sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, channel, day_date, source_file_id,
                   shopee_account_id)
                  SELECT r.order_id, r.checkout_id, r.item_id, r.model_id, r.order_status, r.order_time, r.completed_time,
                         r.click_time, r.shop_id, r.shop_name, r.shop_type, r.item_name, r.category_l1, r.category_l2, r.category_l3,
                         r.price, r.quantity, r.order_value, r.refund_amount, r.net_commission, r.commission_total,
                         {mcn_select},
-                        r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.raw_json, r.day_date, lif.id, 1
+                        r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5, r.channel, r.day_date, lif.id, 1
                  FROM remote.raw_shopee_order_items r
                  JOIN remote.imported_files rif ON rif.id = r.source_file_id
                  JOIN main.imported_files lif ON lif.file_hash = rif.file_hash"
@@ -910,10 +1140,10 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
         "INSERT OR IGNORE INTO main.raw_fb_ads
          (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
           report_start, report_end, status, spend, clicks, cpc, impressions, reach,
-          raw_json, day_date, source_file_id)
+          day_date, source_file_id)
          SELECT r.level, r.name, r.sub_id1, r.sub_id2, r.sub_id3, r.sub_id4, r.sub_id5,
                 r.report_start, r.report_end, r.status, r.spend, r.clicks, r.cpc, r.impressions, r.reach,
-                r.raw_json, r.day_date, lif.id
+                r.day_date, lif.id
          FROM remote.raw_fb_ads r
          JOIN remote.imported_files rif ON rif.id = r.source_file_id
          JOIN main.imported_files lif ON lif.file_hash = rif.file_hash",
@@ -989,6 +1219,17 @@ fn merge_remote_into_local(tx: &rusqlite::Transaction) -> CmdResult<()> {
 
 /// Apply tất cả tombstones trong local DB. Thứ tự: 'day' (CASCADE raw) →
 /// 'manual_entry' (exact key) → 'ui_row' (exact manual + prefix-compatible raw).
+///
+/// **Timestamp semantics (v8+):** Với manual_entries (có `updated_at`), chỉ
+/// DELETE nếu `updated_at <= tombstone.deleted_at` — tức là delete tombstone
+/// chỉ thắng khi row chưa có edit mới hơn. Nếu máy B edit row SAU khi máy A
+/// delete, edit của B sẽ "resurrect" row khi merge → không bị mất edit.
+///
+/// Raw tables KHÔNG có `updated_at` → vẫn DELETE unconditional. Acceptable vì
+/// raw data đến từ CSV, immutable — user re-import sẽ tạo row mới với PK giống.
+///
+/// 'day' tombstone vẫn CASCADE unconditional — delete cả ngày là user intent
+/// rõ ràng hơn, không nên auto-resurrect dựa trên edit nhỏ.
 fn apply_tombstones(tx: &rusqlite::Transaction) -> CmdResult<()> {
     use crate::commands::query::{is_prefix, to_canonical};
 
@@ -1000,34 +1241,49 @@ fn apply_tombstones(tx: &rusqlite::Transaction) -> CmdResult<()> {
         [],
     )?;
 
-    // 2. 'manual_entry' tombstones — parse key, DELETE manual_entries exact match.
-    let manual_keys: Vec<String> = {
+    // 2. 'manual_entry' tombstones — parse key, DELETE manual_entries exact match
+    //    CHỈ khi row.updated_at <= tombstone.deleted_at (resurrect rule).
+    let manual_keys: Vec<(String, String)> = {
         let mut stmt = tx.prepare(
-            "SELECT entity_key FROM tombstones WHERE entity_type = 'manual_entry'",
+            "SELECT entity_key, deleted_at FROM tombstones WHERE entity_type = 'manual_entry'",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for key in manual_keys {
+    for (key, deleted_at) in manual_keys {
         if let Some((day, sub_ids)) = parse_tombstone_sub_key(&key) {
             tx.execute(
                 "DELETE FROM manual_entries
                  WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
-                   AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
-                params![sub_ids[0], sub_ids[1], sub_ids[2], sub_ids[3], sub_ids[4], day],
+                   AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?
+                   AND updated_at <= ?",
+                params![
+                    sub_ids[0],
+                    sub_ids[1],
+                    sub_ids[2],
+                    sub_ids[3],
+                    sub_ids[4],
+                    day,
+                    deleted_at
+                ],
             )?;
         }
     }
 
-    // 3. 'ui_row' tombstones — parse key, DELETE manual_entries exact + raw prefix-compatible.
-    let ui_keys: Vec<String> = {
+    // 3. 'ui_row' tombstones — parse key, DELETE manual_entries exact (timestamp
+    //    guard) + raw prefix-compatible (unconditional vì raw không có updated_at).
+    let ui_keys: Vec<(String, String)> = {
         let mut stmt = tx.prepare(
-            "SELECT entity_key FROM tombstones WHERE entity_type = 'ui_row'",
+            "SELECT entity_key, deleted_at FROM tombstones WHERE entity_type = 'ui_row'",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for key in ui_keys {
+    for (key, deleted_at) in ui_keys {
         let Some((day, sub_ids)) = parse_tombstone_sub_key(&key) else {
             continue;
         };
@@ -1035,8 +1291,17 @@ fn apply_tombstones(tx: &rusqlite::Transaction) -> CmdResult<()> {
         tx.execute(
             "DELETE FROM manual_entries
              WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
-               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
-            params![sub_ids[0], sub_ids[1], sub_ids[2], sub_ids[3], sub_ids[4], day],
+               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?
+               AND updated_at <= ?",
+            params![
+                sub_ids[0],
+                sub_ids[1],
+                sub_ids[2],
+                sub_ids[3],
+                sub_ids[4],
+                day,
+                deleted_at
+            ],
         )?;
 
         let target = to_canonical(sub_ids);
@@ -1111,4 +1376,236 @@ fn parse_tombstone_sub_key(key: &str) -> Option<(String, [String; 5])> {
             parts[5].to_string(),
         ],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_conn_with_sync_state() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sync_state (
+                id                            INTEGER PRIMARY KEY CHECK (id = 1),
+                dirty                         INTEGER NOT NULL DEFAULT 1,
+                last_synced_at_ms             INTEGER,
+                last_synced_remote_mtime_ms   INTEGER,
+                last_error                    TEXT,
+                change_id                     INTEGER NOT NULL DEFAULT 0,
+                last_uploaded_change_id       INTEGER NOT NULL DEFAULT 0,
+                owner_uid                     TEXT,
+                last_known_clock_ms           INTEGER NOT NULL DEFAULT 0,
+                last_remote_etag              TEXT
+            );
+            INSERT INTO sync_state (id) VALUES (1);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn hlc_monotonic_in_one_process() {
+        // next_hlc_ms phải luôn trả value tăng monotone kể cả khi gọi nhanh
+        // trong cùng 1ms (counter phần).
+        let conn = test_conn_with_sync_state();
+        let a = next_hlc_ms(&conn).unwrap();
+        let b = next_hlc_ms(&conn).unwrap();
+        let c = next_hlc_ms(&conn).unwrap();
+        assert!(a < b, "HLC must be monotonic: {a} < {b}");
+        assert!(b < c, "HLC must be monotonic: {b} < {c}");
+    }
+
+    #[test]
+    fn hlc_absorb_remote_clock_bumps_local() {
+        // Simulate merge scenario: remote có timestamp 10 phút future → local
+        // absorb → next HLC phải > remote.
+        let conn = test_conn_with_sync_state();
+        let future_ms = chrono::Utc::now().timestamp_millis() + 10 * 60 * 1000;
+        absorb_remote_clock(&conn, future_ms).unwrap();
+        let next = next_hlc_ms(&conn).unwrap();
+        assert!(
+            next > future_ms,
+            "after absorb remote future clock, next HLC {next} must > {future_ms}"
+        );
+    }
+
+    #[test]
+    fn hlc_no_backward_slip_with_remote_older() {
+        // Remote timestamp cũ hơn local → absorb no-op, không gây tụt clock.
+        let conn = test_conn_with_sync_state();
+        let first = next_hlc_ms(&conn).unwrap();
+        // Giả sử remote từ 1 giờ trước.
+        absorb_remote_clock(&conn, first - 3_600_000).unwrap();
+        let next = next_hlc_ms(&conn).unwrap();
+        assert!(
+            next > first,
+            "absorb older remote không được tụt clock: next {next} must > first {first}"
+        );
+    }
+
+    #[test]
+    fn rfc3339_roundtrip() {
+        let original_ms = 1_700_000_000_000_i64; // 2023-11-14 22:13:20 UTC
+        let s = ms_to_rfc3339(original_ms);
+        let back = rfc3339_to_ms(&s);
+        assert_eq!(back, original_ms, "RFC3339 round-trip must preserve ms");
+    }
+
+    #[test]
+    fn rfc3339_parse_invalid_returns_zero() {
+        assert_eq!(rfc3339_to_ms(""), 0);
+        assert_eq!(rfc3339_to_ms("not-a-date"), 0);
+    }
+
+    #[test]
+    fn apply_tombstones_respects_updated_at() {
+        // Setup: DB có manual_entries row với updated_at mới hơn deleted_at
+        // của tombstone tương ứng → apply_tombstones phải giữ row (resurrect rule).
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE manual_entries (
+                sub_id1 TEXT NOT NULL, sub_id2 TEXT NOT NULL, sub_id3 TEXT NOT NULL,
+                sub_id4 TEXT NOT NULL, sub_id5 TEXT NOT NULL, day_date TEXT NOT NULL,
+                display_name TEXT, override_clicks INTEGER, override_spend REAL,
+                override_cpc REAL, override_orders INTEGER, override_commission REAL,
+                notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                shopee_account_id INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date)
+            );
+            CREATE TABLE days (date TEXT PRIMARY KEY, created_at TEXT, notes TEXT);
+            CREATE TABLE tombstones (
+                entity_type TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                deleted_at TEXT NOT NULL,
+                UNIQUE(entity_type, entity_key)
+            );
+            INSERT INTO days(date) VALUES ('2026-04-23');
+            -- Row với updated_at NEW hơn tombstone deleted_at
+            INSERT INTO manual_entries
+              (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date,
+               created_at, updated_at)
+              VALUES ('a', 'b', '', '', '', '2026-04-23',
+                      '2026-04-23T10:00:00Z', '2026-04-23T12:00:00Z');
+            -- Tombstone với deleted_at SỚM hơn row edit → row should survive
+            INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+              VALUES ('manual_entry', '2026-04-23|a|b|||', '2026-04-23T11:00:00Z');",
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        apply_tombstones(&tx).unwrap();
+        tx.commit().unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manual_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "row với updated_at > tombstone.deleted_at phải survive apply_tombstones"
+        );
+    }
+
+    #[test]
+    fn apply_tombstones_deletes_older_row() {
+        // Opposite case: row updated_at OLDER than tombstone deleted_at → row
+        // phải bị xóa (delete came after edit).
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE manual_entries (
+                sub_id1 TEXT NOT NULL, sub_id2 TEXT NOT NULL, sub_id3 TEXT NOT NULL,
+                sub_id4 TEXT NOT NULL, sub_id5 TEXT NOT NULL, day_date TEXT NOT NULL,
+                display_name TEXT, override_clicks INTEGER, override_spend REAL,
+                override_cpc REAL, override_orders INTEGER, override_commission REAL,
+                notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                shopee_account_id INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date)
+            );
+            CREATE TABLE days (date TEXT PRIMARY KEY, created_at TEXT, notes TEXT);
+            CREATE TABLE tombstones (
+                entity_type TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                deleted_at TEXT NOT NULL,
+                UNIQUE(entity_type, entity_key)
+            );
+            INSERT INTO days(date) VALUES ('2026-04-23');
+            -- Row với updated_at OLDER than tombstone deleted_at
+            INSERT INTO manual_entries
+              (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date,
+               created_at, updated_at)
+              VALUES ('a', 'b', '', '', '', '2026-04-23',
+                      '2026-04-23T09:00:00Z', '2026-04-23T10:00:00Z');
+            -- Tombstone deleted AFTER edit → delete wins
+            INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+              VALUES ('manual_entry', '2026-04-23|a|b|||', '2026-04-23T11:00:00Z');",
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        apply_tombstones(&tx).unwrap();
+        tx.commit().unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manual_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "row với updated_at < tombstone.deleted_at phải bị xóa"
+        );
+    }
+
+    #[test]
+    fn fingerprint_stable_across_calls() {
+        // Fingerprint phải deterministic trên cùng máy — gọi 2 lần ra kết quả giống.
+        let fp1 = machine_fingerprint_raw();
+        let fp2 = machine_fingerprint_raw();
+        assert_eq!(fp1, fp2, "fingerprint phải stable trong cùng máy");
+        assert_eq!(fp1.len(), 32, "MD5 hex = 32 chars");
+    }
+
+    #[test]
+    fn zstd_roundtrip_preserves_bytes() {
+        // Compress + decompress phải return bytes y hệt.
+        let input = b"SQLite format 3\0\x10\x00\x01\x01\x00\x40\x20\x20".repeat(1000);
+        let compressed = zstd_compress_mt(&input).unwrap();
+        assert!(compressed.len() < input.len(), "nén phải smaller");
+        let head = &compressed[0..4];
+        assert_eq!(head, ZSTD_MAGIC, "compressed output phải có zstd magic");
+        let decompressed = zstd_decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "zstd round-trip phải preserve bytes");
+    }
+
+    #[test]
+    fn zstd_decompress_rejects_non_zstd() {
+        // Not zstd magic → error với message clear.
+        let fake = b"\x1f\x8b\x08\x00random gzip-ish".to_vec();
+        let err = zstd_decompress(&fake).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("zstd") || msg.contains("payload"),
+            "error message phải mention format: {msg}"
+        );
+    }
+
+    #[test]
+    fn zstd_compresses_large_ratio() {
+        // SQLite-like repetitive data nén zstd ratio > 5×.
+        let input = vec![0u8; 100_000];
+        let compressed = zstd_compress_mt(&input).unwrap();
+        let ratio = input.len() as f64 / compressed.len() as f64;
+        assert!(
+            ratio > 5.0,
+            "zstd trên data repetitive phải ratio > 5× (got {ratio:.1}×)"
+        );
+    }
+
+    #[test]
+    fn md5_hex_deterministic() {
+        let a = md5_hex(b"hello world");
+        let b = md5_hex(b"hello world");
+        let c = md5_hex(b"hello worlD"); // different
+        assert_eq!(a, b, "MD5 deterministic");
+        assert_ne!(a, c, "different input → different hash");
+        assert_eq!(a.len(), 32, "MD5 hex = 32 chars");
+    }
 }

@@ -6,14 +6,34 @@
     <title>Shopee Affiliate Tracker</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Inter: `display=swap` để text không block render. Material Symbols:
+         `display=block` để ẩn literal icon-name (vd "cloud_sync") cho tới khi
+         font load xong — tránh user thấy text thô khi splash screen khởi động. -->
     <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0,0&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0,0&display=block"
       rel="stylesheet"
     />
   </head>
 
   <body>
     <div id="root"></div>
+    <!-- Font readiness guard: `.fonts-loaded` class set khi browser đã load
+         xong TẤT CẢ font (Inter + Material Symbols). CSS dưới ẩn icon text
+         thô cho tới khi class này được set → không thấy "cloud_sync" literal. -->
+    <script>
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(function () {
+          document.documentElement.classList.add("fonts-loaded");
+        });
+      } else {
+        // Browser cũ không support Font Loading API → assume loaded ngay.
+        document.documentElement.classList.add("fonts-loaded");
+      }
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -352,7 +352,8 @@ pub struct ShopeeOrderRow {
     pub mcn_fee: Option<f64>,
     pub sub_ids: [String; 5],
     pub channel: Option<String>,
-    pub raw_json: Option<String>,
+    // raw_json removed v9 — CSV gốc lưu imports/<hash>.csv. FE vẫn có thể
+    // send `rawJson` trong JSON payload, serde ignore field không biết.
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,8 +446,8 @@ pub fn import_shopee_orders(
               price, quantity, order_value, refund_amount,
               net_commission, commission_total, order_commission_total, mcn_fee,
               sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-              channel, raw_json, day_date, source_file_id, shopee_account_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              channel, day_date, source_file_id, shopee_account_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(checkout_id, item_id, model_id) DO UPDATE SET
                 order_status   = excluded.order_status,
                 order_time     = excluded.order_time,
@@ -460,7 +461,6 @@ pub fn import_shopee_orders(
                 commission_total = excluded.commission_total,
                 order_commission_total = excluded.order_commission_total,
                 mcn_fee        = excluded.mcn_fee,
-                raw_json       = excluded.raw_json,
                 source_file_id = excluded.source_file_id,
                 shopee_account_id = excluded.shopee_account_id,
                 day_date       = excluded.day_date",
@@ -515,7 +515,6 @@ pub fn import_shopee_orders(
                 r.sub_ids[3],
                 r.sub_ids[4],
                 r.channel,
-                r.raw_json,
                 day_date,
                 source_file_id,
                 shopee_account_id,
@@ -597,7 +596,7 @@ pub struct FbAdGroupRow {
     pub cpm: Option<f64>,
     pub result_count: Option<i64>,
     pub cost_per_result: Option<f64>,
-    pub raw_json: Option<String>,
+    // raw_json removed v9 — CSV gốc lưu imports/<hash>.csv.
 }
 
 /// Normalize click count: ưu tiên link_clicks → all_clicks → result_count.
@@ -718,7 +717,6 @@ pub fn import_fb_ad_groups(
                 cpc,
                 r.impressions,
                 r.reach,
-                r.raw_json,
                 day_date,
                 source_file_id,
             ])?;
@@ -752,8 +750,8 @@ const FB_ADS_UPSERT_SQL: &str = "
      sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
      report_start, report_end, status,
      spend, clicks, cpc, impressions, reach,
-     raw_json, day_date, source_file_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     day_date, source_file_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(day_date, level, name) DO UPDATE SET
        sub_id1 = excluded.sub_id1, sub_id2 = excluded.sub_id2,
        sub_id3 = excluded.sub_id3, sub_id4 = excluded.sub_id4,
@@ -762,7 +760,7 @@ const FB_ADS_UPSERT_SQL: &str = "
        status = excluded.status,
        spend = excluded.spend, clicks = excluded.clicks, cpc = excluded.cpc,
        impressions = excluded.impressions, reach = excluded.reach,
-       raw_json = excluded.raw_json, source_file_id = excluded.source_file_id
+       source_file_id = excluded.source_file_id
 ";
 
 // ============================================================
@@ -787,7 +785,7 @@ pub struct FbCampaignRow {
     pub link_cpc: Option<f64>,
     pub all_cpc: Option<f64>,
     pub cost_per_result: Option<f64>,
-    pub raw_json: Option<String>,
+    // raw_json removed v9 — CSV gốc lưu imports/<hash>.csv.
 }
 
 #[derive(Debug, Deserialize)]
@@ -862,7 +860,6 @@ pub fn import_fb_campaigns(
                 cpc,
                 r.impressions,
                 r.reach,
-                r.raw_json,
                 day_date,
                 source_file_id,
             ])?;

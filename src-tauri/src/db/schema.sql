@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS raw_shopee_order_items (
     sub_id4            TEXT NOT NULL DEFAULT '',
     sub_id5            TEXT NOT NULL DEFAULT '',
     channel            TEXT,
-    raw_json           TEXT,              -- JSON blob các field phụ (rate, MCN fee, note...)
+    -- raw_json column dropped v9 — không read, CSV file gốc lưu imports/<hash>.csv
     day_date           TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
     source_file_id     INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
     UNIQUE(checkout_id, item_id, model_id)
@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS raw_fb_ads (
     cpc                REAL,                       -- normalized
     impressions        INTEGER,
     reach              INTEGER,
-    raw_json           TEXT,                       -- các field phụ (frequency, CTR, CPM, landing_views, shop_clicks, result_indicator, cost_per_result, ...)
+    -- raw_json column dropped v9 — không read, CSV file gốc lưu imports/<hash>.csv
     day_date           TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
     source_file_id     INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
     UNIQUE(day_date, level, name)
@@ -187,7 +187,16 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_synced_remote_mtime_ms   INTEGER,
     last_error                    TEXT,
     change_id                     INTEGER NOT NULL DEFAULT 0,
-    last_uploaded_change_id       INTEGER NOT NULL DEFAULT 0
+    last_uploaded_change_id       INTEGER NOT NULL DEFAULT 0,
+    owner_uid                     TEXT,
+    -- v8 HLC-lite: timestamp monotonic counter chống clock drift giữa 2 máy.
+    last_known_clock_ms           INTEGER NOT NULL DEFAULT 0,
+    -- v8 CAS upload: etag R2 lần cuối sync thành công. Next upload attach
+    -- expected etag → Worker reject 412 nếu stale.
+    last_remote_etag              TEXT,
+    -- v8.1 skip-identical: MD5 của compressed bytes lần upload gần nhất.
+    -- Next upload compute hash → match → skip (save bandwidth).
+    last_uploaded_hash            TEXT
 );
 
 -- Seed singleton. Lần đầu: dirty=1 để force upload local data (nếu có).

@@ -18,6 +18,8 @@ import {
 } from "../lib/screenshot";
 import { DayScreenshotDialog } from "./DayScreenshotDialog";
 import { ScrollToTopButton } from "./ScrollToTopButton";
+import { ProductClickInsights } from "./ProductClickInsights";
+import type { AccountFilterMode } from "../hooks/useDbStats";
 
 interface AggregateProductDialogProps {
   isOpen: boolean;
@@ -25,6 +27,8 @@ interface AggregateProductDialogProps {
   /** Days đã load ở tab Overview — dialog tự filter rows match subIds. */
   days: UiDay[];
   source: SourceFilter;
+  /** Account filter từ parent — dùng cho BE click insights queries. */
+  accountFilter?: AccountFilterMode;
   onClose: () => void;
 }
 
@@ -33,6 +37,7 @@ export function AggregateProductDialog({
   product,
   days,
   source,
+  accountFilter,
   onClose,
 }: AggregateProductDialogProps) {
   useSettings(); // subscribe để tự re-render khi profitFees đổi (không dùng trực tiếp ở đây)
@@ -135,6 +140,22 @@ export function AggregateProductDialog({
     () => new Set(items.map((i) => i.orderId)).size,
     [items],
   );
+
+  // Product insights filter — derive date range từ days prop. Days list
+  // sorted DESC (newest first) → first=to, last=from. ProductClickInsights
+  // fetch 4 BE aggregates (hourly clicks, hourly orders, delays, referrer)
+  // scoped theo sub_ids của product.
+  const insightsFilter = useMemo(() => {
+    if (!product) return null;
+    const fromDate = days.length > 0 ? days[days.length - 1].date : undefined;
+    const toDate = days.length > 0 ? days[0].date : undefined;
+    return {
+      fromDate,
+      toDate,
+      accountFilter,
+      subIds: product.subIds as unknown as [string, string, string, string, string],
+    };
+  }, [product, days, accountFilter]);
   const cancelledCount = useMemo(
     () => items.filter((i) => /hủy|cancel/i.test(i.orderStatus ?? "")).length,
     [items],
@@ -360,6 +381,9 @@ export function AggregateProductDialog({
               />
             </div>
           </Section>
+
+          {/* ============ Phân tích click Shopee (scope theo sub_ids) ============ */}
+          {insightsFilter && <ProductClickInsights filter={insightsFilter} />}
 
           {/* ============ Tất cả đơn hàng ============ */}
           <Section

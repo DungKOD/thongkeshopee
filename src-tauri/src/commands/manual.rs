@@ -7,13 +7,13 @@
 //!
 //! Batch delete của "Lưu thay đổi" → xem `commands::batch`.
 
-use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 use tauri::State;
 
 use crate::db::types::{ManualEntryInput, ManualRowKey};
 use crate::db::{tombstone_key_sub, DbState};
 
+use super::sync::next_hlc_rfc3339;
 use super::{CmdError, CmdResult};
 
 #[tauri::command]
@@ -23,7 +23,10 @@ pub fn save_manual_entry(
 ) -> CmdResult<()> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let tx = conn.transaction()?;
-    let now = Utc::now().to_rfc3339();
+    // HLC-lite: ensure updated_at monotonic across machines. Thay `Utc::now`
+    // bằng `next_hlc_rfc3339` để clock drift của máy local không làm edit này
+    // "trông như" sớm hơn edit đã thấy từ remote.
+    let now = next_hlc_rfc3339(&tx)?;
 
     tx.execute(
         "INSERT OR IGNORE INTO days(date, created_at) VALUES(?, ?)",
@@ -92,7 +95,9 @@ pub fn delete_manual_entry(
 ) -> CmdResult<()> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let tx = conn.transaction()?;
-    let now = Utc::now().to_rfc3339();
+    // HLC-lite: tombstone.deleted_at cũng phải monotonic để so sánh với
+    // row.updated_at từ máy khác (xem apply_tombstones có check updated_at).
+    let now = next_hlc_rfc3339(&tx)?;
 
     tx.execute(
         "DELETE FROM manual_entries

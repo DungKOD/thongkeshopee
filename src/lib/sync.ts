@@ -125,8 +125,13 @@ export interface AdminUserListCache {
 }
 
 /// Đọc user list cache (DB local). null = chưa fetch bao giờ → FE fallback rỗng.
-export function adminReadUserListCache(): Promise<AdminUserListCache | null> {
-  return invoke<AdminUserListCache | null>("admin_read_user_list_cache");
+/// Require admin claim (defense-in-depth; primary auth ở Worker khi fetch).
+export function adminReadUserListCache(
+  idToken: string,
+): Promise<AdminUserListCache | null> {
+  return invoke<AdminUserListCache | null>("admin_read_user_list_cache", {
+    idToken,
+  });
 }
 
 /// Fetch user list từ Worker → replace cache → trả về. Background revalidate.

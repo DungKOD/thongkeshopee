@@ -1,18 +1,42 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { UiDay } from "../types";
+import { invoke } from "../lib/tauri";
+import type { AccountFilterMode, DaysFilter } from "../hooks/useDbStats";
 import {
   aggregateProductRows,
+  computeAdsEfficiency,
+  computeBreakeven,
+  computeCumulativeTrend,
+  computeDailyTrend,
+  computeExtremumDays,
+  computeFunnel,
+  computeLosers,
+  computeMinSpendThreshold,
   computeOverviewTotals,
+  computeWinners,
   fmtDate,
   fmtInt,
   fmtPct,
   fmtVnd,
+  profitTone,
+  roiTone,
+  toneTextClass,
   type AggregatedProductRow,
   type OverviewTotals,
   type SourceFilter,
+  type Tone,
 } from "../formulas";
 import { useSettings } from "../hooks/useSettings";
 import { AggregateProductDialog } from "./AggregateProductDialog";
+import { OverviewTrendChart } from "./OverviewTrendChart";
+import { OverviewAdsInsights } from "./OverviewAdsInsights";
+import { HourlyChart, type HourlyBucket } from "./HourlyChart";
+import {
+  ClickDelayChart,
+  ReferrerEfficiencyTable,
+  type DelayBucket,
+  type ReferrerEfficiency,
+} from "./OverviewClickInsights";
 
 interface OverviewTabProps {
   days: UiDay[];
@@ -21,6 +45,22 @@ interface OverviewTabProps {
   dateTo: string;
   /** Tổng ngày trong DB — so sánh với daysCount thực tế để user biết đang xem bao nhiêu. */
   totalDaysInDb: number;
+  /** Filter hiện tại truyền từ AppInner — dùng cho `load_hourly_orders` BE
+   *  aggregate theo đúng khoảng + account mà user đang xem. */
+  currentFilter: DaysFilter;
+  accountFilter: AccountFilterMode;
+}
+
+interface HourlyOrderBucketDto {
+  hour: number;
+  orders: number;
+  orderValue: number;
+  commission: number;
+}
+
+interface HourlyClickBucketDto {
+  hour: number;
+  clicks: number;
 }
 
 const SOURCE_OPTIONS: Array<{ id: SourceFilter; label: string; icon: string; desc: string }> = [
@@ -100,27 +140,138 @@ export function OverviewTab({
   dateFrom,
   dateTo,
   totalDaysInDb,
+  currentFilter,
+  accountFilter,
 }: OverviewTabProps) {
   const { settings } = useSettings();
   const [source, setSource] = useState<SourceFilter>("all");
   const [selectedProduct, setSelectedProduct] =
     useState<AggregatedProductRow | null>(null);
 
-  const totals = useMemo(
-    () => computeOverviewTotals(days, settings.clickSources, settings.profitFees, source),
-    [days, settings.clickSources, settings.profitFees, source],
-  );
-
-  const products = useMemo(() => {
-    const rows = aggregateProductRows(
+  // Single useMemo cho toàn bộ analytics — tất cả đều re-compute cùng lúc
+  // khi filter đổi. Gộp để tránh 11 cascading useMemo với deps trùng nhau
+  // (mỗi lần days/settings/source đổi sẽ fire 11 separate memo invalidations).
+  const analytics = useMemo(() => {
+    const totals = computeOverviewTotals(
       days,
       settings.clickSources,
       settings.profitFees,
       source,
     );
-    rows.sort((a, b) => b.profit - a.profit);
-    return rows;
+    const products = aggregateProductRows(
+      days,
+      settings.clickSources,
+      settings.profitFees,
+      source,
+    );
+    products.sort((a, b) => b.profit - a.profit);
+
+    const trendData = computeDailyTrend(
+      days,
+      settings.clickSources,
+      settings.profitFees,
+      source,
+    );
+    const cumulativeData = computeCumulativeTrend(trendData);
+    const breakeven = computeBreakeven(totals, settings.profitFees);
+    const funnel = computeFunnel(totals);
+    const efficiency = computeAdsEfficiency(totals);
+    const { best: bestDay, worst: worstDay } = computeExtremumDays(trendData);
+    const minSpend = computeMinSpendThreshold(products);
+    const winners = computeWinners(products, minSpend, 5);
+    const losers = computeLosers(products, minSpend, 5);
+
+    return {
+      totals,
+      products,
+      trendData,
+      cumulativeData,
+      breakeven,
+      funnel,
+      efficiency,
+      bestDay,
+      worstDay,
+      winners,
+      losers,
+    };
   }, [days, settings.clickSources, settings.profitFees, source]);
+  const {
+    totals,
+    products,
+    trendData,
+    cumulativeData,
+    breakeven,
+    funnel,
+    efficiency,
+    bestDay,
+    worstDay,
+    winners,
+    losers,
+  } = analytics;
+
+  // 4 BE aggregates dưới đây fetch song song khi filter đổi (date range /
+  // account). KHÔNG pass subIdFilter — Overview scope là all products.
+  // Overlay clicks lên HourlyBucket thay vì giữ 2 state riêng — HourlyChart
+  // nhận cả 2 dataset với `metric` khác nhau.
+  const [hourlyOrders, setHourlyOrders] = useState<HourlyBucket[]>([]);
+  const [hourlyClicks, setHourlyClicks] = useState<HourlyBucket[]>([]);
+  const [referrerEff, setReferrerEff] = useState<ReferrerEfficiency[]>([]);
+  const [clickDelays, setClickDelays] = useState<DelayBucket[]>([]);
+  const [clickInsightsLoading, setClickInsightsLoading] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setClickInsightsLoading(true);
+    const beFilter: DaysFilter = {
+      fromDate: currentFilter.fromDate,
+      toDate: currentFilter.toDate,
+      limit: currentFilter.limit,
+      accountFilter,
+    };
+    Promise.all([
+      invoke<HourlyOrderBucketDto[]>("load_hourly_orders", { filter: beFilter }),
+      invoke<HourlyClickBucketDto[]>("load_hourly_clicks", { filter: beFilter }),
+      invoke<ReferrerEfficiency[]>("load_referrer_efficiency", { filter: beFilter }),
+      invoke<DelayBucket[]>("load_click_order_delays", { filter: beFilter }),
+    ])
+      .then(([orders, clicks, referrers, delays]) => {
+        if (cancelled) return;
+        setHourlyOrders(
+          orders.map((b) => ({
+            hour: b.hour,
+            orders: b.orders,
+            orderValue: b.orderValue,
+            commission: b.commission,
+            clicks: 0,
+          })),
+        );
+        setHourlyClicks(
+          clicks.map((b) => ({
+            hour: b.hour,
+            orders: 0,
+            orderValue: 0,
+            commission: 0,
+            clicks: b.clicks,
+          })),
+        );
+        setReferrerEff(referrers);
+        setClickDelays(delays);
+      })
+      .catch((e) => {
+        console.error("[overview click insights] load failed:", e);
+        if (!cancelled) {
+          setHourlyOrders([]);
+          setHourlyClicks([]);
+          setReferrerEff([]);
+          setClickDelays([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setClickInsightsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentFilter.fromDate, currentFilter.toDate, currentFilter.limit, accountFilter]);
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-6">
@@ -200,6 +351,51 @@ export function OverviewTab({
       {/* ============ KPI secondary (nhỏ) ============ */}
       <SecondaryKpiRow totals={totals} source={source} />
 
+      {/* ============ Trend chart (3 modes: finance / ROI / cumulative) ============ */}
+      <OverviewTrendChart
+        data={trendData}
+        cumulative={cumulativeData}
+        showAds={source === "all"}
+      />
+
+      {/* ============ Hourly clicks + orders (side-by-side) ============ */}
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <HourlyChart
+          data={hourlyClicks}
+          title="Giờ click Shopee nhiều nhất"
+          metric="clicks"
+          icon="mouse"
+          loading={clickInsightsLoading}
+        />
+        <HourlyChart
+          data={hourlyOrders}
+          title="Giờ mua hàng nhiều nhất"
+          metric="orders"
+          icon="schedule"
+          loading={clickInsightsLoading}
+        />
+      </section>
+
+      {/* ============ Click-to-order delay histogram ============ */}
+      <ClickDelayChart data={clickDelays} />
+
+      {/* ============ Referrer efficiency leaderboard ============ */}
+      <ReferrerEfficiencyTable rows={referrerEff} />
+
+      {/* ============ Efficiency + Breakeven + Funnel + Best/Worst day +
+           Referrers + Winners/Losers ============ */}
+      <OverviewAdsInsights
+        winners={winners}
+        losers={losers}
+        breakeven={breakeven}
+        funnel={funnel}
+        efficiency={efficiency}
+        bestDay={bestDay}
+        worstDay={worstDay}
+        showAds={source === "all"}
+        onSelectProduct={setSelectedProduct}
+      />
+
       {/* ============ Bảng sản phẩm ============ */}
       <ProductsTable
         rows={products}
@@ -212,6 +408,7 @@ export function OverviewTab({
         product={selectedProduct}
         days={days}
         source={source}
+        accountFilter={accountFilter}
         onClose={() => setSelectedProduct(null)}
       />
     </div>
@@ -231,16 +428,8 @@ function PrimaryKpiRow({
 }) {
   const roi =
     totals.totalSpend > 0 ? (totals.profit / totals.totalSpend) * 100 : null;
-  const profitTone =
-    totals.profit > 0 ? "positive" : totals.profit < 0 ? "negative" : "neutral";
-  const roiTone =
-    roi === null
-      ? "muted"
-      : roi > 0
-      ? "positive"
-      : roi < 0
-      ? "negative"
-      : "neutral";
+  const profitToneValue = profitTone(totals.profit);
+  const roiToneValue = roiTone(roi);
   const showAds = source === "all";
 
   // Shopee-only → 3 cards (không spend, không ROI). All → 4 cards.
@@ -251,7 +440,7 @@ function PrimaryKpiRow({
         icon="trending_up"
         label={showAds ? "Lợi nhuận" : "Hoa hồng ròng"}
         value={fmtVnd(totals.profit)}
-        tone={profitTone}
+        tone={profitToneValue}
         sub={
           showAds
             ? `Hoa hồng ròng ${fmtVnd(totals.netCommission)}`
@@ -263,7 +452,7 @@ function PrimaryKpiRow({
           icon="percent"
           label="ROI"
           value={roi !== null ? fmtPct(roi) : "—"}
-          tone={roiTone}
+          tone={roiToneValue}
           sub={
             roi === null
               ? "Chưa có spend"
@@ -392,14 +581,8 @@ function BigKpi({
   label: string;
   value: string;
   sub?: string;
-  tone: "positive" | "negative" | "neutral" | "muted";
+  tone: Tone;
 }) {
-  const valueCls: Record<string, string> = {
-    positive: "text-green-400",
-    negative: "text-red-400",
-    neutral: "text-white",
-    muted: "text-white/70",
-  };
   return (
     <div className="rounded-xl bg-surface-4 p-5 shadow-elev-2 transition-shadow hover:shadow-elev-4">
       <div className="flex items-center gap-2">
@@ -409,7 +592,7 @@ function BigKpi({
         </p>
       </div>
       <p
-        className={`num-glow mt-2 truncate text-3xl font-bold tabular-nums ${valueCls[tone]}`}
+        className={`num-glow mt-2 truncate text-3xl font-bold tabular-nums ${toneTextClass(tone)}`}
         title={value}
       >
         {value}

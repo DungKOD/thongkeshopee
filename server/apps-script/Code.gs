@@ -15,9 +15,16 @@
  * Upsert theo URL (mỗi URL chỉ 1 row, giữ status cuối). Sort newest-first theo timestamp.
  */
 
+// Firebase config — phải khớp project mà FE sign-in vào. Token verify ở
+// `verifyFirebaseToken` qua Identity Toolkit `accounts:lookup?key=<apiKey>`,
+// API key PHẢI thuộc project đã phát hành token (aud claim). Sai project →
+// Google reject → AS trả 401 "Invalid token".
+//
+// Source of truth: FE `.env.local` VITE_FIREBASE_PROJECT_ID + VITE_FIREBASE_API_KEY.
+// Override runtime qua Script Properties (Project Settings → Script Properties).
 const CONFIG_DEFAULTS = {
-  FIREBASE_PROJECT_ID: 'thongkeshopee-62d61',
-  FIREBASE_API_KEY: 'AIzaSyBciz2PyfarMqVU8VmGXgFxlzrAWuBwqwA',
+  FIREBASE_PROJECT_ID: 'thongkeshopee-9b2d9',
+  FIREBASE_API_KEY: 'AIzaSyBcnNmUdkA1fNzBFsp2UQeDBpqY3Mlhjfk',
   DRIVE_FOLDER_ID: '1_N8hcw7oyVbI40P_uiyXWssvgWY_DKJb',
 };
 
@@ -62,6 +69,7 @@ function doPost(e) {
         return handleReadUserVideoLog(
           user,
           idToken,
+          body.targetUid,
           body.targetLocalPart,
           body.limit,
           body.offset,
@@ -70,13 +78,19 @@ function doPost(e) {
         return handleDeleteUserVideoLogRow(
           user,
           idToken,
+          body.targetUid,
           body.targetLocalPart,
           body.videoTimestamp,
           body.videoUrl,
           body.videoStatus,
         );
       case 'deleteUserVideoLogSheet':
-        return handleDeleteUserVideoLogSheet(user, idToken, body.targetLocalPart);
+        return handleDeleteUserVideoLogSheet(
+          user,
+          idToken,
+          body.targetUid,
+          body.targetLocalPart,
+        );
       default:
         return jsonError(400, 'Unknown action: ' + action);
     }
@@ -493,30 +507,118 @@ function parseTs_(s) {
 }
 
 /**
- * Get-or-create sheet tab theo localPart. Lần đầu: header + freeze row 1 +
- * set format plain text cho toàn sheet để tránh auto-parse ngày/số.
+ * Get-or-create sheet tab cho 1 user. Tab name = email local-part (phần
+ * trước @) — dễ đọc cho admin. Collision guard qua developer metadata
+ * `owner_uid`: 2 user khác provider cùng local-part → user sau bị reject
+ * với error rõ ràng (không ghi đè im lặng).
+ *
+ * Migration: nếu có tab cũ tên UID (từ v2 fix trước khi revert) + tab
+ * localPart chưa tồn tại → rename uid → localPart, stamp metadata. Data
+ * được preserve, admin view tự động ra đúng tab.
  */
-function getOrCreateLogSheet_(localPart) {
+function getOrCreateLogSheetForUser_(user) {
   const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
+  const uid = user.uid;
+  const localPart = emailToLocalPart(user.email);
+
+  // Tab localPart đã tồn tại → verify ownership.
   let sheet = ss.getSheetByName(localPart);
-  if (!sheet) {
-    sheet = ss.insertSheet(localPart);
-    sheet.getRange(1, 1, sheet.getMaxRows(), 3).setNumberFormat('@');
-    sheet
-      .getRange(1, 1, 1, VIDEO_LOG_HEADER.length)
-      .setValues([VIDEO_LOG_HEADER])
-      .setFontWeight('bold');
-    sheet.setFrozenRows(1);
-    sheet.setColumnWidth(1, 160);
-    sheet.setColumnWidth(2, 480);
-    sheet.setColumnWidth(3, 100);
+  if (sheet) {
+    const claimedUid = getSheetOwnerUid_(sheet);
+    if (!claimedUid) {
+      // Tab cũ (pre-metadata) → claim cho user hiện tại (first-come-first-serve).
+      setSheetOwnerUid_(sheet, uid);
+      return sheet;
+    }
+    if (claimedUid === uid) return sheet;
+    // COLLISION: 2 user khác nhau cùng local-part. Reject rõ ràng — không
+    // ghi đè log user khác. User bị block phải liên hệ admin đổi sang email
+    // khác hoặc admin xóa tab cũ.
+    throw new Error(
+      'COLLISION: tab "' + localPart + '" đã thuộc user khác (uid=' + claimedUid + '). ' +
+        'Local-part email trùng — liên hệ admin để resolve.',
+    );
   }
+
+  // Migration từ v2: tab tên uid tồn tại → rename về localPart.
+  const legacyUidSheet = ss.getSheetByName(uid);
+  if (legacyUidSheet) {
+    legacyUidSheet.setName(localPart);
+    setSheetOwnerUid_(legacyUidSheet, uid);
+    return legacyUidSheet;
+  }
+
+  // Tạo tab mới.
+  sheet = ss.insertSheet(localPart);
+  setSheetOwnerUid_(sheet, uid);
+  sheet.getRange(1, 1, sheet.getMaxRows(), 3).setNumberFormat('@');
+  sheet
+    .getRange(1, 1, 1, VIDEO_LOG_HEADER.length)
+    .setValues([VIDEO_LOG_HEADER])
+    .setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(1, 160);
+  sheet.setColumnWidth(2, 480);
+  sheet.setColumnWidth(3, 100);
   return sheet;
+}
+
+/**
+ * Lookup tab của target user cho admin read/delete. Ưu tiên localPart
+ * (naming convention hiện tại); fallback uid tab (user chưa migrate sau
+ * revert v3). Verify ownership qua metadata nếu có. Trả null nếu không có.
+ */
+function resolveUserLogSheet_(ss, targetUid, targetLocalPart) {
+  if (targetLocalPart) {
+    const byLocal = ss.getSheetByName(targetLocalPart);
+    if (byLocal) {
+      // Verify không phải tab của user khác (nếu có claim metadata).
+      const claimedUid = getSheetOwnerUid_(byLocal);
+      if (!claimedUid || !targetUid || claimedUid === targetUid) {
+        return byLocal;
+      }
+    }
+  }
+  // Fallback: user chưa migrate từ v2 uid-named tab → tìm theo uid.
+  if (targetUid) {
+    const byUid = ss.getSheetByName(targetUid);
+    if (byUid) return byUid;
+  }
+  return null;
+}
+
+function getSheetOwnerUid_(sheet) {
+  try {
+    const metas = sheet
+      .createDeveloperMetadataFinder()
+      .withKey('owner_uid')
+      .find();
+    if (metas && metas.length > 0) return metas[0].getValue();
+  } catch (e) {
+    /* legacy sheet without metadata API access */
+  }
+  return null;
+}
+
+function setSheetOwnerUid_(sheet, uid) {
+  try {
+    const existing = sheet
+      .createDeveloperMetadataFinder()
+      .withKey('owner_uid')
+      .find();
+    if (existing) existing.forEach(function (m) { m.remove(); });
+    sheet.addDeveloperMetadata('owner_uid', uid);
+  } catch (e) {
+    /* best-effort — legacy sheet có thể không support metadata */
+  }
 }
 
 /**
  * Upsert theo URL: xóa row cũ (nếu có) cùng URL → insert row mới ngay sau header.
  * Sheet view + UI đều newest-first. Mỗi URL giữ 1 row với status cuối.
+ *
+ * Tab name = `user.uid` (không phải email local-part) → tránh collision
+ * cross-provider same-local-part. Migration cũ → uid trong `getOrCreateLogSheetForUser_`.
  */
 function handleLogVideoDownload(user, videoUrl, videoStatus, videoTimestamp) {
   if (!videoUrl || !videoStatus || !videoTimestamp) {
@@ -526,8 +628,7 @@ function handleLogVideoDownload(user, videoUrl, videoStatus, videoTimestamp) {
     return jsonError(400, 'Invalid videoStatus: ' + videoStatus);
   }
 
-  const localPart = emailToLocalPart(user.email);
-  const sheet = getOrCreateLogSheet_(localPart);
+  const sheet = getOrCreateLogSheetForUser_(user);
   const statusVN = vnStatus_(videoStatus);
 
   // Xóa row cũ (nếu có) match theo col B (URL). Iterate bottom-up để
@@ -552,19 +653,29 @@ function handleLogVideoDownload(user, videoUrl, videoStatus, videoTimestamp) {
 }
 
 /**
- * Admin-only: đọc sheet tab của target user. Sort newest-first bằng parse
- * timestamp — robust với cả legacy rows (append-bottom cũ) + rows mới
+ * Admin-only: đọc sheet tab của target user. Ưu tiên tab `targetUid`;
+ * fallback `targetLocalPart` cho user chưa migrate. Sort newest-first bằng
+ * parse timestamp — robust với cả legacy rows (append-bottom cũ) + rows mới
  * (insert-top). Pagination limit/offset áp dụng trên danh sách đã sort.
  */
-function handleReadUserVideoLog(user, idToken, targetLocalPart, limit, offset) {
+function handleReadUserVideoLog(
+  user,
+  idToken,
+  targetUid,
+  targetLocalPart,
+  limit,
+  offset,
+) {
   if (!isAdmin(user, idToken)) return jsonError(403, 'Admin required');
-  if (!targetLocalPart) return jsonError(400, 'Missing targetLocalPart');
+  if (!targetUid && !targetLocalPart) {
+    return jsonError(400, 'Missing targetUid/targetLocalPart');
+  }
 
   const lim = Math.max(1, Math.min(5000, parseInt(limit, 10) || 100));
   const off = Math.max(0, parseInt(offset, 10) || 0);
 
   const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
-  const sheet = ss.getSheetByName(targetLocalPart);
+  const sheet = resolveUserLogSheet_(ss, targetUid, targetLocalPart);
   if (!sheet) return jsonOk({ videoLogs: [] });
 
   const lastRow = sheet.getLastRow();
@@ -594,19 +705,22 @@ function handleReadUserVideoLog(user, idToken, targetLocalPart, limit, offset) {
 function handleDeleteUserVideoLogRow(
   user,
   idToken,
+  targetUid,
   targetLocalPart,
   timestamp,
   videoUrl,
   status,
 ) {
   if (!isAdmin(user, idToken)) return jsonError(403, 'Admin required');
-  if (!targetLocalPart) return jsonError(400, 'Missing targetLocalPart');
+  if (!targetUid && !targetLocalPart) {
+    return jsonError(400, 'Missing targetUid/targetLocalPart');
+  }
   if (!timestamp || !videoUrl || !status) {
     return jsonError(400, 'Missing timestamp/videoUrl/status');
   }
 
   const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
-  const sheet = ss.getSheetByName(targetLocalPart);
+  const sheet = resolveUserLogSheet_(ss, targetUid, targetLocalPart);
   if (!sheet) return jsonError(404, 'Sheet tab not found');
 
   const lastRow = sheet.getLastRow();
@@ -628,16 +742,36 @@ function handleDeleteUserVideoLogRow(
 
 /**
  * Admin-only: xóa tab (sheet) của 1 user. File Sheet gốc không bị xóa.
+ * Xóa cả tab `localPart` (naming convention hiện tại) lẫn tab `uid` cũ
+ * (từ v2 — nếu user chưa migrate) để cleanup triệt để.
  */
-function handleDeleteUserVideoLogSheet(user, idToken, targetLocalPart) {
+function handleDeleteUserVideoLogSheet(user, idToken, targetUid, targetLocalPart) {
   if (!isAdmin(user, idToken)) return jsonError(403, 'Admin required');
-  if (!targetLocalPart) return jsonError(400, 'Missing targetLocalPart');
+  if (!targetUid && !targetLocalPart) {
+    return jsonError(400, 'Missing targetUid/targetLocalPart');
+  }
 
   const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
-  const sheet = ss.getSheetByName(targetLocalPart);
-  if (!sheet) return jsonOk({ deleted: false, reason: 'tab already missing' });
-
-  ss.deleteSheet(sheet);
+  let deletedAny = false;
+  if (targetLocalPart) {
+    const byLocal = ss.getSheetByName(targetLocalPart);
+    if (byLocal) {
+      // Chỉ xóa tab localPart nếu không claim bởi user KHÁC.
+      const claimedUid = getSheetOwnerUid_(byLocal);
+      if (!claimedUid || !targetUid || claimedUid === targetUid) {
+        ss.deleteSheet(byLocal);
+        deletedAny = true;
+      }
+    }
+  }
+  if (targetUid) {
+    const byUid = ss.getSheetByName(targetUid);
+    if (byUid) {
+      ss.deleteSheet(byUid);
+      deletedAny = true;
+    }
+  }
+  if (!deletedAny) return jsonOk({ deleted: false, reason: 'tab already missing' });
   return jsonOk({ deleted: true });
 }
 

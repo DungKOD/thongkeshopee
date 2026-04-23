@@ -51,6 +51,10 @@ pub struct DaysFilter {
     pub sub_id_filter: Option<String>,
     /// Account Shopee filter. None hoặc `All` = không filter (behavior cũ).
     pub account_filter: Option<AccountFilterMode>,
+    /// Sub_id tuple exact của 1 product (dialog Chi tiết). Khi provided,
+    /// analytics commands post-filter rows theo prefix-compatible match
+    /// (cùng rule `get_order_items_for_row` dùng). None = all products.
+    pub sub_ids: Option<[String; 5]>,
 }
 
 /// Filter mode theo account. Tagged union trùng FE `AccountFilter`.
@@ -960,6 +964,612 @@ pub fn get_order_items_for_row(
     Ok(out)
 }
 
+/// Test xem 1 row có match sub_ids filter không — dùng prefix-compatible
+/// rule (cùng logic `get_order_items_for_row`): canonical của row là prefix
+/// của target HOẶC ngược lại.
+fn sub_ids_match(row: &[String; 5], target: &[String; 5]) -> bool {
+    let row_canon = to_canonical(row.clone());
+    let target_canon = to_canonical(target.clone());
+    is_prefix(&row_canon, &target_canon) || is_prefix(&target_canon, &row_canon)
+}
+
+/// Phân bố đơn theo giờ trong ngày (0-23) — aggregate toàn bộ orders trong
+/// khoảng filter. Giúp user biết giờ nào buy nhiều → tối ưu đăng bài, run ads.
+///
+/// Filter: `from_date`, `to_date`, `account_filter`, `sub_ids`. Nếu `sub_ids`
+/// provided, chỉ count order có sub_id tuple prefix-compatible với target
+/// (dùng cho dialog Chi tiết sản phẩm).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourlyOrderBucket {
+    pub hour: u8,
+    pub orders: i64,
+    pub order_value: f64,
+    pub commission: f64,
+}
+
+#[tauri::command]
+pub fn load_hourly_orders(
+    state: State<'_, DbState>,
+    filter: Option<DaysFilter>,
+) -> CmdResult<Vec<HourlyOrderBucket>> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let f = filter.unwrap_or_default();
+
+    // 2 paths: aggregate SQL-native (fast) khi không filter sub_ids, hoặc
+    // scan-and-aggregate per-row (filter prefix-match) khi có sub_ids.
+    if f.sub_ids.is_none() {
+        let mut sql = String::from(
+            "SELECT
+                CAST(strftime('%H', order_time) AS INTEGER) as hour,
+                COUNT(DISTINCT order_id) as orders,
+                COALESCE(SUM(order_value), 0) as gmv,
+                COALESCE(SUM(net_commission), 0) as commission
+             FROM raw_shopee_order_items
+             WHERE order_time IS NOT NULL AND order_time != ''",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(v) = &f.from_date {
+            sql.push_str(" AND day_date >= ?");
+            params_vec.push(Box::new(v.clone()));
+        }
+        if let Some(v) = &f.to_date {
+            sql.push_str(" AND day_date <= ?");
+            params_vec.push(Box::new(v.clone()));
+        }
+        if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
+            sql.push_str(" AND shopee_account_id = ?");
+            params_vec.push(Box::new(*id));
+        }
+        sql.push_str(" GROUP BY hour ORDER BY hour ASC");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
+        let rows: Vec<HourlyOrderBucket> = stmt
+            .query_map(params_refs.as_slice(), |r| {
+                let hour_i: i64 = r.get(0)?;
+                Ok(HourlyOrderBucket {
+                    hour: hour_i.clamp(0, 23) as u8,
+                    orders: r.get(1)?,
+                    order_value: r.get(2)?,
+                    commission: r.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        return Ok(fill_24_orders(rows));
+    }
+
+    // Sub_ids filter path: query per-item với sub_id columns + filter Rust-side.
+    let target = f.sub_ids.clone().unwrap();
+    let mut sql = String::from(
+        "SELECT order_id,
+                CAST(strftime('%H', order_time) AS INTEGER) as hour,
+                COALESCE(order_value, 0) as order_value,
+                COALESCE(net_commission, 0) as net_commission,
+                sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+         FROM raw_shopee_order_items
+         WHERE order_time IS NOT NULL AND order_time != ''",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = &f.from_date {
+        sql.push_str(" AND day_date >= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &f.to_date {
+        sql.push_str(" AND day_date <= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
+        sql.push_str(" AND shopee_account_id = ?");
+        params_vec.push(Box::new(*id));
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+        .collect();
+    // Per-hour: (distinct_order_ids, sum_order_value, sum_commission).
+    let mut buckets: [(std::collections::HashSet<String>, f64, f64); 24] =
+        std::array::from_fn(|_| (std::collections::HashSet::new(), 0.0, 0.0));
+    for row in stmt.query_map(params_refs.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, f64>(2)?,
+            r.get::<_, f64>(3)?,
+            [
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+            ],
+        ))
+    })? {
+        let (order_id, hour, ov, comm, subs) = row?;
+        if !sub_ids_match(&subs, &target) {
+            continue;
+        }
+        let idx = hour.clamp(0, 23) as usize;
+        buckets[idx].0.insert(order_id);
+        buckets[idx].1 += ov;
+        buckets[idx].2 += comm;
+    }
+    Ok((0..24)
+        .map(|i| HourlyOrderBucket {
+            hour: i as u8,
+            orders: buckets[i].0.len() as i64,
+            order_value: buckets[i].1,
+            commission: buckets[i].2,
+        })
+        .collect())
+}
+
+/// Helper: fill 24 hour buckets từ Vec partial (SQL GROUP BY thường skip hour rỗng).
+fn fill_24_orders(rows: Vec<HourlyOrderBucket>) -> Vec<HourlyOrderBucket> {
+    let mut full = vec![
+        HourlyOrderBucket {
+            hour: 0,
+            orders: 0,
+            order_value: 0.0,
+            commission: 0.0,
+        };
+        24
+    ];
+    for i in 0..24u8 {
+        full[i as usize].hour = i;
+    }
+    for row in rows {
+        let idx = row.hour as usize;
+        full[idx] = row;
+    }
+    full
+}
+
+/// Phân bố click Shopee theo giờ trong ngày (0-23) — mirror `load_hourly_orders`
+/// nhưng aggregate `raw_shopee_clicks.click_time`. Giúp user biết giờ nào
+/// traffic peak (khác giờ mua → user click đêm chốt sáng = insight cho schedule ads).
+///
+/// Filter: `from_date`, `to_date`, `account_filter`. Skip `sub_id_filter` (Overview tổng hợp).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourlyClickBucket {
+    pub hour: u8,
+    pub clicks: i64,
+}
+
+#[tauri::command]
+pub fn load_hourly_clicks(
+    state: State<'_, DbState>,
+    filter: Option<DaysFilter>,
+) -> CmdResult<Vec<HourlyClickBucket>> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let f = filter.unwrap_or_default();
+
+    // SQL-native path nếu không filter sub_ids. Có sub_ids → query row level
+    // + post-filter bằng prefix match.
+    if f.sub_ids.is_none() {
+        let mut sql = String::from(
+            "SELECT
+                CAST(strftime('%H', click_time) AS INTEGER) as hour,
+                COUNT(*) as clicks
+             FROM raw_shopee_clicks
+             WHERE click_time IS NOT NULL AND click_time != ''",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(v) = &f.from_date {
+            sql.push_str(" AND day_date >= ?");
+            params_vec.push(Box::new(v.clone()));
+        }
+        if let Some(v) = &f.to_date {
+            sql.push_str(" AND day_date <= ?");
+            params_vec.push(Box::new(v.clone()));
+        }
+        if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
+            sql.push_str(" AND shopee_account_id = ?");
+            params_vec.push(Box::new(*id));
+        }
+        sql.push_str(" GROUP BY hour ORDER BY hour ASC");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
+        let rows: Vec<HourlyClickBucket> = stmt
+            .query_map(params_refs.as_slice(), |r| {
+                let hour_i: i64 = r.get(0)?;
+                Ok(HourlyClickBucket {
+                    hour: hour_i.clamp(0, 23) as u8,
+                    clicks: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        let mut full = vec![HourlyClickBucket { hour: 0, clicks: 0 }; 24];
+        for i in 0..24u8 {
+            full[i as usize].hour = i;
+        }
+        for row in rows {
+            let idx = row.hour as usize;
+            full[idx] = row;
+        }
+        return Ok(full);
+    }
+
+    // Sub_ids filter path.
+    let target = f.sub_ids.clone().unwrap();
+    let mut sql = String::from(
+        "SELECT CAST(strftime('%H', click_time) AS INTEGER) as hour,
+                sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+         FROM raw_shopee_clicks
+         WHERE click_time IS NOT NULL AND click_time != ''",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = &f.from_date {
+        sql.push_str(" AND day_date >= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &f.to_date {
+        sql.push_str(" AND day_date <= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
+        sql.push_str(" AND shopee_account_id = ?");
+        params_vec.push(Box::new(*id));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+        .collect();
+    let mut counts = [0_i64; 24];
+    for row in stmt.query_map(params_refs.as_slice(), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            [
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ],
+        ))
+    })? {
+        let (hour, subs) = row?;
+        if !sub_ids_match(&subs, &target) {
+            continue;
+        }
+        let idx = hour.clamp(0, 23) as usize;
+        counts[idx] += 1;
+    }
+    Ok((0..24)
+        .map(|i| HourlyClickBucket {
+            hour: i as u8,
+            clicks: counts[i],
+        })
+        .collect())
+}
+
+/// Hiệu suất từng referrer (nguồn traffic Shopee) — aggregate click + đơn.
+/// Khác `clicksByReferrer` chỉ count click, cái này bring CR + commission →
+/// biết referrer nào quality traffic (click nhiều + CR cao) vs referrer junk.
+///
+/// Logic match click → order: cùng sub_ids tuple trong cùng ngày. Shopee
+/// `referrer` chỉ gắn với click_row; order không có referrer → phải JOIN
+/// qua sub_ids + day_date. Approximate — nếu 1 sub_id có nhiều referrer cùng
+/// ngày, order được chia theo tỉ lệ click:
+///   orders_from_R = total_orders_for_subids × (clicks_R / total_clicks_for_subids)
+///
+/// Filter: `from_date`, `to_date`, `account_filter`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferrerEfficiency {
+    pub referrer: String,
+    pub clicks: i64,
+    pub orders: f64,
+    pub commission: f64,
+    pub cr: Option<f64>,
+}
+
+#[tauri::command]
+pub fn load_referrer_efficiency(
+    state: State<'_, DbState>,
+    filter: Option<DaysFilter>,
+) -> CmdResult<Vec<ReferrerEfficiency>> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let f = filter.unwrap_or_default();
+
+    // Build WHERE cho shopee_clicks filter.
+    let mut where_clicks = String::from(" WHERE 1=1");
+    let mut where_orders = String::from(" WHERE 1=1");
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut params_orders: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = &f.from_date {
+        where_clicks.push_str(" AND day_date >= ?");
+        where_orders.push_str(" AND day_date >= ?");
+        params_vec.push(Box::new(v.clone()));
+        params_orders.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &f.to_date {
+        where_clicks.push_str(" AND day_date <= ?");
+        where_orders.push_str(" AND day_date <= ?");
+        params_vec.push(Box::new(v.clone()));
+        params_orders.push(Box::new(v.clone()));
+    }
+    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
+        where_clicks.push_str(" AND shopee_account_id = ?");
+        where_orders.push_str(" AND shopee_account_id = ?");
+        params_vec.push(Box::new(*id));
+        params_orders.push(Box::new(*id));
+    }
+
+    // Step 1: click count per (day, sub_ids, referrer)
+    let clicks_sql = format!(
+        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                COALESCE(referrer, '') as referrer, COUNT(*) as clicks
+         FROM raw_shopee_clicks
+         {where_clicks}
+         GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, referrer"
+    );
+    let mut stmt = conn.prepare(&clicks_sql)?;
+    let refs_clicks: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+        .collect();
+    type ClickKey = (String, [String; 5]);
+    let mut clicks_by_key: std::collections::HashMap<ClickKey, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for row in stmt.query_map(refs_clicks.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            [
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ],
+            r.get::<_, String>(6)?,
+            r.get::<_, i64>(7)?,
+        ))
+    })? {
+        let (day, subs, referrer, clicks) = row?;
+        clicks_by_key
+            .entry((day, subs))
+            .or_default()
+            .push((referrer, clicks));
+    }
+
+    // Step 2: order count + commission per (day, sub_ids) — distinct order_id.
+    let orders_sql = format!(
+        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                COUNT(DISTINCT order_id) as orders,
+                COALESCE(SUM(net_commission), 0) as commission
+         FROM raw_shopee_order_items
+         {where_orders}
+         GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5"
+    );
+    let mut stmt = conn.prepare(&orders_sql)?;
+    let refs_orders: Vec<&dyn rusqlite::ToSql> = params_orders
+        .iter()
+        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+        .collect();
+    type OrderAgg = (i64, f64);
+    let mut orders_by_key: std::collections::HashMap<ClickKey, OrderAgg> =
+        std::collections::HashMap::new();
+    for row in stmt.query_map(refs_orders.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            [
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ],
+            r.get::<_, i64>(6)?,
+            r.get::<_, f64>(7)?,
+        ))
+    })? {
+        let (day, subs, orders, commission) = row?;
+        orders_by_key.insert((day, subs), (orders, commission));
+    }
+
+    // Step 3: aggregate per referrer — distribute orders theo tỉ lệ click.
+    // Nếu f.sub_ids provided (Chi tiết product), filter keys prefix-match trước.
+    let target_sub_ids = f.sub_ids.clone();
+    let mut agg: std::collections::HashMap<String, (i64, f64, f64)> =
+        std::collections::HashMap::new();
+    for (key, referrer_clicks) in clicks_by_key {
+        if let Some(target) = target_sub_ids.as_ref() {
+            if !sub_ids_match(&key.1, target) {
+                continue;
+            }
+        }
+        let total_clicks: i64 = referrer_clicks.iter().map(|(_, c)| *c).sum();
+        let (orders_for_key, commission_for_key) = orders_by_key
+            .get(&key)
+            .copied()
+            .unwrap_or((0, 0.0));
+        for (referrer, clicks) in referrer_clicks {
+            let share = if total_clicks > 0 {
+                clicks as f64 / total_clicks as f64
+            } else {
+                0.0
+            };
+            let orders_share = orders_for_key as f64 * share;
+            let commission_share = commission_for_key * share;
+            let e = agg.entry(referrer).or_insert((0, 0.0, 0.0));
+            e.0 += clicks;
+            e.1 += orders_share;
+            e.2 += commission_share;
+        }
+    }
+
+    let mut out: Vec<ReferrerEfficiency> = agg
+        .into_iter()
+        .map(|(referrer, (clicks, orders, commission))| {
+            let cr = if clicks > 0 {
+                Some(orders / clicks as f64 * 100.0)
+            } else {
+                None
+            };
+            ReferrerEfficiency {
+                referrer,
+                clicks,
+                orders,
+                commission,
+                cr,
+            }
+        })
+        .collect();
+    // Sort desc by CR (null last). Tiebreak by clicks desc.
+    out.sort_by(|a, b| {
+        b.cr
+            .partial_cmp(&a.cr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.clicks.cmp(&a.clicks))
+    });
+    Ok(out)
+}
+
+/// Phân bố thời gian từ click → đặt hàng. Bucket cố định:
+/// <1h, 1-6h, 6-24h, 1-3d, >3d, no_click (click_time null).
+/// Giúp hiểu user behavior: impulse buy vs consider → ảnh hưởng retargeting window.
+///
+/// Filter: `from_date`, `to_date`, `account_filter`. Skip sub_id.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClickOrderDelayBucket {
+    pub bucket: String,
+    pub orders: i64,
+}
+
+#[tauri::command]
+pub fn load_click_order_delays(
+    state: State<'_, DbState>,
+    filter: Option<DaysFilter>,
+) -> CmdResult<Vec<ClickOrderDelayBucket>> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let f = filter.unwrap_or_default();
+
+    // Compute delay seconds. Null click_time → bucket 'no_click'.
+    // Query sub_id columns để filter prefix-match khi f.sub_ids provided.
+    let mut sql = String::from(
+        "SELECT order_id, click_time, order_time,
+                sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+         FROM raw_shopee_order_items
+         WHERE order_time IS NOT NULL AND order_time != ''",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = &f.from_date {
+        sql.push_str(" AND day_date >= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &f.to_date {
+        sql.push_str(" AND day_date <= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
+        sql.push_str(" AND shopee_account_id = ?");
+        params_vec.push(Box::new(*id));
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+        .collect();
+
+    let target = f.sub_ids.clone();
+    // Distinct orders (1 order nhiều items) — dedupe qua HashMap<order_id, delay>.
+    let mut by_order: std::collections::HashMap<String, Option<f64>> =
+        std::collections::HashMap::new();
+    for row in stmt.query_map(refs.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            [
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ],
+        ))
+    })? {
+        let (order_id, click_time, order_time, subs) = row?;
+        if let Some(t) = target.as_ref() {
+            if !sub_ids_match(&subs, t) {
+                continue;
+            }
+        }
+        if by_order.contains_key(&order_id) {
+            continue;
+        }
+        let delay_s = match click_time.as_deref() {
+            None | Some("") => None,
+            Some(ct) => parse_timestamp_to_epoch(ct).and_then(|c| {
+                parse_timestamp_to_epoch(&order_time).map(|o| (o - c).max(0) as f64)
+            }),
+        };
+        by_order.insert(order_id, delay_s);
+    }
+
+    // Bucket counts. Cứng 6 buckets theo thứ tự hiển thị.
+    let mut buckets: std::collections::HashMap<&'static str, i64> =
+        std::collections::HashMap::from([
+            ("<1h", 0),
+            ("1-6h", 0),
+            ("6-24h", 0),
+            ("1-3d", 0),
+            (">3d", 0),
+            ("no_click", 0),
+        ]);
+    for delay in by_order.into_values() {
+        let key = match delay {
+            None => "no_click",
+            Some(s) if s < 3600.0 => "<1h",
+            Some(s) if s < 6.0 * 3600.0 => "1-6h",
+            Some(s) if s < 24.0 * 3600.0 => "6-24h",
+            Some(s) if s < 3.0 * 86400.0 => "1-3d",
+            Some(_) => ">3d",
+        };
+        *buckets.entry(key).or_insert(0) += 1;
+    }
+
+    // Output theo thứ tự fixed.
+    let order = ["<1h", "1-6h", "6-24h", "1-3d", ">3d", "no_click"];
+    Ok(order
+        .iter()
+        .map(|&k| ClickOrderDelayBucket {
+            bucket: k.to_string(),
+            orders: *buckets.get(k).unwrap_or(&0),
+        })
+        .collect())
+}
+
+/// Parse "YYYY-MM-DD HH:MM:SS" (Shopee format) or ISO8601 → epoch seconds.
+/// Return None nếu fail — caller treat as no_click bucket.
+fn parse_timestamp_to_epoch(s: &str) -> Option<i64> {
+    use chrono::{DateTime, NaiveDateTime};
+    // Try RFC3339/ISO8601 first
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    // Fallback: "YYYY-MM-DD HH:MM:SS" (Shopee CSV format)
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(ndt.and_utc().timestamp());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,8 +1976,8 @@ mod tests {
                   price, quantity, order_value, refund_amount,
                   net_commission, commission_total,
                   sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-                  channel, raw_json, day_date, source_file_id)
-                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  channel, day_date, source_file_id)
+                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(checkout_id, item_id, model_id) DO UPDATE SET
                     order_status = excluded.order_status,
                     order_time = excluded.order_time,
@@ -1406,7 +2016,6 @@ mod tests {
                 sub_ids[3].as_str().unwrap_or(""),
                 sub_ids[4].as_str().unwrap_or(""),
                 r["channel"].as_str(),
-                r["rawJson"].as_str(),
                 payload.day_date,
                 source_file_id,
             ])
@@ -1441,8 +2050,8 @@ mod tests {
                  (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                   report_start, report_end, status,
                   spend, clicks, cpc, impressions, reach,
-                  raw_json, day_date, source_file_id)
-                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  day_date, source_file_id)
+                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(day_date, level, name) DO UPDATE SET
                     spend = excluded.spend, clicks = excluded.clicks,
                     cpc = excluded.cpc, impressions = excluded.impressions,
@@ -1474,7 +2083,6 @@ mod tests {
                 cpc,
                 r["impressions"].as_i64(),
                 r["reach"].as_i64(),
-                r["rawJson"].as_str(),
                 payload.day_date,
                 source_file_id,
             ])

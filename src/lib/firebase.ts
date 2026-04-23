@@ -31,6 +31,15 @@ export const googleProvider = new GoogleAuthProvider();
 
 void setPersistence(auth, browserLocalPersistence);
 
+/** Lấy ID token của user hiện tại. Throw nếu chưa login — caller nên guard
+ *  `auth.currentUser` trước khi gọi hoặc catch error. `forceRefresh=true`
+ *  để bypass cache 1h (rare — dùng khi claim admin vừa toggle). */
+export async function getAuthToken(forceRefresh = false): Promise<string> {
+  const current = auth.currentUser;
+  if (!current) throw new Error("Chưa đăng nhập");
+  return current.getIdToken(forceRefresh);
+}
+
 // Dev-only: expose `auth` lên window cho DevTools debug. Remove sau khi xong.
 if (import.meta.env.DEV) {
   (globalThis as unknown as { __auth: Auth }).__auth = auth;

@@ -1,6 +1,5 @@
 import type { Env, AuthContext } from '../types';
 import { jsonOk, jsonError } from '../response';
-import { base64Encode } from '../base64';
 import { listAllUsers, emailLocalPart } from '../firestore';
 
 /// List tất cả user trong Firestore + merge R2 file metadata nếu có.
@@ -18,7 +17,7 @@ export async function adminUsersRoute(
   // 1. List tất cả user từ Firestore.
   const profiles = await listAllUsers(auth.idToken, env);
 
-  // 2. List R2 objects `users/*/db.gz` — build map uid → file meta.
+  // 2. List R2 objects `users/*/db.zst` — build map uid → file meta.
   type FileMeta = {
     fileId: string;
     sizeBytes: number;
@@ -33,7 +32,7 @@ export async function adminUsersRoute(
       limit: 1000,
     });
     for (const obj of page.objects) {
-      const m = /^users\/([^/]+)\/db\.gz$/.exec(obj.key);
+      const m = /^users\/([^/]+)\/db\.zst$/.exec(obj.key);
       if (!m) continue;
       filesByUid.set(m[1], {
         fileId: obj.key,
@@ -79,7 +78,7 @@ export async function adminUsersRoute(
   return jsonOk({ users });
 }
 
-/// Clean R2 orphan files — xoá `users/{uid}/db.gz` khi `{uid}` không tồn tại
+/// Clean R2 orphan files — xoá `users/{uid}/db.zst` khi `{uid}` không tồn tại
 /// trong Firestore `users` collection. Admin-only.
 ///
 /// Use case: đổi Firebase project → UIDs cũ không còn trong Firestore mới
@@ -103,7 +102,7 @@ export async function adminCleanupOrphansRoute(
       limit: 1000,
     });
     for (const obj of page.objects) {
-      const m = /^users\/([^/]+)\/db\.gz$/.exec(obj.key);
+      const m = /^users\/([^/]+)\/db\.zst$/.exec(obj.key);
       if (!m) continue;
       const uid = m[1];
       if (validUids.has(uid)) continue;
@@ -116,7 +115,7 @@ export async function adminCleanupOrphansRoute(
   return jsonOk({ deleted });
 }
 
-/// Download DB của user target. Admin-only.
+/// Download DB của user target. Admin-only. v9+: chỉ support `db.zst`.
 export async function adminDownloadRoute(
   req: Request,
   auth: AuthContext,
@@ -128,17 +127,20 @@ export async function adminDownloadRoute(
   const targetUid = url.searchParams.get('uid');
   if (!targetUid) return jsonError(400, 'Missing uid query param');
 
-  const key = `users/${targetUid}/db.gz`;
-  const obj = await env.DB_BUCKET.get(key);
+  const obj = await env.DB_BUCKET.get(`users/${targetUid}/db.zst`);
   if (!obj) return jsonError(404, 'Target user has no backup');
 
-  const bytes = new Uint8Array(await obj.arrayBuffer());
   const mtimeFromMeta = obj.customMetadata?.mtimeMs;
   const lastModified = mtimeFromMeta ? Number(mtimeFromMeta) : obj.uploaded.getTime();
 
-  return jsonOk({
-    base64Data: base64Encode(bytes),
-    sizeBytes: bytes.byteLength,
-    lastModified,
+  return new Response(obj.body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(obj.size),
+      'X-Size-Bytes': String(obj.size),
+      'X-Last-Modified-Ms': String(lastModified),
+      ETag: obj.etag,
+    },
   });
 }

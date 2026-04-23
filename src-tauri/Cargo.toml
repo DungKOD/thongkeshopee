@@ -1,6 +1,6 @@
 [package]
 name = "thongkeshopee"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shopee Affiliate Tracker — Thống kê chạy ads FB hàng ngày"
 authors = ["dungnv92734"]
 edition = "2021"
@@ -35,5 +35,6 @@ base64 = "0.22"
 md-5 = "0.10"
 machine-uid = "0.5"
 hex = "0.4"
-flate2 = "1"
+zstd = { version = "0.13", features = ["zstdmt"] }
+num_cpus = "1"
 

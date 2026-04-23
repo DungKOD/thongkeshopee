@@ -5,22 +5,26 @@
 //! 2. Primary audit store cho video logs là Google Sheet (qua Apps Script).
 //!    DB này chỉ là local fallback để user xem lại history của chính mình.
 //!
-//! Init lazy: tạo file `video_logs.db` trong `app_data_dir`, schema tự apply.
+//! v8+ multi-tenant: DB nằm trong folder per-user `{app_data}/users/{uid}/video_logs.db`.
+//! Setup() mở pre-auth placeholder ở `_pre_auth/`; `switch_db_to_user` swap sang
+//! folder user thật sau khi auth ready (migrate legacy root DB nếu có).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tauri::{AppHandle, Manager};
 
+use super::{PRE_AUTH_SUBDIR, USERS_SUBDIR};
+
 const DB_FILENAME: &str = "video_logs.db";
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS video_downloads (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    url                TEXT NOT NULL,
+    url                TEXT NOT NULL UNIQUE,
     downloaded_at_ms   INTEGER NOT NULL,
     status             TEXT NOT NULL CHECK(status IN ('success','failed'))
 );
@@ -63,8 +67,7 @@ CREATE TABLE IF NOT EXISTS admin_user_list_cache (
 /// Tauri managed state cho video DB connection.
 pub struct VideoDbState(pub Mutex<Connection>);
 
-/// Resolve đường dẫn file `video_logs.db`.
-pub fn resolve_video_db_path(app: &AppHandle) -> Result<PathBuf> {
+fn app_data_root(app: &AppHandle) -> Result<PathBuf> {
     let base = app
         .path()
         .app_data_dir()
@@ -72,13 +75,43 @@ pub fn resolve_video_db_path(app: &AppHandle) -> Result<PathBuf> {
     fs::create_dir_all(&base).with_context(|| {
         format!("không tạo được thư mục app_data_dir: {}", base.display())
     })?;
-    Ok(base.join(DB_FILENAME))
+    Ok(base)
 }
 
-/// Mở hoặc tạo video DB, apply schema. Gọi 1 lần khi app start.
-pub fn init_video_db(app: &AppHandle) -> Result<Connection> {
-    let path = resolve_video_db_path(app)?;
-    let conn = Connection::open(&path)
+/// Resolve video DB path cho 1 user: `{app_data}/users/{uid}/video_logs.db`.
+/// Caller đã verify UID qua `resolve_user_dir` (alphanumeric + - + _).
+pub fn resolve_video_db_path_for_user(app: &AppHandle, uid: &str) -> Result<PathBuf> {
+    let safe = uid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !safe || uid.is_empty() {
+        anyhow::bail!("UID không hợp lệ: {uid}");
+    }
+    let dir = app_data_root(app)?.join(USERS_SUBDIR).join(uid);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("không tạo được thư mục user: {}", dir.display()))?;
+    Ok(dir.join(DB_FILENAME))
+}
+
+/// Placeholder pre-auth video DB path — dùng khi app start chưa có user UID.
+/// Swap sau khi `switch_db_to_user`.
+pub fn resolve_pre_auth_video_db_path(app: &AppHandle) -> Result<PathBuf> {
+    let dir = app_data_root(app)?.join(PRE_AUTH_SUBDIR);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("không tạo được thư mục pre_auth: {}", dir.display()))?;
+    Ok(dir.join(DB_FILENAME))
+}
+
+/// Legacy video DB path ở root `{app_data}/video_logs.db` — dùng cho migration
+/// lần đầu sau upgrade lên v8+. KHÔNG dùng ngoài migration block.
+pub fn resolve_legacy_video_db_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_data_root(app)?.join(DB_FILENAME))
+}
+
+/// Mở hoặc tạo video DB tại `path`, apply PRAGMA + schema + migrations.
+/// Idempotent — chạy mỗi lần switch user.
+pub fn init_video_db_at(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
         .with_context(|| format!("không mở được video DB tại {}", path.display()))?;
 
     conn.execute_batch(
@@ -91,12 +124,64 @@ pub fn init_video_db(app: &AppHandle) -> Result<Connection> {
     conn.execute_batch(SCHEMA_SQL)
         .context("không apply được schema cho video DB")?;
 
+    migrate_video_downloads_unique_url(&conn)
+        .context("migrate video_downloads UNIQUE(url) thất bại")?;
+
     Ok(conn)
 }
 
-/// Setup hook — init + manage state.
+/// v9 migration: add UNIQUE(url) cho `video_downloads` để enable UPSERT theo
+/// URL (nhất quán với AS Sheet upsert). DB cũ không có constraint này → có
+/// thể có duplicate cùng URL → dedupe keep-latest theo downloaded_at_ms.
+fn migrate_video_downloads_unique_url(conn: &Connection) -> Result<()> {
+    // Check existing table DDL để xem đã có UNIQUE(url) chưa.
+    let existing_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='video_downloads'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let has_unique = match existing_sql.as_deref() {
+        Some(s) => s.contains("UNIQUE"),
+        None => return Ok(()), // bảng chưa tồn tại (DB mới hoàn toàn)
+    };
+    if has_unique {
+        return Ok(());
+    }
+
+    // Rebuild table với UNIQUE. Dedupe: giữ row latest per URL qua correlated
+    // subquery chọn `id` có `downloaded_at_ms` lớn nhất (tiebreak id DESC).
+    conn.execute_batch(
+        "CREATE TABLE video_downloads_new (
+             id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+             url                TEXT NOT NULL UNIQUE,
+             downloaded_at_ms   INTEGER NOT NULL,
+             status             TEXT NOT NULL CHECK(status IN ('success','failed'))
+         );
+         INSERT INTO video_downloads_new (url, downloaded_at_ms, status)
+         SELECT vd.url, vd.downloaded_at_ms, vd.status
+         FROM video_downloads vd
+         WHERE vd.id = (
+             SELECT id FROM video_downloads
+             WHERE url = vd.url
+             ORDER BY downloaded_at_ms DESC, id DESC
+             LIMIT 1
+         );
+         DROP TABLE video_downloads;
+         ALTER TABLE video_downloads_new RENAME TO video_downloads;
+         CREATE INDEX IF NOT EXISTS idx_video_downloads_time
+             ON video_downloads(downloaded_at_ms DESC);",
+    )?;
+
+    Ok(())
+}
+
+/// Setup hook — init pre-auth DB + manage state. Swap sang user DB qua
+/// `switch_db_to_user` sau khi FE auth ready.
 pub fn setup(app: &AppHandle) -> Result<()> {
-    let conn = init_video_db(app)?;
+    let path = resolve_pre_auth_video_db_path(app)?;
+    let conn = init_video_db_at(&path)?;
     app.manage(VideoDbState(Mutex::new(conn)));
     Ok(())
 }
@@ -138,6 +223,112 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(urls, vec!["https://tiktok.com/b", "https://tiktok.com/a"]);
+    }
+
+    #[test]
+    fn video_downloads_upsert_keeps_latest_by_url() {
+        let conn = test_conn();
+        // UPSERT cùng URL 2 lần → chỉ 1 row, giữ timestamp + status mới nhất.
+        conn.execute(
+            "INSERT INTO video_downloads(url, downloaded_at_ms, status)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(url) DO UPDATE SET
+                 downloaded_at_ms = excluded.downloaded_at_ms,
+                 status = excluded.status",
+            params!["https://douyin.com/video/xyz", 100_i64, "failed"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO video_downloads(url, downloaded_at_ms, status)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(url) DO UPDATE SET
+                 downloaded_at_ms = excluded.downloaded_at_ms,
+                 status = excluded.status",
+            params!["https://douyin.com/video/xyz", 200_i64, "success"],
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM video_downloads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "UPSERT phải giữ 1 row per URL");
+
+        let (ts, status): (i64, String) = conn
+            .query_row(
+                "SELECT downloaded_at_ms, status FROM video_downloads",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ts, 200, "giữ timestamp mới nhất");
+        assert_eq!(status, "success", "giữ status mới nhất");
+    }
+
+    #[test]
+    fn migrate_video_downloads_dedupe_and_add_unique() {
+        // Tạo DB cũ KHÔNG có UNIQUE(url) — simulate legacy DB trước migration.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE video_downloads (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                url                TEXT NOT NULL,
+                downloaded_at_ms   INTEGER NOT NULL,
+                status             TEXT NOT NULL CHECK(status IN ('success','failed'))
+            );",
+        )
+        .unwrap();
+
+        // Insert 3 rows: 2 cùng URL (cần dedupe), 1 URL khác.
+        conn.execute(
+            "INSERT INTO video_downloads(url, downloaded_at_ms, status)
+             VALUES(?1, ?2, ?3)",
+            params!["https://a.com/1", 100_i64, "success"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO video_downloads(url, downloaded_at_ms, status)
+             VALUES(?1, ?2, ?3)",
+            params!["https://a.com/1", 300_i64, "failed"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO video_downloads(url, downloaded_at_ms, status)
+             VALUES(?1, ?2, ?3)",
+            params!["https://b.com/2", 200_i64, "success"],
+        )
+        .unwrap();
+
+        migrate_video_downloads_unique_url(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM video_downloads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "dedupe phải merge 2 rows cùng URL thành 1");
+
+        let (ts, status): (i64, String) = conn
+            .query_row(
+                "SELECT downloaded_at_ms, status FROM video_downloads WHERE url = ?1",
+                ["https://a.com/1"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ts, 300, "giữ timestamp latest");
+        assert_eq!(status, "failed", "giữ status latest");
+
+        // Verify UNIQUE constraint đã enable — insert duplicate URL fail.
+        let r = conn.execute(
+            "INSERT INTO video_downloads(url, downloaded_at_ms, status)
+             VALUES(?1, ?2, ?3)",
+            params!["https://a.com/1", 400_i64, "success"],
+        );
+        assert!(r.is_err(), "UNIQUE constraint phải reject duplicate URL");
+
+        // Migration idempotent — chạy lần 2 không crash.
+        migrate_video_downloads_unique_url(&conn).unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM video_downloads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count2, 2, "migration idempotent");
     }
 
     #[test]

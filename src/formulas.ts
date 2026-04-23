@@ -29,6 +29,13 @@ export type OverviewTotals = DayTotals & {
   /** Tổng phí quản lý MCN Shopee đã cắt (đã trừ sẵn trong commission —
    *  chỉ dùng hiển thị minh bạch, không tính lại profit). */
   mcnFeeTotal: number;
+  /** Tổng hoa hồng từ đơn rủi ro huỷ (Đang chờ xử lý + Chưa thanh toán).
+   *  Đã tính sẵn vào `commission` — hiển thị riêng để admin biết rủi ro. */
+  commissionPending: number;
+  /** Tổng impressions FB ads — dùng tính CPM + impression→click rate. */
+  impressions: number;
+  /** Breakdown click Shopee theo referrer (đã filter settings). */
+  clicksByReferrer: Record<string, number>;
   daysCount: number;
   rowsCount: number;
 };
@@ -165,6 +172,9 @@ export function computeOverviewTotals(
     orderValueTotal: 0,
     netCommission: 0,
     mcnFeeTotal: 0,
+    commissionPending: 0,
+    impressions: 0,
+    clicksByReferrer: {},
     daysCount: 0,
     rowsCount: 0,
   };
@@ -172,6 +182,7 @@ export function computeOverviewTotals(
     const t = day.totals;
     const spend = includeAds ? t.totalSpend : 0;
     const adsClicks = includeAds ? t.adsClicks : 0;
+    const impr = includeAds ? t.impressions : 0;
     // Dùng computeNetCommission trên day.totals (pre row-0 filter) — KPI
     // accurate kể cả khi có tuple click-only bị filter.
     const net = computeNetCommission(
@@ -182,12 +193,19 @@ export function computeOverviewTotals(
     acc.clicks += adsClicks;
     acc.shopeeClicks += sumFiltered(t.shopeeClicksByReferrer, clickSources);
     acc.totalSpend += spend;
+    acc.impressions += impr;
     acc.orders += t.ordersCount;
     acc.commission += t.commissionTotal;
     acc.netCommission += net;
     acc.profit += net - spend;
     acc.orderValueTotal += t.orderValueTotal;
     acc.mcnFeeTotal += t.mcnFeeTotal;
+    acc.commissionPending += t.commissionPending;
+    // Merge clicks by referrer (chỉ referrer enabled qua settings).
+    for (const [ref, n] of Object.entries(t.shopeeClicksByReferrer)) {
+      if (clickSources[ref] === false) continue;
+      acc.clicksByReferrer[ref] = (acc.clicksByReferrer[ref] ?? 0) + n;
+    }
 
     // daysCount/rowsCount vẫn dựa vào row-level vì là metrics hiển thị UI.
     let dayContributed = false;
@@ -263,6 +281,302 @@ export function aggregateProductRows(
   return Array.from(map.values());
 }
 
+// =========================================================
+// ADS ANALYTICS — metrics actionable cho quyết định chạy ads
+// =========================================================
+
+/// Data point cho trend chart: 1 ngày = 1 point.
+/// profit, spend, netCommission, roi chạy cùng X-axis (date).
+export type DailyTrendPoint = {
+  date: string;
+  /// Label hiển thị trên trục X: DD/MM.
+  dateShort: string;
+  spend: number;
+  netCommission: number;
+  profit: number;
+  /// ROI % = profit/spend × 100. null nếu spend=0 (chưa chạy ads ngày đó).
+  roi: number | null;
+  orders: number;
+  shopeeClicks: number;
+};
+
+/// Trend theo ngày cho chart. Days ASC by date để biểu đồ vẽ từ trái qua phải.
+export function computeDailyTrend(
+  days: readonly UiDay[],
+  clickSources: Record<string, boolean>,
+  fees: ProfitFees,
+  source: SourceFilter,
+): DailyTrendPoint[] {
+  const includeAds = source === "all";
+  const points: DailyTrendPoint[] = [];
+  for (const day of days) {
+    const t = day.totals;
+    const spend = includeAds ? t.totalSpend : 0;
+    const net = computeNetCommission(t.commissionTotal, t.commissionPending, fees);
+    const profit = net - spend;
+    const roi = spend > 0 ? (profit / spend) * 100 : null;
+    const [y, m, d] = day.date.split("-");
+    points.push({
+      date: day.date,
+      dateShort: `${d}/${m}`,
+      spend,
+      netCommission: net,
+      profit,
+      roi,
+      orders: t.ordersCount,
+      shopeeClicks: sumFiltered(t.shopeeClicksByReferrer, clickSources),
+    });
+    // Suppress unused var warning for `y`.
+    void y;
+  }
+  // Sort ASC by date (days đầu vào thường DESC theo UI).
+  points.sort((a, b) => a.date.localeCompare(b.date));
+  return points;
+}
+
+/// Top N winners: products có profit > 0, sắp xếp theo ROI giảm dần.
+/// `minSpend` = ngưỡng tối thiểu để loại noise (product spend quá ít, ROI cao
+/// không có ý nghĩa thống kê). Default = tổng spend / số product × 0.1.
+export function computeWinners(
+  products: readonly AggregatedProductRow[],
+  minSpend: number,
+  limit = 5,
+): AggregatedProductRow[] {
+  return products
+    .filter((p) => p.profit > 0 && p.totalSpend >= minSpend)
+    .sort((a, b) => {
+      const roiA = a.totalSpend > 0 ? a.profit / a.totalSpend : 0;
+      const roiB = b.totalSpend > 0 ? b.profit / b.totalSpend : 0;
+      return roiB - roiA;
+    })
+    .slice(0, limit);
+}
+
+/// Top N losers: products có profit < 0, sắp xếp theo số tiền lỗ giảm dần
+/// (profit âm nhất trước). Loss leaders — gợi ý cut để tiết kiệm ads budget.
+export function computeLosers(
+  products: readonly AggregatedProductRow[],
+  minSpend: number,
+  limit = 5,
+): AggregatedProductRow[] {
+  return products
+    .filter((p) => p.profit < 0 && p.totalSpend >= minSpend)
+    .sort((a, b) => a.profit - b.profit) // most negative first
+    .slice(0, limit);
+}
+
+/// Ngưỡng min spend để lọc noise khỏi winners/losers. Dùng median spend của
+/// các product có spend > 0 — robust với outliers so với mean.
+export function computeMinSpendThreshold(
+  products: readonly AggregatedProductRow[],
+): number {
+  const spends = products
+    .map((p) => p.totalSpend)
+    .filter((s) => s > 0)
+    .sort((a, b) => a - b);
+  if (spends.length === 0) return 0;
+  const mid = Math.floor(spends.length / 2);
+  return spends.length % 2 === 0
+    ? (spends[mid - 1] + spends[mid]) / 2
+    : spends[mid];
+}
+
+/// Breakeven CR (%) = CR tối thiểu để lợi nhuận = 0 với hiện trạng.
+/// Công thức: profit = 0 ⇔ net_commission = spend
+///          ⇔ orders × (avgCommissionPerOrder × (1-tax) - ...) = spend
+/// Simplification: dùng commission/order TB hiện tại × (1 - taxRate)
+/// làm revenue per order, ignore pending reserve (simplification — reserve
+/// rate nhỏ, không đổi dramatically kết quả).
+/// breakevenCR = spend / (shopeeClicks × netPerOrder) × 100
+export type BreakevenAnalysis = {
+  /// CR% tối thiểu để hòa vốn với click + spend hiện tại.
+  breakevenCr: number | null;
+  /// CR% thực tế hiện tại.
+  currentCr: number | null;
+  /// Gap = currentCr - breakevenCr. Dương = đang lãi, âm = đang lỗ.
+  gap: number | null;
+  /// Revenue trung bình per order (commission net).
+  netPerOrder: number | null;
+};
+
+export function computeBreakeven(
+  totals: OverviewTotals,
+  fees: ProfitFees,
+): BreakevenAnalysis {
+  const tax = fees.taxAndPlatformRate / 100;
+  const netPerOrder =
+    totals.orders > 0
+      ? (totals.commission / totals.orders) * (1 - tax)
+      : null;
+  const currentCr =
+    totals.shopeeClicks > 0 ? (totals.orders / totals.shopeeClicks) * 100 : null;
+  let breakevenCr: number | null = null;
+  if (
+    netPerOrder !== null &&
+    netPerOrder > 0 &&
+    totals.totalSpend > 0 &&
+    totals.shopeeClicks > 0
+  ) {
+    breakevenCr = (totals.totalSpend / (totals.shopeeClicks * netPerOrder)) * 100;
+  }
+  const gap =
+    currentCr !== null && breakevenCr !== null ? currentCr - breakevenCr : null;
+  return { breakevenCr, currentCr, gap, netPerOrder };
+}
+
+/// Funnel metrics: Impression → Click ADS → Click Shopee → Số đơn.
+/// - CTR (FB): Click ADS / Impression — ad creative/target performance
+/// - Click-through Shopee: Click Shopee / Click ADS — ad→landing relevance
+/// - CR: Đơn / Click Shopee — product conversion
+/// Bottleneck analysis: step nào drop nhiều nhất → fix đó.
+export type FunnelMetrics = {
+  impressions: number;
+  adsClicks: number;
+  shopeeClicks: number;
+  orders: number;
+  /// Impression → Click ADS %.
+  ctrFb: number | null;
+  /// Click ADS → Click Shopee %.
+  ctrShopee: number | null;
+  /// Click Shopee → Order %.
+  cr: number | null;
+};
+
+export function computeFunnel(totals: OverviewTotals): FunnelMetrics {
+  const ctrFb =
+    totals.impressions > 0 ? (totals.clicks / totals.impressions) * 100 : null;
+  const ctrShopee =
+    totals.clicks > 0 ? (totals.shopeeClicks / totals.clicks) * 100 : null;
+  const cr =
+    totals.shopeeClicks > 0 ? (totals.orders / totals.shopeeClicks) * 100 : null;
+  return {
+    impressions: totals.impressions,
+    adsClicks: totals.clicks,
+    shopeeClicks: totals.shopeeClicks,
+    orders: totals.orders,
+    ctrFb,
+    ctrShopee,
+    cr,
+  };
+}
+
+/// Efficiency metrics cho ads spend — ngoài ROI đã có.
+/// - ROAS: Revenue (hoa hồng ròng) / Spend. ROAS=1 = hòa vốn, >1 = lãi.
+/// - EPC: Commission ròng / Click Shopee. Earnings Per Click — affiliate KPI.
+/// - CPM: Spend / Impressions × 1000. Giá mỗi 1000 impression.
+/// - AOV: Order Value / Orders. Đã có trong SecondaryKpiRow nhưng surface lại.
+/// - Avg daily spend: spend / daysCount — biết đang chạy ngân sách bao nhiêu/ngày.
+export type AdsEfficiencyMetrics = {
+  roas: number | null;
+  epc: number | null;
+  cpm: number | null;
+  aov: number | null;
+  avgDailySpend: number | null;
+};
+
+export function computeAdsEfficiency(
+  totals: OverviewTotals,
+): AdsEfficiencyMetrics {
+  return {
+    roas:
+      totals.totalSpend > 0 ? totals.netCommission / totals.totalSpend : null,
+    epc:
+      totals.shopeeClicks > 0
+        ? totals.netCommission / totals.shopeeClicks
+        : null,
+    cpm:
+      totals.impressions > 0
+        ? (totals.totalSpend / totals.impressions) * 1000
+        : null,
+    aov: totals.orders > 0 ? totals.orderValueTotal / totals.orders : null,
+    avgDailySpend:
+      totals.daysCount > 0 ? totals.totalSpend / totals.daysCount : null,
+  };
+}
+
+/// Cumulative profit trend: mỗi ngày = profit累mulative từ ngày đầu đến đó.
+/// Thấy được đường tăng trưởng (line luôn tăng nếu profit dương mọi ngày,
+/// hoặc có đoạn giảm nếu ngày lỗ).
+export type CumulativePoint = {
+  date: string;
+  dateShort: string;
+  cumulativeProfit: number;
+  cumulativeSpend: number;
+  cumulativeRevenue: number;
+};
+
+export function computeCumulativeTrend(
+  trend: readonly DailyTrendPoint[],
+): CumulativePoint[] {
+  let cp = 0;
+  let cs = 0;
+  let cr = 0;
+  const out: CumulativePoint[] = [];
+  for (const p of trend) {
+    cp += p.profit;
+    cs += p.spend;
+    cr += p.netCommission;
+    out.push({
+      date: p.date,
+      dateShort: p.dateShort,
+      cumulativeProfit: cp,
+      cumulativeSpend: cs,
+      cumulativeRevenue: cr,
+    });
+  }
+  return out;
+}
+
+/// Best & worst day trong khoảng: top theo profit (dương nhất), bottom theo
+/// profit (âm nhất). Gợi ý user pattern ngày tốt/xấu để investigate.
+export type ExtremumDay = {
+  date: string;
+  profit: number;
+  spend: number;
+  netCommission: number;
+  roi: number | null;
+  orders: number;
+};
+
+export function computeExtremumDays(
+  trend: readonly DailyTrendPoint[],
+): { best: ExtremumDay | null; worst: ExtremumDay | null } {
+  // Chỉ xét ngày có spend > 0 (ngày chưa chạy ads → profit = net commission,
+  // so sánh không fair cho ads analysis).
+  const withSpend = trend.filter((p) => p.spend > 0);
+  if (withSpend.length === 0) return { best: null, worst: null };
+
+  // Best = ngày THỰC SỰ LÃI (profit > 0) có profit cao nhất. Nếu không có
+  // ngày lãi → null (UI show empty state, không gọi ngày lỗ nhẹ nhất là
+  // "ngày tốt nhất" — misleading).
+  const profitable = withSpend.filter((p) => p.profit > 0);
+  const best =
+    profitable.length > 0
+      ? profitable.reduce((a, b) => (a.profit >= b.profit ? a : b))
+      : null;
+
+  // Worst = ngày THỰC SỰ LỖ (profit < 0) có profit thấp nhất. Nếu không có
+  // ngày lỗ → null (show empty state "không có ngày lỗ").
+  const losing = withSpend.filter((p) => p.profit < 0);
+  const worst =
+    losing.length > 0
+      ? losing.reduce((a, b) => (a.profit <= b.profit ? a : b))
+      : null;
+
+  const toExtremum = (p: DailyTrendPoint): ExtremumDay => ({
+    date: p.date,
+    profit: p.profit,
+    spend: p.spend,
+    netCommission: p.netCommission,
+    roi: p.roi,
+    orders: p.orders,
+  });
+  return {
+    best: best ? toExtremum(best) : null,
+    worst: worst ? toExtremum(worst) : null,
+  };
+}
+
 export const fmtVnd = (n: number) =>
   new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 0 }).format(
     Math.round(n),
@@ -283,6 +597,65 @@ export const fmtDate = (iso: string) => {
   if (!y || !m || !d) return iso;
   return `${d}/${m}/${y}`;
 };
+
+/** Rút gọn số thành K/M/B cho trục Y chart (giữ dấu âm). */
+export function fmtMoneyShort(n: number): string {
+  if (n === 0) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
+  return String(Math.round(n));
+}
+
+/** Bytes → human readable (B / KB / MB / GB) cho progress bar download. */
+export function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** Epoch ms → "HH:MM DD/MM/YYYY" (local time) cho lịch sử download video. */
+export function fmtHistoryTime(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())} ${pad(d.getDate())}/${pad(
+    d.getMonth() + 1,
+  )}/${d.getFullYear()}`;
+}
+
+/** Tone semantic cho UI — unify style mapping khắp components (chart, card, KPI). */
+export type Tone = "positive" | "negative" | "neutral" | "muted";
+
+/** Text color class theo tone — tailwind classes. */
+export function toneTextClass(tone: Tone): string {
+  switch (tone) {
+    case "positive":
+      return "text-green-400";
+    case "negative":
+      return "text-red-400";
+    case "muted":
+      return "text-white/70";
+    case "neutral":
+      return "text-white";
+  }
+}
+
+/** Tone derived từ profit value. Zero = neutral. */
+export function profitTone(value: number): Tone {
+  if (value > 0) return "positive";
+  if (value < 0) return "negative";
+  return "neutral";
+}
+
+/** Tone derived từ ROI % (null = muted = chưa có spend để tính). */
+export function roiTone(roi: number | null): Tone {
+  if (roi === null) return "muted";
+  if (roi > 0) return "positive";
+  if (roi < 0) return "negative";
+  return "neutral";
+}
 
 /// TSV (tab-separated) string cho 1 UiDay — user copy + paste vào Google
 /// Sheet / Excel. Số hiển thị raw (Number, không có " đ" hay "%") để spreadsheet

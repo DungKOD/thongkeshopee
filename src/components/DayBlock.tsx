@@ -27,6 +27,8 @@ interface DayBlockProps {
   onEditRow: (row: UiRow) => void;
   onEditDay: (date: string) => void;
   readOnly?: boolean;
+  /** Account filter từ App — pass-through cho ProductDetailDialog. */
+  accountFilter?: import("../hooks/useDbStats").AccountFilterMode;
 }
 
 const ROI_TOOLTIP =
@@ -79,6 +81,7 @@ export function DayBlock({
   onEditRow,
   onEditDay,
   readOnly = false,
+  accountFilter,
 }: DayBlockProps) {
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
   const [capturing, setCapturing] = useState(false);
@@ -418,6 +421,7 @@ export function DayBlock({
       <ProductDetailDialog
         isOpen={!!detailRow}
         row={detailRow}
+        accountFilter={accountFilter}
         onClose={() => setDetailRow(null)}
       />
 

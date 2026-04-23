@@ -6,7 +6,7 @@ export async function metadataRoute(
   auth: AuthContext,
   env: Env,
 ): Promise<Response> {
-  const key = `users/${auth.uid}/db.gz`;
+  const key = `users/${auth.uid}/db.zst`;
   const head = await env.DB_BUCKET.head(key);
 
   if (!head) {
@@ -16,6 +16,7 @@ export async function metadataRoute(
       sizeBytes: null,
       lastModified: null,
       fingerprint: null,
+      etag: null,
     });
   }
 
@@ -29,5 +30,9 @@ export async function metadataRoute(
     sizeBytes: head.size,
     lastModified,
     fingerprint,
+    // CAS: client có thể dùng etag này nếu chỉ gọi metadata rồi upload (không
+    // pull). Thường client sẽ pull mỗi khi etag thay đổi, nhưng return etag ở
+    // đây cho trường hợp startup check upload-init khi remote empty/local fresh.
+    etag: head.etag,
   });
 }

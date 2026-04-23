@@ -20,14 +20,12 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use tokio::fs;
 
-use super::sync::gunzip_if_needed;
+use super::sync::zstd_decompress;
 use super::sync_client;
 use super::{CmdError, CmdResult};
 use crate::db::{resolve_active_db_path, DbState};
@@ -79,21 +77,15 @@ pub async fn admin_view_user_db(
     target_local_part: String,
     target_email: Option<String>,
 ) -> CmdResult<AdminViewInfo> {
-    // 1. Gọi Worker /admin/download?uid=<uid> — verify admin + trả base64 + metadata.
-    let (base64, size_bytes, last_modified_ms) =
+    // 1. Gọi Worker /admin/download?uid=<uid> — verify admin + trả raw zstd bytes.
+    let (compressed, size_bytes, last_modified_ms) =
         sync_client::admin_download(&sync_api_url, &id_token, &target_uid).await?;
 
-    let raw_payload = BASE64
-        .decode(base64.as_bytes())
-        .map_err(|e| CmdError::msg(format!("base64 decode: {e}")))?;
-
-    // R2 lưu gzipped (`db.gz`). Phải decompress trước khi write làm SQLite
-    // file, nếu không SQLite mở file sẽ lỗi "file is not a database".
-    // gunzip_if_needed backward-compat với bản cũ (raw SQLite chưa gzip).
-    let bytes = gunzip_if_needed(&raw_payload)?;
+    // R2 lưu zstd bytes. Decompress trước khi write làm SQLite file.
+    let bytes = zstd_decompress(&compressed)?;
     eprintln!(
         "admin_view download: payload={} KB → sqlite={} KB",
-        raw_payload.len() / 1024,
+        compressed.len() / 1024,
         bytes.len() / 1024,
     );
 

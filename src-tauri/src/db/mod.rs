@@ -199,11 +199,42 @@ fn migrate(conn: &Connection) -> Result<()> {
         .context("imported_files drop day_fk migration failed")?;
     // v7: MCN fee visibility — lưu cột 31 (pre-MCN) + cột 35 (phí MCN) từ CSV.
     migrate_mcn_columns(conn).context("mcn columns migration failed")?;
+    // v9: drop `raw_json` columns — không read ở đâu, dedup với CSV file đã
+    // lưu trên disk (imports/<hash>.csv), giảm 55-70% DB size.
+    migrate_drop_raw_json(conn).context("drop raw_json columns failed")?;
     // Dọn orphan imported_files mỗi startup — idempotent. Xử lý legacy DB
     // của user đã xóa ngày trước khi batch_commit_deletes biết cleanup
     // (kẻo re-import cùng file bị chặn bởi hash dedup).
     cleanup_orphan_imported_files(conn).context("cleanup orphan imported_files failed")?;
 
+    Ok(())
+}
+
+/// v9 migration: drop `raw_json` columns khỏi `raw_shopee_order_items` +
+/// `raw_fb_ads`. Data vẫn còn trên disk ở `imports/<hash>.csv` — tương lai
+/// cần re-extract field nào có thể đọc lại CSV. Idempotent (check trước drop).
+///
+/// SQLite 3.35+ support `ALTER TABLE DROP COLUMN`. rusqlite bundled v3.46+ OK.
+/// Sau drop, cần VACUUM để reclaim disk space thực sự — chạy 1 lần sau migrate.
+fn migrate_drop_raw_json(conn: &Connection) -> Result<()> {
+    let mut vacuum_needed = false;
+    for table in ["raw_shopee_order_items", "raw_fb_ads"] {
+        if table_has_column(conn, table, "raw_json")? {
+            conn.execute(&format!("ALTER TABLE {table} DROP COLUMN raw_json"), [])?;
+            vacuum_needed = true;
+        }
+    }
+    if vacuum_needed {
+        // VACUUM reclaim free pages từ DROP COLUMN. Tốn thời gian (~10-30s cho
+        // 500MB DB) nhưng chỉ 1 lần sau migration v9. Subsequent startup skip
+        // vì table_has_column return false.
+        conn.execute_batch("VACUUM")?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
     Ok(())
 }
 
@@ -415,12 +446,12 @@ fn migrate_fb_unify(conn: &Connection) -> Result<()> {
              (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
               report_start, report_end, status,
               spend, clicks, cpc, impressions, reach,
-              raw_json, day_date, source_file_id)
+              day_date, source_file_id)
              SELECT 'ad_group', ad_group_name,
                     sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     report_start, report_end, status,
                     spend, {clicks_expr}, {cpc_expr}, impressions, reach,
-                    raw_json, day_date, source_file_id
+                    day_date, source_file_id
              FROM raw_fb_ad_groups"
         );
         conn.execute(&sql, [])?;
@@ -446,12 +477,12 @@ fn migrate_fb_unify(conn: &Connection) -> Result<()> {
              (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
               report_start, report_end, status,
               spend, clicks, cpc, impressions, reach,
-              raw_json, day_date, source_file_id)
+              day_date, source_file_id)
              SELECT 'campaign', campaign_name,
                     sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     report_start, report_end, status,
                     spend, {clicks_expr}, {cpc_expr}, impressions, reach,
-                    raw_json, day_date, source_file_id
+                    day_date, source_file_id
              FROM raw_fb_campaigns"
         );
         conn.execute(&sql, [])?;
@@ -520,6 +551,34 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
     if !cols.iter().any(|c| c == "owner_uid") {
         conn.execute(
             "ALTER TABLE sync_state ADD COLUMN owner_uid TEXT",
+            [],
+        )?;
+    }
+    // v8: HLC-lite clock (chống clock drift giữa 2 máy). Mỗi mutation lấy
+    // `max(now_ms, last_known_clock_ms + 1)` → timestamp monotonic kể cả khi
+    // local wall clock chậm hơn remote. Sau merge, absorb max remote timestamp
+    // → edit sau merge luôn > mọi edit remote đã thấy.
+    if !cols.iter().any(|c| c == "last_known_clock_ms") {
+        conn.execute(
+            "ALTER TABLE sync_state ADD COLUMN last_known_clock_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    // v8: CAS upload guard. Store etag từ R2 lần cuối pull/upload thành công.
+    // Next upload attach expected_etag → Worker reject 412 nếu R2 đã thay đổi
+    // (máy khác upload trong lúc này) → FE force pull-merge-push + retry.
+    if !cols.iter().any(|c| c == "last_remote_etag") {
+        conn.execute(
+            "ALTER TABLE sync_state ADD COLUMN last_remote_etag TEXT",
+            [],
+        )?;
+    }
+    // v8.1: skip-identical hash. MD5 của compressed bytes lần upload gần nhất.
+    // Next upload compute hash trước → match → skip (no-op sync), save bandwidth
+    // cho case user edit-revert-edit-revert tạo identical snapshots.
+    if !cols.iter().any(|c| c == "last_uploaded_hash") {
+        conn.execute(
+            "ALTER TABLE sync_state ADD COLUMN last_uploaded_hash TEXT",
             [],
         )?;
     }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 
 /**
@@ -16,27 +16,36 @@ export type FilterMode =
 
 export type FilterScope = "stats" | "overview";
 
-export const DEFAULT_RECENT = 7;
 export const LOAD_MORE_STEP = 7;
+/** Mặc định BOTH scopes (stats + overview) = 1 ngày gần nhất — khớp với
+ *  shortcut "Ngày gần nhất" (canExpand=false, count=1) để UI highlight
+ *  đúng. User click shortcut khác (7/14/30 ngày / range) để mở rộng. */
 export const DEFAULT_MODE: FilterMode = {
-  type: "recent",
-  count: DEFAULT_RECENT,
-  canExpand: true,
-};
-/** Overview scope mặc định 1 ngày gần nhất — khớp với shortcut "Ngày gần
- *  nhất" (canExpand=false, count=1) để UI highlight đúng. User click
- *  shortcut khác để mở rộng range. */
-const OVERVIEW_DEFAULT_MODE: FilterMode = {
   type: "recent",
   count: 1,
   canExpand: false,
 };
-const defaultModeFor = (scope: FilterScope): FilterMode =>
-  scope === "overview" ? OVERVIEW_DEFAULT_MODE : DEFAULT_MODE;
 
-/** Prefix + scope → key localStorage. 2 tab persist độc lập. */
-const STORAGE_PREFIX = "thongkeshopee.filter.v2";
-const storageKey = (scope: FilterScope) => `${STORAGE_PREFIX}.${scope}`;
+/// Cleanup legacy localStorage keys từ versions trước (khi filter có persist
+/// qua localStorage). Giờ state in-memory only → keys cũ orphan, xóa 1 lần
+/// cho gọn. Flag persistent để không wipe mỗi startup.
+const CLEANUP_FLAG = "thongkeshopee.filter.memory-only-cleanup.v1";
+const LEGACY_KEYS = [
+  "thongkeshopee.filter.v2",
+  "thongkeshopee.filter.v2.stats",
+  "thongkeshopee.filter.v2.overview",
+  "thongkeshopee.filter.default-migration.v1",
+];
+function cleanupLegacyStorageOnce(): void {
+  try {
+    if (localStorage.getItem(CLEANUP_FLAG)) return;
+    for (const k of LEGACY_KEYS) localStorage.removeItem(k);
+    localStorage.setItem(CLEANUP_FLAG, "1");
+  } catch {
+    // ignore — quota/privacy mode
+  }
+}
+cleanupLegacyStorageOnce();
 
 /** Đầu + cuối của tháng trước so với today local. Trả YYYY-MM-DD. */
 export function prevMonthRange(): { from: string; to: string } {
@@ -53,48 +62,15 @@ export function prevMonthRange(): { from: string; to: string } {
   return { from: fmt(start), to: fmt(end) };
 }
 
-function loadFilterMode(scope: FilterScope): FilterMode {
-  const fallback = defaultModeFor(scope);
-  try {
-    // Migrate: legacy key (trước khi tách scope) dùng cho tab "stats".
-    const raw =
-      localStorage.getItem(storageKey(scope)) ??
-      (scope === "stats" ? localStorage.getItem(STORAGE_PREFIX) : null);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw);
-    if (parsed?.type === "recent" && Number.isFinite(parsed.count)) {
-      return {
-        type: "recent",
-        count: Math.max(1, Math.floor(parsed.count)),
-        canExpand: !!parsed.canExpand,
-      };
-    }
-    if (parsed?.type === "range" && typeof parsed.from === "string") {
-      return {
-        type: "range",
-        from: parsed.from,
-        to: typeof parsed.to === "string" ? parsed.to : "",
-      };
-    }
-    if (parsed?.type === "all") return { type: "all" };
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-function saveFilterMode(scope: FilterScope, m: FilterMode) {
-  try {
-    localStorage.setItem(storageKey(scope), JSON.stringify(m));
-  } catch {
-    // ignore
-  }
-}
-
 /**
  * State + handlers của filter bar cho 1 scope (tab). Mọi tab dùng **cùng
- * logic** — chỉ khác state instance + localStorage key. Callers gọi hook
- * cho mỗi scope, route theo `activeTab`.
+ * logic** — chỉ khác state instance. Callers gọi hook cho mỗi scope, route
+ * theo `activeTab`.
+ *
+ * **Persistence = in-memory only.** Reload app / logout → state mất → default
+ * "1 ngày gần nhất". Chuyển tab stats ↔ overview: giữ nguyên vì 2 instance
+ * state độc lập survive qua render. Logout-login: AppInner remount qua
+ * `<SettingsProvider key={user.uid}>` trong AuthGate → fresh state.
  *
  * Returns object (theo rule react-frontend.md).
  */
@@ -107,7 +83,7 @@ export interface UseFilterModeResult {
   setPrevMonth: () => void;
   /** Shortcut: từ trước đến nay (all). */
   setAllTime: () => void;
-  /** Về default (recent 7, canExpand). */
+  /** Về default (1 ngày gần nhất). */
   clear: () => void;
   /** Date picker "Từ ngày" → chuyển sang range mode. */
   setDateFrom: (v: string) => void;
@@ -115,12 +91,8 @@ export interface UseFilterModeResult {
   setDateTo: (v: string) => void;
 }
 
-export function useFilterMode(scope: FilterScope): UseFilterModeResult {
-  const [mode, setMode] = useState<FilterMode>(() => loadFilterMode(scope));
-
-  useEffect(() => {
-    saveFilterMode(scope, mode);
-  }, [scope, mode]);
+export function useFilterMode(_scope: FilterScope): UseFilterModeResult {
+  const [mode, setMode] = useState<FilterMode>(DEFAULT_MODE);
 
   const setRecent = useCallback(
     (n: number) => setMode({ type: "recent", count: n, canExpand: false }),
@@ -131,7 +103,7 @@ export function useFilterMode(scope: FilterScope): UseFilterModeResult {
     setMode({ type: "range", from: r.from, to: r.to });
   }, []);
   const setAllTime = useCallback(() => setMode({ type: "all" }), []);
-  const clear = useCallback(() => setMode(defaultModeFor(scope)), [scope]);
+  const clear = useCallback(() => setMode(DEFAULT_MODE), []);
   const setDateFrom = useCallback((v: string) => {
     setMode((m) => ({
       type: "range",

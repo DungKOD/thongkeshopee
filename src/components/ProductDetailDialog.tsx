@@ -17,16 +17,21 @@ import {
 } from "../lib/screenshot";
 import { DayScreenshotDialog } from "./DayScreenshotDialog";
 import { ScrollToTopButton } from "./ScrollToTopButton";
+import { ProductClickInsights } from "./ProductClickInsights";
+import type { AccountFilterMode } from "../hooks/useDbStats";
 
 interface ProductDetailDialogProps {
   isOpen: boolean;
   row: UiRow | null;
+  /** Account filter từ parent — dùng cho BE click insights queries. */
+  accountFilter?: AccountFilterMode;
   onClose: () => void;
 }
 
 export function ProductDetailDialog({
   isOpen,
   row,
+  accountFilter,
   onClose,
 }: ProductDetailDialogProps) {
   const { settings } = useSettings();
@@ -466,6 +471,18 @@ export function ProductDetailDialog({
               />
             </div>
           </Section>
+
+          {/* ============ Phân tích click Shopee (scope theo sub_ids) ============ */}
+          {row && (
+            <ProductClickInsights
+              filter={{
+                fromDate: row.dayDate,
+                toDate: row.dayDate,
+                accountFilter,
+                subIds: row.subIds as [string, string, string, string, string],
+              }}
+            />
+          )}
 
           {/* ============ Sản phẩm bán được ============ */}
           <Section

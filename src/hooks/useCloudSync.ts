@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { auth } from "../lib/firebase";
+import { auth, getAuthToken } from "../lib/firebase";
 import { invoke } from "../lib/tauri";
 import {
   machineFingerprint,
@@ -74,7 +74,16 @@ interface UseCloudSyncOptions {
   onRemoteApplied?: () => void | Promise<void>;
 }
 
-const DEBOUNCE_MS = 15_000;
+/// Adaptive debounce: mutation đầu tiên dùng DEBOUNCE_BASE_MS, mỗi mutation
+/// tiếp theo (reset trong window) tăng ladder lên. Cap ở DEBOUNCE_MAX_MS.
+/// Kết quả: user edit liên tục → gộp thành 1 sync cuối thay vì N syncs.
+///
+/// Tradeoff: user edit 1 lần xong thôi → debounce BASE (15s, UX snappy).
+/// User edit 10 lần trong 1 phút → debounce extend dần lên MAX (60s), chỉ
+/// 1 upload cuối.
+const DEBOUNCE_BASE_MS = 15_000;
+const DEBOUNCE_MAX_MS = 60_000;
+const DEBOUNCE_STEP_MS = 15_000;
 const IDLE_MS = 30_000;
 const IDLE_CHECK_MS = 5_000;
 // Exponential backoff: 30s, 60s, 120s, 300s (cap 5min).
@@ -85,7 +94,20 @@ function backoffFor(attempt: number): number {
   return RETRY_BACKOFF_MS[idx];
 }
 
+/// Compute adaptive debounce delay dựa trên consecutive mutations.
+/// - 1st mutation: BASE (15s)
+/// - 2nd: BASE + STEP = 30s
+/// - 3rd: 45s
+/// - 4th+: capped at MAX (60s)
+function adaptiveDebounce(consecutive: number): number {
+  const delay = DEBOUNCE_BASE_MS + consecutive * DEBOUNCE_STEP_MS;
+  return Math.min(delay, DEBOUNCE_MAX_MS);
+}
+
 const ACTIVITY_EVENTS = ["mousedown", "keydown", "wheel", "touchstart"] as const;
+
+/** Signal Rust trả khi CAS etag mismatch — keep in sync với `sync.rs` const. */
+const ETAG_CONFLICT_PREFIX = "ETAG_CONFLICT";
 
 export function useCloudSync({
   mutationVersion,
@@ -106,6 +128,9 @@ export function useCloudSync({
   const retryAttemptRef = useRef(0);
   const lastActivityRef = useRef(Date.now());
   const startupDoneRef = useRef(false);
+  /// Đếm mutations liên tục trong window hiện tại (reset khi debounce fire).
+  /// Dùng compute delay adaptive: edit càng nhiều liên tục → delay dài hơn.
+  const consecutiveMutationsRef = useRef(0);
   const statusRef = useRef<SyncStatus>(status);
   useEffect(() => {
     statusRef.current = status;
@@ -149,10 +174,13 @@ export function useCloudSync({
     }
     clearDebounce();
     clearRetry();
+    // Reset counter — sync vừa fire xong (bất kể qua debounce, idle flush,
+    // hay forceSync), next mutation sẽ start từ BASE = 15s (snappy UX).
+    consecutiveMutationsRef.current = 0;
     setStatus("syncing");
     setError(null);
     try {
-      const idToken = await current.getIdToken(false);
+      const idToken = await getAuthToken();
       const [metadata, localFp, beforeSync] = await Promise.all([
         syncMetadata(idToken),
         machineFingerprint(),
@@ -185,16 +213,35 @@ export function useCloudSync({
         lastUploadedChangeId: beforeSync.lastUploadedChangeId,
       });
 
-      const res = needMerge
-        ? await syncPullMergePush(idToken)
-        : await syncUploadDb(idToken, metadata.exists ?? false);
+      // CAS upload retry: nếu upload thẳng bị 412 (máy khác đã upload giữa
+      // chừng), Rust trả error message bắt đầu "ETAG_CONFLICT" → tự động
+      // route sang pull-merge-push để merge data máy kia rồi re-upload.
+      // pull-merge-push đã có internal retry 3 lần nên không cần wrap thêm.
+      let res;
+      let mergeHappened = needMerge;
+      if (needMerge) {
+        res = await syncPullMergePush(idToken);
+      } else {
+        try {
+          res = await syncUploadDb(idToken, metadata.exists ?? false);
+        } catch (e) {
+          const msg = (e as Error).message ?? String(e);
+          if (msg.startsWith(ETAG_CONFLICT_PREFIX)) {
+            console.log("[sync] upload CAS conflict → fallback pull-merge-push");
+            res = await syncPullMergePush(idToken);
+            mergeHappened = true;
+          } else {
+            throw e;
+          }
+        }
+      }
       setLastSyncAt(new Date(res.last_modified_ms));
 
       const state = await refreshSyncState();
       retryAttemptRef.current = 0;
 
       // Chỉ refetch UI khi merge (đã chạm vào local DB). Upload thẳng không cần.
-      if (needMerge) {
+      if (mergeHappened) {
         try {
           await onRemoteAppliedRef.current?.();
         } catch {
@@ -232,10 +279,13 @@ export function useCloudSync({
 
   const scheduleDebounce = useCallback(() => {
     clearDebounce();
+    const delay = adaptiveDebounce(consecutiveMutationsRef.current);
     const timerId = window.setTimeout(() => {
       debounceRef.current = null;
+      // Reset counter khi debounce fire — next mutation sau đó sẽ start từ BASE.
+      consecutiveMutationsRef.current = 0;
       void doSync();
-    }, DEBOUNCE_MS);
+    }, delay);
     debounceRef.current = timerId;
   }, [doSync]);
 
@@ -253,7 +303,7 @@ export function useCloudSync({
     setError(null);
     try {
       const [idToken, localFp] = await Promise.all([
-        current.getIdToken(false),
+        getAuthToken(),
         machineFingerprint(),
       ]);
       const remote = await syncMetadata(idToken);
@@ -354,6 +404,10 @@ export function useCloudSync({
     if (startupDoneRef.current) return;
     startupDoneRef.current = true;
     void (async () => {
+      // CRITICAL: nếu switch_db_to_user fail, DbState vẫn trỏ _pre_auth (rỗng)
+      // → unlock UI sẽ hiển thị empty state, user tưởng mất data. Tách try
+      // riêng cho switch: fail → keep splash + error banner. doStartupCheck
+      // fail thì được unlock vì DB đã swap đúng, merge fail cũng không corrupt.
       try {
         const ownerChanged = await invoke<boolean>("switch_db_to_user", {
           newUid: authUid,
@@ -367,6 +421,18 @@ export function useCloudSync({
           // localStorage vì Firebase SDK / Tauri có key riêng — chỉ key app.
           wipeUserLocalStorage();
         }
+      } catch (e) {
+        const msg = (e as Error).message ?? String(e);
+        console.error("[sync] switch_db_to_user failed:", msg);
+        setError(msg);
+        setStatus("error");
+        startupDoneRef.current = false; // allow retry on re-auth / reload
+        return; // KHÔNG setIsStartupPhase(false) — splash stays với error
+      }
+
+      // Switch xong → UI có thể unlock safely. doStartupCheck/merge fail vẫn
+      // OK vì DB đã đúng folder user.
+      try {
         // CRITICAL phân quyền: LUÔN refetch FE state sau khi switch_db_to_user
         // xong (bất kể ownerChanged), vì DbState connection đã trỏ sang DB mới
         // của user hiện tại. AccountContext + useDbStats gọi list/query trước
@@ -407,7 +473,7 @@ export function useCloudSync({
   }, [enabled]);
 
   // Mutation → debounce sync. Reset timer mỗi mutation (user đề xuất: giây thứ 7
-  // có mutation mới → 15s đếm lại từ đầu).
+  // có mutation mới → adaptive debounce đếm lại + ladder tăng delay.
   useEffect(() => {
     if (!enabled) return;
     if (
@@ -420,6 +486,9 @@ export function useCloudSync({
     if (mutationVersion === 0) return;
 
     setStatus("dirty");
+    // Tăng consecutive counter — mutation tiếp theo sẽ có delay lớn hơn
+    // (ladder BASE → +STEP → +STEP → ... → MAX). Cap ở MAX (60s).
+    consecutiveMutationsRef.current += 1;
     scheduleDebounce();
 
     return () => {

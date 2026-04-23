@@ -62,7 +62,6 @@ export interface ShopeeOrderRow {
   mcnFee: number | null;
   subIds: SubIds;
   channel: string | null;
-  rawJson: string | null;
 }
 
 export interface FbAdGroupRow {
@@ -86,7 +85,6 @@ export interface FbAdGroupRow {
   cpm: number | null;
   resultCount: number | null;
   costPerResult: number | null;
-  rawJson: string | null;
 }
 
 export interface FbCampaignRow {
@@ -105,7 +103,6 @@ export interface FbCampaignRow {
   linkCpc: number | null;
   allCpc: number | null;
   costPerResult: number | null;
-  rawJson: string | null;
 }
 
 export interface ImportResult {
@@ -161,24 +158,8 @@ function strOrNull(v: unknown): string | null {
   return s || null;
 }
 
-/**
- * Lọc các field đã dùng → stringify phần còn lại vào `raw_json`.
- * Cho phép lưu toàn bộ CSV row để tra cứu sau mà không cần schema hóa.
- */
-function buildRawJson(
-  row: Record<string, string>,
-  usedKeys: ReadonlySet<string>,
-): string | null {
-  const extras: Record<string, string> = {};
-  let count = 0;
-  for (const [k, v] of Object.entries(row)) {
-    if (usedKeys.has(k)) continue;
-    if (v === null || v === undefined || v === "") continue;
-    extras[k] = v;
-    count += 1;
-  }
-  return count === 0 ? null : JSON.stringify(extras);
-}
+// buildRawJson removed v9 — raw_json column dropped. CSV gốc lưu
+// imports/<hash>.csv nếu tương lai cần re-extract field phụ.
 
 // =========================================================
 // Detect kind
@@ -213,38 +194,6 @@ function toShopeeClickRow(r: Record<string, string>): ShopeeClickRow | null {
     referrer: strOrNull(r["Người giới thiệu"]),
   };
 }
-
-const SHOPEE_ORDER_USED = new Set([
-  "ID đơn hàng",
-  "Trạng thái đặt hàng",
-  "Checkout id",
-  "Thời Gian Đặt Hàng",
-  "Thời gian hoàn thành",
-  "Thời gian Click",
-  "Tên Shop",
-  "Shop id",
-  "Loại Shop",
-  "Item id",
-  "Tên Item",
-  "ID Model",
-  "L1 Danh mục toàn cầu",
-  "L2 Danh mục toàn cầu",
-  "L3 Danh mục toàn cầu",
-  "Giá(₫)",
-  "Số lượng",
-  "Giá trị đơn hàng (₫)",
-  "Số tiền hoàn trả (₫)",
-  "Tổng hoa hồng sản phẩm(₫)",
-  "Tổng hoa hồng đơn hàng(₫)",
-  "Phí quản lý MCN(₫)",
-  "Hoa hồng ròng tiếp thị liên kết(₫)",
-  "Sub_id1",
-  "Sub_id2",
-  "Sub_id3",
-  "Sub_id4",
-  "Sub_id5",
-  "Kênh",
-]);
 
 function toShopeeOrderRow(r: Record<string, string>): ShopeeOrderRow | null {
   const orderId = (r["ID đơn hàng"] ?? "").trim();
@@ -285,31 +234,8 @@ function toShopeeOrderRow(r: Record<string, string>): ShopeeOrderRow | null {
     mcnFee: parseNumOrNull(r["Phí quản lý MCN(₫)"]),
     subIds,
     channel: strOrNull(r["Kênh"]),
-    rawJson: buildRawJson(r, SHOPEE_ORDER_USED),
   };
 }
-
-const FB_AD_GROUP_USED = new Set([
-  "Lượt bắt đầu báo cáo",
-  "Lượt kết thúc báo cáo",
-  "Tên nhóm quảng cáo",
-  "Phân phối nhóm quảng cáo",
-  "Số tiền đã chi tiêu (VND)",
-  "Lượt hiển thị",
-  "Người tiếp cận",
-  "Tần suất",
-  "Lượt click vào liên kết",
-  "shop_clicks",
-  "Lượt click (tất cả)",
-  "CPC (chi phí trên mỗi lượt click vào liên kết) (VND)",
-  "CPC (tất cả) (VND)",
-  "CTR (tỷ lệ click vào liên kết)",
-  "CTR (Tất cả)",
-  "Lượt xem trang đích",
-  "CPM (Chi phí trên mỗi 1.000 lượt hiển thị) (VND)",
-  "Kết quả",
-  "Chi phí trên mỗi kết quả",
-]);
 
 function toFbAdGroupRow(r: Record<string, string>): FbAdGroupRow | null {
   const name = (r["Tên nhóm quảng cáo"] ?? "").trim();
@@ -339,26 +265,8 @@ function toFbAdGroupRow(r: Record<string, string>): FbAdGroupRow | null {
     cpm: parseNumOrNull(r["CPM (Chi phí trên mỗi 1.000 lượt hiển thị) (VND)"]),
     resultCount: parseNumOrNull(r["Kết quả"]),
     costPerResult: parseNumOrNull(r["Chi phí trên mỗi kết quả"]),
-    rawJson: buildRawJson(r, FB_AD_GROUP_USED),
   };
 }
-
-const FB_CAMPAIGN_USED = new Set([
-  "Lượt bắt đầu báo cáo",
-  "Lượt kết thúc báo cáo",
-  "Tên chiến dịch",
-  "Lượt phân phối chiến dịch",
-  "Kết quả",
-  "Chỉ báo kết quả",
-  "Chi phí trên mỗi kết quả",
-  "Số tiền đã chi tiêu (VND)",
-  "Lượt hiển thị",
-  "Người tiếp cận",
-  "Lượt click vào liên kết",
-  "Lượt click (tất cả)",
-  "CPC (chi phí trên mỗi lượt click vào liên kết) (VND)",
-  "CPC (tất cả) (VND)",
-]);
 
 function toFbCampaignRow(r: Record<string, string>): FbCampaignRow | null {
   const name = (r["Tên chiến dịch"] ?? "").trim();
@@ -383,7 +291,6 @@ function toFbCampaignRow(r: Record<string, string>): FbCampaignRow | null {
     ),
     allCpc: parseNumOrNull(r["CPC (tất cả) (VND)"]),
     costPerResult: parseNumOrNull(r["Chi phí trên mỗi kết quả"]),
-    rawJson: buildRawJson(r, FB_CAMPAIGN_USED),
   };
 }
 

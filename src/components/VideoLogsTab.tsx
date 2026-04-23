@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { auth } from "../lib/firebase";
+import { auth, getAuthToken } from "../lib/firebase";
 import { adminFetchUserList, adminReadUserListCache, type UserListEntry } from "../lib/sync";
 import {
   adminDeleteUserLogRow,
@@ -15,6 +15,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 const PAGE_SIZE = 100;
 
 interface SelectedUser {
+  uid: string;
   localPart: string;
   email: string;
 }
@@ -51,20 +52,23 @@ async function dedupedFetchUsers(idToken: string): Promise<UserListEntry[]> {
   return inflightUsersFetch;
 }
 
+/// Dedup key = uid (tab/cache key mới). localPart truyền xuống AS cho fallback
+/// nếu tab UID chưa migrate.
 async function dedupedFetchUserLog(
   idToken: string,
+  uid: string,
   localPart: string,
 ): Promise<void> {
-  const existing = inflightLogFetches.get(localPart);
+  const existing = inflightLogFetches.get(uid);
   if (existing) return existing;
   const p = (async () => {
     try {
-      await adminFetchUserLogSheet(idToken, localPart);
+      await adminFetchUserLogSheet(idToken, uid, localPart);
     } finally {
-      inflightLogFetches.delete(localPart);
+      inflightLogFetches.delete(uid);
     }
   })();
-  inflightLogFetches.set(localPart, p);
+  inflightLogFetches.set(uid, p);
   return p;
 }
 
@@ -108,20 +112,20 @@ export function VideoLogsTab() {
   // 1) Cache DB — đọc instant, không delay. Render được gì hiển nấy.
   const loadUsersCache = useCallback(async () => {
     try {
-      const cached = await adminReadUserListCache();
+      const idToken = await getAuthToken();
+      const cached = await adminReadUserListCache(idToken);
       if (cached && mountedRef.current) {
         const list: UserListEntry[] = JSON.parse(cached.users_json);
         setUsers(list.filter((u) => u.localPart));
       }
     } catch {
-      /* cache miss/parse OK — caller tự fetch fresh nếu cần */
+      /* cache miss/parse OK hoặc chưa login — caller tự fetch fresh nếu cần */
     }
   }, []);
 
   // 2) Fetch fresh từ AS (deduped). Manual refresh button gọi thẳng hàm này.
   const loadUsersFresh = useCallback(async () => {
-    const current = auth.currentUser;
-    if (!current) {
+    if (!auth.currentUser) {
       setUsersError("Chưa đăng nhập");
       return;
     }
@@ -130,7 +134,7 @@ export function VideoLogsTab() {
       setUsersError(null);
     }
     try {
-      const idToken = await current.getIdToken(false);
+      const idToken = await getAuthToken();
       const list = await dedupedFetchUsers(idToken);
       if (mountedRef.current) {
         setUsers(list.filter((u) => u.localPart));
@@ -172,31 +176,32 @@ export function VideoLogsTab() {
       : users;
   }, [users, query]);
 
-  // Đọc trang đầu từ cache DB. Trả về số rows đọc được.
-  const readCacheFirstPage = useCallback(async (localPart: string) => {
-    const rows = await adminReadUserLogCache(localPart, PAGE_SIZE, 0);
+  // Đọc trang đầu từ cache DB. Trả về số rows đọc được. Key = uid.
+  const readCacheFirstPage = useCallback(async (uid: string) => {
+    if (!auth.currentUser) return 0;
+    const idToken = await getAuthToken();
+    const rows = await adminReadUserLogCache(idToken, uid, PAGE_SIZE, 0);
     setLogs(rows);
     setOffset(rows.length);
     setHasMore(rows.length >= PAGE_SIZE);
-    const m = await adminUserLogFetchMeta(localPart);
+    const m = await adminUserLogFetchMeta(idToken, uid);
     setMeta(m);
     return rows.length;
   }, []);
 
-  // Fetch Sheet (deduped per localPart) → replace cache → đọc lại trang đầu.
+  // Fetch Sheet (deduped per uid) → replace cache → đọc lại trang đầu.
   // Nếu cùng 1 user đang fetch từ instance trước → reuse promise, không spam.
   const fetchFromSheet = useCallback(
-    async (localPart: string) => {
-      const current = auth.currentUser;
-      if (!current) return;
+    async (uid: string, localPart: string) => {
+      if (!auth.currentUser) return;
       if (mountedRef.current) {
         setFetching(true);
         setFetchError(null);
       }
       try {
-        const idToken = await current.getIdToken(false);
-        await dedupedFetchUserLog(idToken, localPart);
-        if (mountedRef.current) await readCacheFirstPage(localPart);
+        const idToken = await getAuthToken();
+        await dedupedFetchUserLog(idToken, uid, localPart);
+        if (mountedRef.current) await readCacheFirstPage(uid);
       } catch (e) {
         if (mountedRef.current) setFetchError((e as Error).message);
       } finally {
@@ -208,8 +213,9 @@ export function VideoLogsTab() {
 
   const selectUser = useCallback(
     async (u: UserListEntry) => {
-      if (!u.localPart) return;
+      if (!u.localPart || !u.uid) return;
       setSelected({
+        uid: u.uid,
         localPart: u.localPart,
         email: u.email ?? u.localPart,
       });
@@ -223,7 +229,7 @@ export function VideoLogsTab() {
       // 1. Cache DB — render ngay.
       setInitialLoading(true);
       try {
-        await readCacheFirstPage(u.localPart);
+        await readCacheFirstPage(u.uid);
       } catch (e) {
         setLogsError((e as Error).message);
       } finally {
@@ -232,9 +238,9 @@ export function VideoLogsTab() {
 
       // 2. Auto-fetch từ Sheet CHỈ lần đầu tiên cho user này trong app session.
       // Chọn lại user cũ → không fetch lại. User muốn fresh → bấm "Tải lại".
-      if (!hasFetchedLogsOnce.has(u.localPart)) {
-        hasFetchedLogsOnce.add(u.localPart);
-        void fetchFromSheet(u.localPart);
+      if (!hasFetchedLogsOnce.has(u.uid)) {
+        hasFetchedLogsOnce.add(u.uid);
+        void fetchFromSheet(u.uid, u.localPart);
       }
     },
     [readCacheFirstPage, fetchFromSheet],
@@ -244,8 +250,8 @@ export function VideoLogsTab() {
   // không auto-fetch dư.
   const refetch = useCallback(() => {
     if (!selected) return;
-    hasFetchedLogsOnce.add(selected.localPart);
-    void fetchFromSheet(selected.localPart);
+    hasFetchedLogsOnce.add(selected.uid);
+    void fetchFromSheet(selected.uid, selected.localPart);
   }, [selected, fetchFromSheet]);
 
   // Track index row đang xóa để disable button + show spinner.
@@ -265,14 +271,14 @@ export function VideoLogsTab() {
       if (!selected) return;
       const row = logs[idx];
       if (!row) return;
-      const current = auth.currentUser;
-      if (!current) return;
+      if (!auth.currentUser) return;
 
       setDeletingRowIdx(idx);
       try {
-        const idToken = await current.getIdToken(false);
+        const idToken = await getAuthToken();
         await adminDeleteUserLogRow(
           idToken,
+          selected.uid,
           selected.localPart,
           row.timestamp,
           row.url,
@@ -323,15 +329,13 @@ export function VideoLogsTab() {
   );
 
   const doDeleteSheet = useCallback(async () => {
-    if (!selected) return;
-    const current = auth.currentUser;
-    if (!current) return;
+    if (!selected || !auth.currentUser) return;
 
     setDeletingSheet(true);
     setLogsError(null);
     try {
-      const idToken = await current.getIdToken(false);
-      await adminDeleteUserLogSheet(idToken, selected.localPart);
+      const idToken = await getAuthToken();
+      await adminDeleteUserLogSheet(idToken, selected.uid, selected.localPart);
       setLogs([]);
       setOffset(0);
       setHasMore(false);
@@ -369,11 +373,14 @@ export function VideoLogsTab() {
 
   const loadMore = useCallback(async () => {
     if (!selected || logsLoading || !hasMore) return;
+    if (!auth.currentUser) return;
     setLogsLoading(true);
     setLogsError(null);
     try {
+      const idToken = await getAuthToken();
       const more = await adminReadUserLogCache(
-        selected.localPart,
+        idToken,
+        selected.uid,
         PAGE_SIZE,
         offset,
       );
@@ -455,7 +462,7 @@ export function VideoLogsTab() {
           ) : (
             <ul>
               {filteredUsers.map((u) => {
-                const isActive = selected?.localPart === u.localPart;
+                const isActive = selected?.uid === u.uid;
                 return (
                   <li key={u.uid}>
                     <button

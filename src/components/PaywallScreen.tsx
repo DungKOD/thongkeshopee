@@ -12,10 +12,8 @@ export function PaywallScreen({ expiredAt, reason }: PaywallScreenProps) {
 
   const email = user?.email ?? "";
   const uid = user?.uid ?? "";
-  const zalo = import.meta.env.VITE_ADMIN_ZALO || "(chưa cấu hình)";
-  const note =
-    import.meta.env.VITE_ADMIN_NOTE ||
-    "Chuyển khoản xong nhắn Zalo gửi email để kích hoạt";
+  const zalo = import.meta.env.VITE_ADMIN_ZALO || "";
+  const zaloLink = zalo ? `https://zalo.me/${zalo.replace(/\D/g, "")}` : "";
 
   const copyText = `Email: ${email}\nUID: ${uid}`;
 
@@ -46,18 +44,20 @@ export function PaywallScreen({ expiredAt, reason }: PaywallScreenProps) {
           </p>
         </div>
 
-        <div className="mb-4 rounded-lg border border-shopee-500/40 bg-shopee-900/20 p-4">
-          <div className="mb-2 text-xs font-medium text-shopee-300">
-            Liên hệ admin qua Zalo
-          </div>
-          <div
-            className="truncate font-mono text-lg font-semibold text-white"
-            title={zalo}
+        {zalo && (
+          <a
+            href={zaloLink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn-ripple mb-4 flex items-center justify-center gap-2 rounded-lg border border-shopee-500/40 bg-shopee-900/20 p-4 text-shopee-200 transition hover:bg-shopee-900/40"
+            title={`Mở Zalo ${zalo}`}
           >
-            {zalo}
-          </div>
-          <div className="mt-1 text-xs text-white/60">{note}</div>
-        </div>
+            <span className="material-symbols-rounded text-xl">chat</span>
+            <span className="text-sm font-medium">
+              Liên hệ admin qua Zalo
+            </span>
+          </a>
+        )}
 
         <div className="mb-4 rounded-lg border border-surface-8 bg-surface-2 p-4">
           <div className="mb-3 text-xs font-medium text-white/60">

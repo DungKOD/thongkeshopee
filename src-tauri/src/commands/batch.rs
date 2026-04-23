@@ -9,7 +9,6 @@
 //! Sau khi xóa: cleanup `days` orphan (không còn raw/manual nào) → UI tự
 //! không hiển thị day đó.
 
-use chrono::Utc;
 use rusqlite::params;
 use tauri::State;
 
@@ -17,6 +16,7 @@ use crate::db::types::BatchDeletePayload;
 use crate::db::{resolve_active_imports_dir, tombstone_key_sub, DbState};
 
 use super::query::{is_prefix, to_canonical, Canonical};
+use super::sync::next_hlc_rfc3339;
 use super::{CmdError, CmdResult};
 
 #[tauri::command]
@@ -26,7 +26,9 @@ pub fn batch_commit_deletes(
 ) -> CmdResult<BatchResult> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let tx = conn.transaction()?;
-    let now = Utc::now().to_rfc3339();
+    // HLC-lite: tombstone.deleted_at monotonic → apply_tombstones compare với
+    // manual_entries.updated_at từ remote chính xác bất chấp clock drift.
+    let now = next_hlc_rfc3339(&tx)?;
 
     let mut days_deleted = 0_i64;
     for date in &payload.days {

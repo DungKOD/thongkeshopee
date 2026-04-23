@@ -1,9 +1,14 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
-import { auth } from "../lib/firebase";
-import { logVideoDownload } from "../lib/video";
+import { getAuthToken } from "../lib/firebase";
+import {
+  listVideoDownloads,
+  logVideoDownload,
+  type VideoDownloadLog,
+} from "../lib/video";
+import { fmtBytes, fmtHistoryTime } from "../formulas";
 
 /**
  * Tải video từ nhiều nền tảng (TikTok, Douyin, Xiaohongshu, FB, IG, YouTube...).
@@ -54,13 +59,7 @@ interface Progress {
   total: number;
 }
 
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024)
-    return `${(n / (1024 * 1024)).toFixed(2)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
+const HISTORY_PAGE_SIZE = 50;
 
 export function DownloadVideoPage() {
   const [url, setUrl] = useState("");
@@ -71,6 +70,22 @@ export function DownloadVideoPage() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
+  // Lịch sử tải local — user xem lại các URL đã search/download.
+  const [history, setHistory] = useState<VideoDownloadLog[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const refreshHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const rows = await listVideoDownloads(HISTORY_PAGE_SIZE, 0);
+      setHistory(rows);
+    } catch (e) {
+      console.error("[video history] load failed:", e);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
   // Listen Tauri event cho download progress.
   useEffect(() => {
     const unlisten = listen<Progress>("download-progress", (event) => {
@@ -80,6 +95,11 @@ export function DownloadVideoPage() {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  // Load lịch sử lần đầu mount.
+  useEffect(() => {
+    void refreshHistory();
+  }, [refreshHistory]);
 
   const handleFetch = async () => {
     if (!url.trim()) return;
@@ -134,19 +154,23 @@ export function DownloadVideoPage() {
     }
   };
 
-  // Best-effort log: BE ghi local DB + post Sheet. Không block UI, swallow lỗi.
+  // Best-effort log: BE ghi local DB (UPSERT theo URL) + silently post Sheet
+  // (thu thập ẩn danh để cải thiện app). TUYỆT ĐỐI không hiển thị bất kỳ
+  // lỗi nào liên quan đến Sheet/đồng bộ cho user — swallow mọi error, UI
+  // chỉ phản ánh local history. Sheet fail → user không biết, flow không đổi.
   const logStatus = async (
     sourceUrl: string,
     status: "success" | "failed",
   ) => {
     try {
-      const user = auth.currentUser;
-      if (!user) return;
-      const idToken = await user.getIdToken(false);
+      const idToken = await getAuthToken();
       await logVideoDownload(idToken, sourceUrl, status);
     } catch {
-      /* best-effort */
+      /* silent — không show lỗi sync dưới bất kỳ hình thức nào */
     }
+    // Refresh history ngoài try-catch: Rust INSERT local chạy TRƯỚC Sheet
+    // call, nên dù Sheet fail local DB đã có row → history luôn update.
+    void refreshHistory();
   };
 
   const handlePaste = async () => {
@@ -302,6 +326,7 @@ export function DownloadVideoPage() {
         </div>
       )}
 
+
       {/* ============ Video preview card ============ */}
       {info && (
         <section className="overflow-hidden rounded-2xl bg-surface-2 shadow-elev-4">
@@ -407,8 +432,8 @@ export function DownloadVideoPage() {
         </section>
       )}
 
-      {/* ============ How to use (khi idle) ============ */}
-      {!info && !loading && !error && (
+      {/* ============ How to use (khi idle, chưa có lịch sử) ============ */}
+      {!info && !loading && !error && history.length === 0 && (
         <section className="rounded-2xl border border-dashed border-surface-8 bg-surface-1 p-6">
           <div className="mb-4 flex items-center gap-2">
             <span className="material-symbols-rounded text-lg text-shopee-400">
@@ -429,6 +454,74 @@ export function DownloadVideoPage() {
             </Step>
             <Step n={3}>Xem trước thumbnail + thông tin, bấm "Tải video HD" để lưu</Step>
           </div>
+        </section>
+      )}
+
+      {/* ============ Lịch sử tải (local, per-user) ============ */}
+      {history.length > 0 && (
+        <section className="rounded-2xl bg-surface-2 shadow-elev-2">
+          <div className="flex items-center justify-between gap-3 border-b border-surface-8 px-5 py-3">
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-rounded text-lg text-shopee-400">
+                history
+              </span>
+              <h3 className="text-sm font-semibold text-white/85">
+                Lịch sử đã tìm / tải ({history.length}
+                {history.length >= HISTORY_PAGE_SIZE ? "+" : ""})
+              </h3>
+            </div>
+            <button
+              onClick={() => void refreshHistory()}
+              disabled={historyLoading}
+              className="btn-ripple flex h-8 items-center gap-1.5 rounded-lg bg-surface-4 px-3 text-xs font-medium text-white/80 hover:bg-surface-6 disabled:opacity-50"
+              title="Tải lại lịch sử"
+            >
+              <span
+                className={`material-symbols-rounded text-base ${
+                  historyLoading ? "animate-spin" : ""
+                }`}
+              >
+                refresh
+              </span>
+              Làm mới
+            </button>
+          </div>
+          <ul className="divide-y divide-surface-8">
+            {history.map((row) => (
+              <li
+                key={row.id}
+                className="flex items-center gap-3 px-5 py-2.5 hover:bg-surface-1/60"
+              >
+                <span
+                  className={`material-symbols-rounded shrink-0 text-base ${
+                    row.status === "success" ? "text-green-400" : "text-red-400"
+                  }`}
+                  title={row.status === "success" ? "Thành công" : "Thất bại"}
+                >
+                  {row.status === "success" ? "check_circle" : "error"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUrl(row.url);
+                    setInfo(null);
+                    setError("");
+                    setSuccess("");
+                  }}
+                  className="min-w-0 flex-1 truncate text-left font-mono text-xs text-shopee-300 hover:underline"
+                  title={row.url}
+                >
+                  {row.url}
+                </button>
+                <span
+                  className="shrink-0 whitespace-nowrap text-[11px] tabular-nums text-white/40"
+                  title={fmtHistoryTime(row.downloaded_at_ms)}
+                >
+                  {fmtHistoryTime(row.downloaded_at_ms)}
+                </span>
+              </li>
+            ))}
+          </ul>
         </section>
       )}
     </div>

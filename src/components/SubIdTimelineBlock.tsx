@@ -19,6 +19,8 @@ interface SubIdTimelineBlockProps {
   onToggleRowDelete: (row: UiRow) => void;
   onEditRow: (row: UiRow) => void;
   readOnly?: boolean;
+  /** Account filter từ App — pass-through cho ProductDetailDialog. */
+  accountFilter?: import("../hooks/useDbStats").AccountFilterMode;
 }
 
 const HEADERS: Array<{ label: string; tooltip?: string }> = [
@@ -68,6 +70,7 @@ export function SubIdTimelineBlock({
   onToggleRowDelete,
   onEditRow,
   readOnly = false,
+  accountFilter,
 }: SubIdTimelineBlockProps) {
   const { settings } = useSettings();
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
@@ -214,6 +217,7 @@ export function SubIdTimelineBlock({
       <ProductDetailDialog
         isOpen={!!detailRow}
         row={detailRow}
+        accountFilter={accountFilter}
         onClose={() => setDetailRow(null)}
       />
     </section>

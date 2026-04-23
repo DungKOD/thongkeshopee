@@ -33,6 +33,11 @@ body {
 /* Smooth scrolling */
 html {
   scroll-behavior: smooth;
+  /* Reserve scrollbar gutter luôn — khi dialog mở set overflow:hidden, scrollbar
+   * biến mất làm content dịch sang phải ~10-17px (giật layout). `stable` giữ
+   * chỗ scrollbar cố định bất kể có scroll hay không → UI ổn định. Modern
+   * browser support (Chrome 94+, Firefox 97+, Tauri WebView OK). */
+  scrollbar-gutter: stable;
 }
 
 /* Better scrollbar for dark mode */
@@ -67,6 +72,14 @@ html {
   font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 20;
   vertical-align: middle;
   user-select: none;
+}
+
+/* Ẩn icon-name text thô (vd "cloud_sync") cho tới khi Material Symbols font
+ * load xong. `font-display: block` trên @font-face đã ẩn 3s đầu, nhưng nếu
+ * font fail hoặc chậm hơn, CSS này là safety net. `.fonts-loaded` được set
+ * bởi JS `document.fonts.ready` trong index.html. */
+html:not(.fonts-loaded) .material-symbols-rounded {
+  visibility: hidden;
 }
 
 /* Shake animation dùng cho dialog cảnh báo xóa */

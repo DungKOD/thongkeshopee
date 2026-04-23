@@ -1,7 +1,7 @@
 {
   "name": "thongkeshopee",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,7 +17,8 @@
     "html-to-image": "^1.11.13",
     "papaparse": "^5.5.3",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "recharts": "^3.8.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

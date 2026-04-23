@@ -58,13 +58,10 @@ function AppInner() {
   const overviewFilter = useFilterMode("overview");
   const activeFilter = activeTab === "overview" ? overviewFilter : statsFilter;
 
-  // Overview tab: mỗi lần chuyển vào → reset về default (1 ngày gần nhất).
-  // Không giữ filter cũ user đã chọn ở lần trước; user muốn luôn thấy data
-  // mới nhất khi mở Overview.
-  const overviewClear = overviewFilter.clear;
-  useEffect(() => {
-    if (activeTab === "overview") overviewClear();
-  }, [activeTab, overviewClear]);
+  // Filter persist TRONG SESSION (in-memory). Chuyển tab stats ↔ overview
+  // giữ nguyên filter đã chọn của mỗi tab. Reload app / logout → AppInner
+  // remount → state reset về "Ngày gần nhất" (1 ngày) — default cho cả 2 tab.
+  // Không còn auto-reset khi chuyển qua Overview như version cũ.
 
   // Alias để không đụng call sites hiện có trong component.
   const filterMode = activeFilter.mode;
@@ -72,7 +69,6 @@ function AppInner() {
   const setRecentDays = activeFilter.setRecent;
   const setPrevMonth = activeFilter.setPrevMonth;
   const setAllTime = activeFilter.setAllTime;
-  const clearFilter = activeFilter.clear;
   const setDateFrom = activeFilter.setDateFrom;
   const setDateTo = activeFilter.setDateTo;
 
@@ -164,9 +160,12 @@ function AppInner() {
 
   // Khi swap sang DB khác (hoặc thoát) → refetch + clear pending changes
   // của admin (pending state UI không hợp lệ với DB mới).
+  // Gọi refreshAccounts() để AccountContext không giữ list TK của user vừa
+  // xem (hoặc state stale từ trước) — filter dropdown phải khớp DB đang hiển thị.
   useEffect(() => {
     clearPending();
     void refetch();
+    void refreshAccounts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adminView?.uid]);
 
@@ -517,6 +516,20 @@ function AppInner() {
   }, [canLoadMore]);
 
   if (isStartupPhase) {
+    // Nếu switch_db_to_user fail → hook keep isStartupPhase=true + set syncError.
+    // Splash hiển thị error thay vì text "đang đồng bộ" để user không bị kẹt
+    // nhìn vào loading spinner vô thời hạn. Retry = logout + login lại.
+    if (syncStatus === "error" && syncError) {
+      return (
+        <SplashScreen
+          title="Không mở được database"
+          subtitle={syncError}
+          lastSyncAt={lastSyncAt}
+          error
+          onRetry={() => void authSignOut()}
+        />
+      );
+    }
     return (
       <SplashScreen {...splashTextFor(syncPhase)} lastSyncAt={lastSyncAt} />
     );
@@ -816,22 +829,6 @@ function AppInner() {
                   </ShortcutButton>
                 </div>
 
-                {(filterMode.type === "range" ||
-                  filterMode.type === "all" ||
-                  (filterMode.type === "recent" &&
-                    !filterMode.canExpand)) && (
-                  <button
-                    onClick={clearFilter}
-                    className="btn-ripple flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs text-white/70 hover:bg-white/5 hover:text-white"
-                    title="Bỏ lọc ngày — về paginated 7 ngày mặc định"
-                  >
-                    <span className="material-symbols-rounded text-sm">
-                      close
-                    </span>
-                    Bỏ lọc
-                  </button>
-                )}
-
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
                 {/* Account filter — tách theo TK Shopee affiliate. Nút
@@ -948,6 +945,8 @@ function AppInner() {
                 dateFrom={dateFrom}
                 dateTo={dateTo}
                 totalDaysInDb={totalDaysInDb}
+                currentFilter={effectiveFilter}
+                accountFilter={accountFilter}
               />
             ) : (
               <>
@@ -963,6 +962,7 @@ function AppInner() {
                       setEntryDialog({ date: r.dayDate, row: r })
                     }
                     readOnly={inAdminView}
+                    accountFilter={accountFilter}
                   />
                 ) : (
                   days.map((day) => (
@@ -980,6 +980,7 @@ function AppInner() {
                       }
                       onEditDay={(date) => setEntryDialog({ date })}
                       readOnly={inAdminView}
+                      accountFilter={accountFilter}
                     />
                   ))
                 )}
@@ -1203,8 +1204,16 @@ function AuthGate() {
     return <PaywallScreen expiredAt={expiredAt} reason={status} />;
   }
 
+  // CRITICAL phân quyền: key={user.uid} force remount toàn bộ subtree khi uid
+  // đổi. Lý do: SettingsProvider/AppInner khởi tạo state từ localStorage SYNC
+  // tại mount (useState(loadSettings), useFilterMode, smartcalc:open…).
+  // `wipeUserLocalStorage` trong useCloudSync chạy SAU mount → chỉ xoá
+  // localStorage, không reset React state. Không remount = user B thấy config
+  // của user A (click sources, profit fee %, filter range, calc open state).
+  // Key theo uid đảm bảo: uid đổi → unmount cũ → localStorage wiped → mount mới
+  // đọc default.
   return (
-    <SettingsProvider>
+    <SettingsProvider key={user.uid}>
       <AdminViewProvider>
         <AccountProvider>
           <AppInner />
@@ -1244,27 +1253,37 @@ function splashTextFor(phase: SyncPhase): { title: string; subtitle?: string } {
 /// Fullscreen splash — icon xoay anchor ở vị trí cố định (32vh từ top),
 /// text flow dưới. Khi subtitle/timestamp dài, text wrap xuống nhưng icon
 /// KHÔNG di chuyển — UX ổn định, user vẫn biết đang sync.
+///
+/// error=true → icon chuyển error_outline (không xoay) + optional nút retry.
 function SplashScreen({
   title,
   subtitle,
   lastSyncAt,
+  error,
+  onRetry,
 }: {
   title: string;
   subtitle?: string;
   lastSyncAt?: Date | null;
+  error?: boolean;
+  onRetry?: () => void;
 }) {
   return (
     <main className="min-h-screen bg-surface-0 px-6 text-white">
       <div className="flex flex-col items-center pt-[32vh]">
-        <span className="material-symbols-rounded animate-spin text-7xl text-shopee-400">
-          cloud_sync
+        <span
+          className={`material-symbols-rounded text-7xl ${
+            error ? "text-red-400" : "animate-spin text-shopee-400"
+          }`}
+        >
+          {error ? "error" : "cloud_sync"}
         </span>
         <div className="mt-6 flex flex-col items-center gap-3">
           <h1 className="text-center text-2xl font-semibold text-white/95">
             {title}
           </h1>
           {subtitle && (
-            <p className="max-w-md text-center text-base text-white/70">
+            <p className="max-w-md break-words text-center text-base text-white/70">
               {subtitle}
             </p>
           )}
@@ -1272,6 +1291,15 @@ function SplashScreen({
             <p className="text-sm text-white/50">
               Lần cuối: {lastSyncAt.toLocaleString("vi-VN")}
             </p>
+          )}
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              className="btn-ripple mt-2 flex items-center gap-2 rounded-lg border border-white/40 bg-white/10 px-4 py-2 text-sm font-medium text-white hover:bg-white/20"
+            >
+              <span className="material-symbols-rounded text-base">logout</span>
+              Đăng xuất và thử lại
+            </button>
           )}
         </div>
       </div>

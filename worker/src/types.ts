@@ -23,28 +23,29 @@ export interface MetadataResponse {
   sizeBytes: number | null;
   lastModified: number | null;
   fingerprint: string | null;
+  /// R2 etag — client dùng làm `expectedEtag` trong upload kế tiếp (CAS).
+  /// null nếu object không tồn tại.
+  etag: string | null;
 }
 
-export interface UploadRequest {
-  base64Data: string;
-  mtimeMs: number;
-  fingerprint: string;
-}
-
+/// v8.1+ upload: body là raw zstd bytes, metadata trong HTTP headers
+/// (X-Mtime-Ms, X-Fingerprint, X-Expected-Etag). Không còn JSON body.
+///
+/// Worker response shape sau upload thành công:
 export interface UploadResponse {
   ok: true;
   fileId: string;
   sizeBytes: number;
   lastModified: number;
   fingerprint: string;
+  /// Etag MỚI sau upload thành công — client lưu vào sync_state để
+  /// upload lần sau attach làm expectedEtag.
+  etag: string;
 }
 
-export interface DownloadResponse {
-  ok: true;
-  base64Data: string;
-  sizeBytes: number;
-  lastModified: number;
-}
+/// v8.1+ download: response body là raw zstd bytes, metadata trong response
+/// headers (X-Size-Bytes, X-Last-Modified-Ms, ETag). Không còn JSON envelope.
+/// Giữ interface này chỉ cho doc — không còn được deserialize vì không phải JSON.
 
 export interface ErrorResponse {
   ok: false;
