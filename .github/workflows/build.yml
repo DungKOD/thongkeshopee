@@ -2,6 +2,7 @@ name: Build Tauri App
 
 on:
   push:
+    branches: [master]
     tags: ['v*']
   workflow_dispatch:
 
@@ -10,23 +11,18 @@ permissions:
 
 jobs:
   build:
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macOS Apple Silicon (M1/M2/M3)
           - platform: macos-latest
             args: --target aarch64-apple-darwin
             rust_target: aarch64-apple-darwin
             name: macos-arm64
-          # macOS Intel
           - platform: macos-latest
             args: --target x86_64-apple-darwin
             rust_target: x86_64-apple-darwin
             name: macos-x86_64
-          # Windows x64
           - platform: windows-latest
             args: ""
             rust_target: ""
@@ -59,7 +55,6 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      # Inject env từ Secrets → .env.local để Vite pick up lúc build.
       - name: Create .env.local from secrets
         shell: bash
         run: |
@@ -75,49 +70,31 @@ jobs:
           VITE_ADMIN_NOTE=${{ secrets.VITE_ADMIN_NOTE }}
           EOF
 
-      # tauri-action handles: frontend build → rust build → bundle →
-      # auto-detect artifact paths → upload to GitHub Release (nếu tagName).
-      # `tagName` chỉ set khi push tag v* → trigger release flow.
       - name: Build Tauri app
-        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: "Shopee Affiliate Tracker ${{ github.ref_name }}"
-          releaseBody: |
-            ### Download
-
-            - **Windows**: tải file `.msi` hoặc `.exe` bên dưới
-            - **macOS Apple Silicon (M1/M2/M3)**: tải `.dmg` có `aarch64`
-            - **macOS Intel**: tải `.dmg` có `x64`
-
-            ### Notes
-            Ứng dụng chưa ký (code signing) — Windows SmartScreen có thể cảnh báo,
-            chọn "More info" → "Run anyway". macOS: nếu Gatekeeper block, right-click
-            app trong Applications → "Open" → Open.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
 
-      # tauri-action trả artifactPaths dạng JSON array → convert sang newline list
-      # cho actions/upload-artifact (chỉ chấp nhận multiline string / glob).
-      - name: Format artifact paths
-        id: paths
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') && steps.tauri.outputs.artifactPaths != '' }}
+      - name: Debug — list bundle output
+        if: always()
         shell: bash
         run: |
-          {
-            echo 'list<<EOF'
-            echo '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]'
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          echo "=== src-tauri/target bundle tree ==="
+          find src-tauri/target -type d -name bundle -exec ls -laR {} + 2>/dev/null || true
 
-      - name: Upload artifacts (no tag)
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') && steps.tauri.outputs.artifactPaths != '' }}
+      - name: Upload build artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ steps.paths.outputs.list }}
-          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/**
+            src-tauri/target/*/release/bundle/**
+          if-no-files-found: warn
+          retention-days: 14
