@@ -52,6 +52,7 @@ pub fn run() {
             commands::manual::delete_manual_entry,
             commands::manual::has_manual_entry,
             commands::batch::batch_commit_deletes,
+            commands::batch::revert_import,
             commands::video::get_video_info,
             commands::video::download_video,
             commands::video::log_video_download,

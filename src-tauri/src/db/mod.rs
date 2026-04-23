@@ -202,6 +202,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     // v9: drop `raw_json` columns — không read ở đâu, dedup với CSV file đã
     // lưu trên disk (imports/<hash>.csv), giảm 55-70% DB size.
     migrate_drop_raw_json(conn).context("drop raw_json columns failed")?;
+    // v10: import history + many-to-many mapping cho revert correctness.
+    // Rebuild `imported_files` để drop UNIQUE(file_hash) inline (thay bằng
+    // partial index WHERE reverted_at IS NULL), add cột reverted_at, backfill
+    // 3 bảng mapping từ source_file_id hiện có.
+    migrate_import_history_v10(conn).context("import history v10 migration failed")?;
     // Dọn orphan imported_files mỗi startup — idempotent. Xử lý legacy DB
     // của user đã xóa ngày trước khi batch_commit_deletes biết cleanup
     // (kẻo re-import cùng file bị chặn bởi hash dedup).
@@ -238,17 +243,161 @@ fn migrate_drop_raw_json(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// DELETE imported_files không còn raw row nào reference qua source_file_id.
+/// DELETE imported_files không còn raw row nào reference qua mapping tables.
 /// Chạy mỗi startup vì DELETE orphan là idempotent — chi phí rẻ và đảm bảo
 /// user re-import được file sau khi xóa data, kể cả với DB legacy.
+///
+/// v10: check qua MAPPING tables thay `source_file_id` vì UPSERT từ file B có
+/// thể ghi đè source_file_id trên row từ file A → file A "trông như orphan"
+/// dù mapping(row, A) vẫn có. Giữ row `reverted_at IS NOT NULL` (lịch sử).
 fn cleanup_orphan_imported_files(conn: &Connection) -> Result<()> {
     conn.execute(
         "DELETE FROM imported_files
-         WHERE id NOT IN (
-             SELECT source_file_id FROM raw_shopee_clicks UNION
-             SELECT source_file_id FROM raw_shopee_order_items UNION
-             SELECT source_file_id FROM raw_fb_ads
-         )",
+         WHERE reverted_at IS NULL
+           AND id NOT IN (
+               SELECT file_id FROM clicks_to_file UNION
+               SELECT file_id FROM orders_to_file UNION
+               SELECT file_id FROM fb_ads_to_file
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v10 migration: import history + many-to-many mapping raw↔file.
+///
+/// Thay đổi:
+/// 1. Rebuild `imported_files` để drop UNIQUE(file_hash) inline (bị khóa
+///    sau revert không cho re-import cùng file) → thay bằng partial unique
+///    index `WHERE reverted_at IS NULL`.
+/// 2. Add cột `reverted_at TEXT` để soft-mark file đã revert (giữ history).
+/// 3. Backfill 3 bảng mapping từ `source_file_id` hiện có — data cũ chỉ
+///    biết 1 file nguồn duy nhất (không tracked many-to-many trước v10).
+///    Data mới import sau migration có đầy đủ link.
+///
+/// Idempotent — chạy lại skip nếu đã không còn UNIQUE inline + reverted_at
+/// đã có. Backfill dùng INSERT OR IGNORE nên chạy N lần cho ra cùng kết quả.
+fn migrate_import_history_v10(conn: &Connection) -> Result<()> {
+    let existing_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='imported_files'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let has_inline_unique = match existing_sql.as_deref() {
+        Some(s) => s.contains("UNIQUE(file_hash)") || s.contains("UNIQUE (file_hash)"),
+        None => return Ok(()),
+    };
+    let has_reverted_at = table_has_column(conn, "imported_files", "reverted_at")?;
+
+    if has_inline_unique {
+        // Rebuild toàn bộ bảng: drop UNIQUE constraint, thêm cột reverted_at +
+        // shopee_account_id. Disable FK trong rebuild vì raw tables có FK
+        // ON DELETE CASCADE trỏ tới.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE imported_files_new (
+                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                 filename          TEXT NOT NULL,
+                 kind              TEXT NOT NULL,
+                 imported_at       TEXT NOT NULL,
+                 row_count         INTEGER NOT NULL DEFAULT 0,
+                 file_hash         TEXT NOT NULL,
+                 stored_path       TEXT,
+                 day_date          TEXT,
+                 notes             TEXT,
+                 reverted_at       TEXT,
+                 shopee_account_id INTEGER
+             );
+             INSERT INTO imported_files_new
+               (id, filename, kind, imported_at, row_count, file_hash, stored_path, day_date, notes)
+             SELECT
+               id, filename, kind, imported_at, row_count, file_hash, stored_path, day_date, notes
+             FROM imported_files;
+             DROP TABLE imported_files;
+             ALTER TABLE imported_files_new RENAME TO imported_files;
+             CREATE INDEX IF NOT EXISTS idx_imported_day  ON imported_files(day_date);
+             CREATE INDEX IF NOT EXISTS idx_imported_kind ON imported_files(kind);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_hash_active
+                 ON imported_files(file_hash) WHERE reverted_at IS NULL;
+             PRAGMA foreign_keys = ON;",
+        )?;
+    } else {
+        // Defensive: nếu table đã không còn UNIQUE inline nhưng cũng chưa có
+        // reverted_at (edge case giữa migration cũ và mới) → ADD COLUMN thường.
+        if !has_reverted_at {
+            conn.execute(
+                "ALTER TABLE imported_files ADD COLUMN reverted_at TEXT",
+                [],
+            )?;
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_hash_active
+                 ON imported_files(file_hash) WHERE reverted_at IS NULL",
+                [],
+            )?;
+        }
+    }
+    // Idempotent thêm cột shopee_account_id nếu chưa có (rebuild path đã có rồi).
+    if !table_has_column(conn, "imported_files", "shopee_account_id")? {
+        conn.execute(
+            "ALTER TABLE imported_files ADD COLUMN shopee_account_id INTEGER",
+            [],
+        )?;
+    }
+
+    // Unconditional: đảm bảo partial unique index tồn tại cho cả fresh install
+    // (schema.sql không tạo vì reverted_at là cột v10) lẫn upgrade. Idempotent.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_hash_active
+         ON imported_files(file_hash) WHERE reverted_at IS NULL",
+        [],
+    )?;
+    // Backfill shopee_account_id cho data cũ — lấy account phổ biến nhất trong
+    // raw rows của file. Chỉ shopee_* kind mới có account; fb_* giữ NULL.
+    conn.execute(
+        "UPDATE imported_files
+         SET shopee_account_id = (
+             SELECT shopee_account_id FROM raw_shopee_clicks
+             WHERE source_file_id = imported_files.id
+             GROUP BY shopee_account_id ORDER BY COUNT(*) DESC LIMIT 1
+         )
+         WHERE kind = 'shopee_clicks' AND shopee_account_id IS NULL",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE imported_files
+         SET shopee_account_id = (
+             SELECT shopee_account_id FROM raw_shopee_order_items
+             WHERE source_file_id = imported_files.id
+             GROUP BY shopee_account_id ORDER BY COUNT(*) DESC LIMIT 1
+         )
+         WHERE kind = 'shopee_commission' AND shopee_account_id IS NULL",
+        [],
+    )?;
+
+    // Backfill mapping từ source_file_id. INSERT OR IGNORE: nếu chạy lại
+    // không double-insert. Data cũ chỉ track 1 file/row → ít tối ưu nhưng
+    // không sai (correctness = data mới sẽ đúng 100%).
+    conn.execute(
+        "INSERT OR IGNORE INTO clicks_to_file(click_id, file_id)
+         SELECT click_id, source_file_id FROM raw_shopee_clicks",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO orders_to_file(order_item_id, file_id)
+         SELECT id, source_file_id FROM raw_shopee_order_items",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO fb_ads_to_file(fb_ad_id, file_id)
+         SELECT id, source_file_id FROM raw_fb_ads",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(10, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
         [],
     )?;
     Ok(())
@@ -632,6 +781,45 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // v10 correctness: mapping tables phải drop khi raw row bị xóa (direct hoặc
+    // CASCADE từ days.date). Nếu không: mapping rỗng chỉ tới row đã xóa →
+    // revert orphan query miss + re-import (orders/fb_ads có AUTOINCREMENT id)
+    // tạo row mới id không khớp mapping cũ.
+    //
+    // Lưu ý: SQLite trigger FIRE cả với CASCADE delete (khác MySQL). Vậy nên
+    // day delete → raw CASCADE → trigger fire → mapping cleanup. Atomic.
+    let mapping_cleanup_specs: &[(&str, &str, &str, &str)] = &[
+        (
+            "trg_cleanup_click_mapping",
+            "raw_shopee_clicks",
+            "clicks_to_file",
+            "click_id",
+        ),
+        (
+            "trg_cleanup_order_mapping",
+            "raw_shopee_order_items",
+            "orders_to_file",
+            "order_item_id",
+        ),
+        (
+            "trg_cleanup_fb_ad_mapping",
+            "raw_fb_ads",
+            "fb_ads_to_file",
+            "fb_ad_id",
+        ),
+    ];
+    for (trg, src_tbl, map_tbl, map_key) in mapping_cleanup_specs {
+        let old_col = if *map_key == "click_id" { "click_id" } else { "id" };
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {trg}"), [])?;
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER {trg} AFTER DELETE ON {src_tbl}
+                 BEGIN DELETE FROM {map_tbl} WHERE {map_key} = OLD.{old_col}; END"
+            ),
+            [],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -668,6 +856,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
+        // Chạy migrate() để tạo partial unique index v10 (schema.sql không tạo
+        // vì reverted_at là cột v10 — phải ALTER TABLE ADD COLUMN trước).
+        migrate(&conn).unwrap();
         conn
     }
 
@@ -796,5 +987,442 @@ mod tests {
         insert("a").unwrap();
         assert!(insert("a").is_err(), "dup (sub_ids, date) phải fail");
         insert("b").unwrap();
+    }
+
+    /// Setup: 2 file A và B đều import cùng click "c1" (trùng data).
+    /// Revert A → click "c1" GIỮ NGUYÊN vì B vẫn link tới nó.
+    /// Revert B thêm → click "c1" mới bị xóa.
+    #[test]
+    fn revert_preserves_rows_linked_by_another_file() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-17', 'now')",
+            [],
+        )
+        .unwrap();
+
+        // File A
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('A.csv', 'shopee_clicks', 'now', 'hashA', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+        let a_id = conn.last_insert_rowid();
+
+        // File B
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('B.csv', 'shopee_clicks', 'now', 'hashB', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+        let b_id = conn.last_insert_rowid();
+
+        // Click c1 tồn tại 1 lần trong raw (source_file_id = A) nhưng MAPPING cả A và B.
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks(click_id, click_time, day_date, source_file_id)
+             VALUES('c1', 'now', '2026-04-17', ?)",
+            [a_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c1', ?)",
+            [a_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c1', ?)",
+            [b_id],
+        )
+        .unwrap();
+
+        // Simulate revert A: xóa mapping file_id=A + xóa raw orphan.
+        conn.execute("DELETE FROM clicks_to_file WHERE file_id = ?", [a_id])
+            .unwrap();
+        let orphan_deleted = conn
+            .execute(
+                "DELETE FROM raw_shopee_clicks
+                 WHERE click_id NOT IN (SELECT click_id FROM clicks_to_file)",
+                [],
+            )
+            .unwrap();
+
+        // c1 CÒN vì B vẫn link.
+        assert_eq!(orphan_deleted, 0, "revert A không được xóa click c1");
+        let c1_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE click_id='c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(c1_count, 1, "c1 phải còn sau revert A (B vẫn link)");
+
+        // Revert B tiếp.
+        conn.execute("DELETE FROM clicks_to_file WHERE file_id = ?", [b_id])
+            .unwrap();
+        conn.execute(
+            "DELETE FROM raw_shopee_clicks
+             WHERE click_id NOT IN (SELECT click_id FROM clicks_to_file)",
+            [],
+        )
+        .unwrap();
+        let c1_count2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE click_id='c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(c1_count2, 0, "c1 phải mất sau khi revert B (hết link)");
+    }
+
+    /// Partial unique index `idx_imported_hash_active` cho phép nhiều row cùng
+    /// file_hash nếu chỉ 1 row active (reverted_at IS NULL).
+    #[test]
+    fn partial_unique_hash_allows_reimport_after_revert() {
+        let conn = test_conn();
+
+        // File A active.
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('A.csv', 'shopee_clicks', 'now', 'hash-X', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+
+        // File A lần 2 cùng hash — reject (vẫn active).
+        let dup = conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('A-dup.csv', 'shopee_clicks', 'now', 'hash-X', '2026-04-17')",
+            [],
+        );
+        assert!(dup.is_err(), "dedup phải chặn 2 file cùng hash cùng active");
+
+        // Mark A as reverted.
+        conn.execute(
+            "UPDATE imported_files SET reverted_at='now' WHERE file_hash='hash-X'",
+            [],
+        )
+        .unwrap();
+
+        // Giờ re-import A được → partial unique cho phép vì row cũ reverted.
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('A-reimport.csv', 'shopee_clicks', 'now', 'hash-X', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imported_files
+                 WHERE file_hash='hash-X' AND reverted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1, "chỉ 1 row active sau re-import");
+
+        let total_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imported_files WHERE file_hash='hash-X'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_count, 2, "row cũ reverted giữ lại cho history");
+    }
+
+    /// Day delete CASCADE raw row → trigger cleanup mapping atomic.
+    /// Ngăn chặn stale mapping sau khi user xóa ngày.
+    #[test]
+    fn day_delete_cascades_cleanup_click_mapping() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-17', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('A.csv', 'shopee_clicks', 'now', 'hA', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks(click_id, click_time, day_date, source_file_id)
+             VALUES('c1', 'now', '2026-04-17', ?)",
+            [file_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c1', ?)",
+            [file_id],
+        )
+        .unwrap();
+
+        // Xóa day → CASCADE raw_shopee_clicks → trigger fire → mapping xóa.
+        conn.execute("DELETE FROM days WHERE date='2026-04-17'", [])
+            .unwrap();
+
+        let raw_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM raw_shopee_clicks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_count, 0, "raw clicks phải bị CASCADE");
+
+        let map_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM clicks_to_file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(map_count, 0, "trigger phải cleanup mapping khi CASCADE");
+    }
+
+    /// Scenario cốt lõi của user: 2 file trùng 1 dòng order.
+    /// File A import → file B UPSERT ghi đè `source_file_id`. Revert A thì
+    /// KHÔNG được hard-delete file A (cleanup orphan phải dùng mapping, không
+    /// dựa source_file_id).
+    #[test]
+    fn upsert_overwrites_source_file_id_but_mapping_preserves_history() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-17', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('A.csv', 'shopee_commission', 'now', 'hA', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+        let a_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('B.csv', 'shopee_commission', 'now', 'hB', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+        let b_id = conn.last_insert_rowid();
+
+        // File A import order X.
+        conn.execute(
+            "INSERT INTO raw_shopee_order_items
+               (order_id, checkout_id, item_id, order_status, order_time, day_date, source_file_id)
+             VALUES ('o1', 'chk1', 'it1', 'Đang chờ', 'now', '2026-04-17', ?)",
+            [a_id],
+        )
+        .unwrap();
+        let order_row_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO orders_to_file(order_item_id, file_id) VALUES(?, ?)",
+            [order_row_id, a_id],
+        )
+        .unwrap();
+
+        // File B UPSERT → ghi đè source_file_id thành B. Mapping thêm (row, B).
+        conn.execute(
+            "UPDATE raw_shopee_order_items SET order_status='Hoàn thành',
+                source_file_id = ? WHERE id = ?",
+            [b_id, order_row_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO orders_to_file(order_item_id, file_id) VALUES(?, ?)",
+            [order_row_id, b_id],
+        )
+        .unwrap();
+
+        // Check: source_file_id giờ = B, nhưng mapping có cả A và B.
+        let sfi: i64 = conn
+            .query_row(
+                "SELECT source_file_id FROM raw_shopee_order_items WHERE id = ?",
+                [order_row_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sfi, b_id, "UPSERT ghi đè source_file_id");
+        let map_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM orders_to_file WHERE order_item_id = ?",
+                [order_row_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(map_count, 2, "mapping phải có cả A và B");
+
+        // Cleanup orphan qua MAPPING (chuẩn v10). File A phải còn (mapping có entry).
+        cleanup_orphan_imported_files(&conn).unwrap();
+        let a_still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imported_files WHERE id = ?",
+                [a_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_still, 1,
+            "file A KHÔNG được orphan (mapping còn), cleanup phải dựa mapping"
+        );
+
+        // Simulate revert A: xóa mapping(A), raw row còn (mapping(B) còn).
+        conn.execute(
+            "DELETE FROM orders_to_file WHERE file_id = ?",
+            [a_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM raw_shopee_order_items
+             WHERE id NOT IN (SELECT order_item_id FROM orders_to_file)",
+            [],
+        )
+        .unwrap();
+
+        let row_still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_order_items WHERE id = ?",
+                [order_row_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_still, 1, "raw row phải còn sau revert A (mapping B giữ)");
+    }
+
+    /// Commission report scenario: file X (xuất ngày 10) + file Y (xuất ngày 15,
+    /// chứa đơn cũ đã update status + đơn mới). Revert Y phải GIỮ đơn cũ
+    /// (vì có ở X) + XÓA đơn mới (chỉ ở Y).
+    #[test]
+    fn commission_report_revert_preserves_shared_orders() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-10', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-12', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('X.csv', 'shopee_commission', 'now', 'hX', '2026-04-10')",
+            [],
+        )
+        .unwrap();
+        let x_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('Y.csv', 'shopee_commission', 'now', 'hY', '2026-04-10')",
+            [],
+        )
+        .unwrap();
+        let y_id = conn.last_insert_rowid();
+
+        // File X imports order_old (2026-04-10).
+        conn.execute(
+            "INSERT INTO raw_shopee_order_items
+               (order_id, checkout_id, item_id, order_time, day_date, source_file_id)
+             VALUES ('old', 'chk-old', 'it', 'now', '2026-04-10', ?)",
+            [x_id],
+        )
+        .unwrap();
+        let old_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO orders_to_file(order_item_id, file_id) VALUES(?, ?)",
+            [old_id, x_id],
+        )
+        .unwrap();
+
+        // File Y re-imports order_old (status update) + adds order_new.
+        conn.execute(
+            "UPDATE raw_shopee_order_items SET source_file_id = ? WHERE id = ?",
+            [y_id, old_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO orders_to_file(order_item_id, file_id) VALUES(?, ?)",
+            [old_id, y_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_shopee_order_items
+               (order_id, checkout_id, item_id, order_time, day_date, source_file_id)
+             VALUES ('new', 'chk-new', 'it', 'now', '2026-04-12', ?)",
+            [y_id],
+        )
+        .unwrap();
+        let new_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO orders_to_file(order_item_id, file_id) VALUES(?, ?)",
+            [new_id, y_id],
+        )
+        .unwrap();
+
+        // Revert Y: xóa mapping(Y) + orphan raw.
+        conn.execute(
+            "DELETE FROM orders_to_file WHERE file_id = ?",
+            [y_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM raw_shopee_order_items
+             WHERE id NOT IN (SELECT order_item_id FROM orders_to_file)",
+            [],
+        )
+        .unwrap();
+
+        // old: mapping(X) còn → giữ. new: chỉ Y → mất.
+        let old_still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_order_items WHERE order_id='old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_still, 1, "order 'old' phải giữ (shared với X)");
+        let new_still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_order_items WHERE order_id='new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_still, 0, "order 'new' phải mất (chỉ ở Y)");
+    }
+
+    /// Mapping tables phải CASCADE khi hard-delete imported_files (cleanup orphan).
+    #[test]
+    fn mapping_cascades_on_imported_files_delete() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-17', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES('x.csv', 'shopee_clicks', 'now', 'h', '2026-04-17')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c1', ?)",
+            [file_id],
+        )
+        .unwrap();
+
+        // Hard delete imported_files row → mapping CASCADE.
+        conn.execute(
+            "DELETE FROM imported_files WHERE id = ?",
+            [file_id],
+        )
+        .unwrap();
+        let map_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM clicks_to_file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(map_count, 0, "mapping phải CASCADE theo imported_files");
     }
 }

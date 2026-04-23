@@ -140,6 +140,7 @@ fn register_imported_file(
     stored_path: &str,
     day_date: &str,
     row_count: i64,
+    shopee_account_id: Option<i64>,
 ) -> CmdResult<i64> {
     tx.execute(
         "INSERT OR IGNORE INTO days(date, created_at) VALUES(?, ?)",
@@ -153,9 +154,11 @@ fn register_imported_file(
         params![day_date],
     )?;
 
+    // v10: dedup chỉ check file ACTIVE (chưa revert). Row `reverted_at IS NOT NULL`
+    // giữ cho history — user revert xong import lại cùng file → tạo row mới.
     let existing: Option<i64> = tx
         .query_row(
-            "SELECT id FROM imported_files WHERE file_hash = ?",
+            "SELECT id FROM imported_files WHERE file_hash = ? AND reverted_at IS NULL",
             params![hash],
             |r| r.get(0),
         )
@@ -166,9 +169,9 @@ fn register_imported_file(
 
     tx.execute(
         "INSERT INTO imported_files
-         (filename, kind, imported_at, row_count, file_hash, stored_path, day_date)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![filename, kind, now, row_count, hash, stored_path, day_date],
+         (filename, kind, imported_at, row_count, file_hash, stored_path, day_date, shopee_account_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![filename, kind, now, row_count, hash, stored_path, day_date, shopee_account_id],
     )?;
     Ok(tx.last_insert_rowid())
 }
@@ -262,6 +265,7 @@ pub fn import_shopee_clicks(
         &stored_path,
         &day_date_from,
         payload.rows.len() as i64,
+        Some(shopee_account_id),
     )?;
 
     let mut inserted: i64 = 0;
@@ -274,6 +278,11 @@ pub fn import_shopee_clicks(
               sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
               referrer, day_date, source_file_id, shopee_account_id)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        // v10: mapping raw↔file. INSERT OR IGNORE mọi row (insert hoặc dup)
+        // vì file X đều đã "touch" click đó — revert phải biết để giữ khi còn file Y.
+        let mut map_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO clicks_to_file(click_id, file_id) VALUES(?, ?)",
         )?;
         for (r, date_opt) in &rows_with_dates {
             let Some(day_date) = date_opt else {
@@ -295,6 +304,7 @@ pub fn import_shopee_clicks(
                 source_file_id,
                 shopee_account_id,
             ])?;
+            map_stmt.execute(params![r.click_id, source_file_id])?;
             if changes > 0 {
                 inserted += 1;
             } else {
@@ -430,9 +440,12 @@ pub fn import_shopee_orders(
         &stored_path,
         &day_date_from,
         payload.rows.len() as i64,
+        Some(shopee_account_id),
     )?;
 
     // UPSERT: ON CONFLICT DO UPDATE cập nhật trạng thái + field mới nhất.
+    // v10: RETURNING id để mapping orders_to_file biết row_id của UPSERTED row
+    // (SQLite 3.35+ support trong cả DO UPDATE branch).
     let mut inserted: i64 = 0;
     let mut updated: i64 = 0;
     let mut skipped: i64 = 0;
@@ -463,7 +476,11 @@ pub fn import_shopee_orders(
                 mcn_fee        = excluded.mcn_fee,
                 source_file_id = excluded.source_file_id,
                 shopee_account_id = excluded.shopee_account_id,
-                day_date       = excluded.day_date",
+                day_date       = excluded.day_date
+             RETURNING id",
+        )?;
+        let mut map_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO orders_to_file(order_item_id, file_id) VALUES(?, ?)",
         )?;
 
         // Validation: Shopee spec `net_commission = order_commission_total − mcn_fee`.
@@ -485,40 +502,44 @@ pub fn import_shopee_orders(
                 )
                 .unwrap_or(0);
 
-            stmt.execute(params![
-                r.order_id,
-                r.checkout_id,
-                r.item_id,
-                r.model_id,
-                r.order_status,
-                r.order_time,
-                r.completed_time,
-                r.click_time,
-                r.shop_id,
-                r.shop_name,
-                r.shop_type,
-                r.item_name,
-                r.category_l1,
-                r.category_l2,
-                r.category_l3,
-                r.price,
-                r.quantity,
-                r.order_value,
-                r.refund_amount,
-                r.net_commission,
-                r.commission_total,
-                r.order_commission_total,
-                r.mcn_fee,
-                r.sub_ids[0],
-                r.sub_ids[1],
-                r.sub_ids[2],
-                r.sub_ids[3],
-                r.sub_ids[4],
-                r.channel,
-                day_date,
-                source_file_id,
-                shopee_account_id,
-            ])?;
+            let order_item_id: i64 = stmt.query_row(
+                params![
+                    r.order_id,
+                    r.checkout_id,
+                    r.item_id,
+                    r.model_id,
+                    r.order_status,
+                    r.order_time,
+                    r.completed_time,
+                    r.click_time,
+                    r.shop_id,
+                    r.shop_name,
+                    r.shop_type,
+                    r.item_name,
+                    r.category_l1,
+                    r.category_l2,
+                    r.category_l3,
+                    r.price,
+                    r.quantity,
+                    r.order_value,
+                    r.refund_amount,
+                    r.net_commission,
+                    r.commission_total,
+                    r.order_commission_total,
+                    r.mcn_fee,
+                    r.sub_ids[0],
+                    r.sub_ids[1],
+                    r.sub_ids[2],
+                    r.sub_ids[3],
+                    r.sub_ids[4],
+                    r.channel,
+                    day_date,
+                    source_file_id,
+                    shopee_account_id,
+                ],
+                |row| row.get(0),
+            )?;
+            map_stmt.execute(params![order_item_id, source_file_id])?;
 
             if let (Some(net), Some(pre), Some(fee)) =
                 (r.net_commission, r.order_commission_total, r.mcn_fee)
@@ -687,12 +708,16 @@ pub fn import_fb_ad_groups(
         &stored_path,
         &day_date,
         payload.rows.len() as i64,
+        None,
     )?;
 
     let mut inserted: i64 = 0;
     let mut duplicated: i64 = 0;
     {
         let mut stmt = tx.prepare(FB_ADS_UPSERT_SQL)?;
+        let mut map_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO fb_ads_to_file(fb_ad_id, file_id) VALUES(?, ?)",
+        )?;
         for r in &payload.rows {
             let before: i64 = tx
                 .query_row(
@@ -704,25 +729,29 @@ pub fn import_fb_ad_groups(
                 .unwrap_or(0);
             let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
             let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
-            stmt.execute(params![
-                "ad_group",
-                r.ad_group_name,
-                r.sub_ids[0],
-                r.sub_ids[1],
-                r.sub_ids[2],
-                r.sub_ids[3],
-                r.sub_ids[4],
-                r.report_start,
-                r.report_end,
-                r.status,
-                r.spend,
-                clicks,
-                cpc,
-                r.impressions,
-                r.reach,
-                day_date,
-                source_file_id,
-            ])?;
+            let fb_ad_id: i64 = stmt.query_row(
+                params![
+                    "ad_group",
+                    r.ad_group_name,
+                    r.sub_ids[0],
+                    r.sub_ids[1],
+                    r.sub_ids[2],
+                    r.sub_ids[3],
+                    r.sub_ids[4],
+                    r.report_start,
+                    r.report_end,
+                    r.status,
+                    r.spend,
+                    clicks,
+                    cpc,
+                    r.impressions,
+                    r.reach,
+                    day_date,
+                    source_file_id,
+                ],
+                |row| row.get(0),
+            )?;
+            map_stmt.execute(params![fb_ad_id, source_file_id])?;
             if before == 0 {
                 inserted += 1;
             } else {
@@ -747,6 +776,7 @@ pub fn import_fb_ad_groups(
 
 /// UPSERT template shared giữa `import_fb_ad_groups` và `import_fb_campaigns`.
 /// ON CONFLICT theo `(day_date, level, name)` — 2 level cùng name không đụng nhau.
+/// v10: RETURNING id để mapping fb_ads_to_file (SQLite 3.35+).
 const FB_ADS_UPSERT_SQL: &str = "
     INSERT INTO raw_fb_ads
     (level, name,
@@ -764,6 +794,7 @@ const FB_ADS_UPSERT_SQL: &str = "
        spend = excluded.spend, clicks = excluded.clicks, cpc = excluded.cpc,
        impressions = excluded.impressions, reach = excluded.reach,
        source_file_id = excluded.source_file_id
+    RETURNING id
 ";
 
 // ============================================================
@@ -832,12 +863,16 @@ pub fn import_fb_campaigns(
         &stored_path,
         &day_date,
         payload.rows.len() as i64,
+        None,
     )?;
 
     let mut inserted: i64 = 0;
     let mut duplicated: i64 = 0;
     {
         let mut stmt = tx.prepare(FB_ADS_UPSERT_SQL)?;
+        let mut map_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO fb_ads_to_file(fb_ad_id, file_id) VALUES(?, ?)",
+        )?;
         for r in &payload.rows {
             let before: i64 = tx
                 .query_row(
@@ -849,25 +884,29 @@ pub fn import_fb_campaigns(
                 .unwrap_or(0);
             let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
             let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
-            stmt.execute(params![
-                "campaign",
-                r.campaign_name,
-                r.sub_ids[0],
-                r.sub_ids[1],
-                r.sub_ids[2],
-                r.sub_ids[3],
-                r.sub_ids[4],
-                r.report_start,
-                r.report_end,
-                r.status,
-                r.spend,
-                clicks,
-                cpc,
-                r.impressions,
-                r.reach,
-                day_date,
-                source_file_id,
-            ])?;
+            let fb_ad_id: i64 = stmt.query_row(
+                params![
+                    "campaign",
+                    r.campaign_name,
+                    r.sub_ids[0],
+                    r.sub_ids[1],
+                    r.sub_ids[2],
+                    r.sub_ids[3],
+                    r.sub_ids[4],
+                    r.report_start,
+                    r.report_end,
+                    r.status,
+                    r.spend,
+                    clicks,
+                    cpc,
+                    r.impressions,
+                    r.reach,
+                    day_date,
+                    source_file_id,
+                ],
+                |row| row.get(0),
+            )?;
+            map_stmt.execute(params![fb_ad_id, source_file_id])?;
             if before == 0 {
                 inserted += 1;
             } else {

@@ -21,21 +21,56 @@ CREATE TABLE IF NOT EXISTS days (
 -- report update đơn cũ). Nếu có FK CASCADE → xóa ngày X → wipe file metadata
 -- → wipe luôn raw rows của NGÀY KHÁC cùng file qua source_file_id CASCADE.
 -- Không CASCADE qua day cho imported_files = an toàn cho multi-day file.
+-- v10: cho phép soft-revert → partial unique index ở dưới (không UNIQUE inline)
+-- để revert xong user có thể re-import cùng file.
 CREATE TABLE IF NOT EXISTS imported_files (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename     TEXT NOT NULL,
-    kind         TEXT NOT NULL,        -- 'shopee_clicks'|'shopee_commission'|'fb_ad_group'|'fb_campaign'
-    imported_at  TEXT NOT NULL,
-    row_count    INTEGER NOT NULL DEFAULT 0,
-    file_hash    TEXT NOT NULL,        -- SHA-256 của raw content
-    stored_path  TEXT,                 -- relative path trong app_data_dir/imports/
-    day_date     TEXT,                 -- earliest date in file (informational)
-    notes        TEXT,
-    UNIQUE(file_hash)                  -- chặn import trùng
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename           TEXT NOT NULL,
+    kind               TEXT NOT NULL,  -- 'shopee_clicks'|'shopee_commission'|'fb_ad_group'|'fb_campaign'
+    imported_at        TEXT NOT NULL,
+    row_count          INTEGER NOT NULL DEFAULT 0,
+    file_hash          TEXT NOT NULL,  -- SHA-256 của raw content
+    stored_path        TEXT,           -- relative path trong app_data_dir/imports/
+    day_date           TEXT,           -- earliest date in file (informational)
+    notes              TEXT,
+    reverted_at        TEXT,           -- v10: NULL = active, !=NULL = đã revert (lưu history)
+    shopee_account_id  INTEGER         -- v10: TK Shopee gán lúc import (NULL cho file FB không có account)
 );
 
 CREATE INDEX IF NOT EXISTS idx_imported_day     ON imported_files(day_date);
 CREATE INDEX IF NOT EXISTS idx_imported_kind    ON imported_files(kind);
+-- Partial unique index `idx_imported_hash_active` tạo trong migration v10
+-- (không ở schema.sql vì index reference cột `reverted_at` — trên old DB cột
+-- này chưa có lúc schema.sql chạy, phải ADD COLUMN trước qua migrate()).
+
+-- =============================================================
+-- v10 mapping tables — track raw row thuộc về file nào (many-to-many).
+-- Revert file X → DELETE mapping(file_id=X) → DELETE raw row chỉ khi không
+-- còn mapping nào trỏ tới (tức file trùng data khác đã revert hết). Đảm bảo
+-- correctness tuyệt đối khi 2 file cùng chứa 1 row.
+-- FK file_id ON DELETE CASCADE: nếu hard-delete imported_files (migration cũ
+-- dọn orphan) thì mapping cũng biến mất theo.
+-- =============================================================
+CREATE TABLE IF NOT EXISTS clicks_to_file (
+    click_id   TEXT    NOT NULL,
+    file_id    INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
+    PRIMARY KEY(click_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_clicks_to_file_file  ON clicks_to_file(file_id);
+
+CREATE TABLE IF NOT EXISTS orders_to_file (
+    order_item_id INTEGER NOT NULL,
+    file_id       INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
+    PRIMARY KEY(order_item_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_orders_to_file_file  ON orders_to_file(file_id);
+
+CREATE TABLE IF NOT EXISTS fb_ads_to_file (
+    fb_ad_id INTEGER NOT NULL,
+    file_id  INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
+    PRIMARY KEY(fb_ad_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fb_ads_to_file_file  ON fb_ads_to_file(file_id);
 
 -- =============================================================
 -- raw_shopee_clicks — 1 row/click từ WebsiteClickReport.

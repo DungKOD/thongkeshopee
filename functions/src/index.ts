@@ -89,6 +89,122 @@ export const syncUserClaims = onDocumentWritten(
   },
 );
 
+// Rate-limit password reset requests per-email (5 lần / 24h rolling window).
+//
+// Firebase Auth built-in protection chỉ rate-limit theo IP (~100 req/hour).
+// User có thể spam chính họ (VD: quên pass, liên tục "quên") → Firebase gửi 5-10
+// email chưa chắc block. Function này giữ counter per-email trong Firestore,
+// reject khi vượt quota.
+//
+// Flow: FE gọi function trước → allowed=true thì FE tiếp tục gọi
+// `sendPasswordResetEmail` (client SDK). Nếu function reject → throw error.
+//
+// Bypass risk: user tech có thể call `sendPasswordResetEmail` trực tiếp qua
+// DevTools → skip counter. Nhưng Firebase IP rate-limit vẫn block.
+// Mục tiêu là UX limit, không phải adversarial security.
+export const requestPasswordReset = onCall(
+  {
+    timeoutSeconds: 10,
+    memory: "256MiB",
+    maxInstances: 5,
+  },
+  async (request) => {
+    const rawEmail = request.data?.email;
+    if (typeof rawEmail !== "string") {
+      throw new HttpsError("invalid-argument", "Thiếu email");
+    }
+    const email = rawEmail.trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new HttpsError("invalid-argument", "Email không hợp lệ");
+    }
+
+    const MAX_PER_DAY = 5;
+    const WINDOW_MS = 24 * 60 * 60 * 1000;
+    const COOLDOWN_MS = 60 * 1000;
+    const now = Date.now();
+
+    const db = getFirestore();
+    const docRef = db.collection("passwordResetQuota").doc(email);
+
+    // Transaction: check cooldown + daily quota. Atomic → concurrent calls từ
+    // cùng email serialize. Block reason phân biệt "cooldown" (1 phút giữa 2
+    // lần) và "daily" (5 lần / 24h).
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(docRef);
+      const raw = snap.exists ? ((snap.data()?.attempts as number[]) ?? []) : [];
+      const active = raw.filter((t) => now - t < WINDOW_MS);
+
+      // 1. Cooldown 1 phút giữa 2 lần liên tiếp.
+      if (active.length > 0) {
+        const last = active[active.length - 1];
+        if (now - last < COOLDOWN_MS) {
+          return {
+            blocked: true,
+            reason: "cooldown" as const,
+            retryAtMs: last + COOLDOWN_MS,
+            count: active.length,
+          };
+        }
+      }
+
+      // 2. Quota 5 lần / 24h rolling.
+      if (active.length >= MAX_PER_DAY) {
+        const oldest = active[0];
+        return {
+          blocked: true,
+          reason: "daily" as const,
+          retryAtMs: oldest + WINDOW_MS,
+          count: active.length,
+        };
+      }
+
+      active.push(now);
+      tx.set(docRef, {
+        attempts: active,
+        lastEmail: email,
+        updatedAt: now,
+      });
+      return {
+        blocked: false as const,
+        reason: "ok" as const,
+        retryAtMs: 0,
+        count: active.length,
+      };
+    });
+
+    if (result.blocked) {
+      const remainMs = result.retryAtMs - now;
+      if (result.reason === "cooldown") {
+        const secs = Math.max(1, Math.ceil(remainMs / 1000));
+        throw new HttpsError(
+          "resource-exhausted",
+          `Vui lòng đợi ${secs} giây trước khi yêu cầu lại (giới hạn 1 phút/lần).`,
+        );
+      }
+      // reason === "daily"
+      const mins = Math.ceil(remainMs / 60_000);
+      const hours = Math.floor(mins / 60);
+      const timeStr =
+        hours > 0
+          ? `~${hours}h${mins % 60 > 0 ? ` ${mins % 60}p` : ""}`
+          : `~${mins} phút`;
+      throw new HttpsError(
+        "resource-exhausted",
+        `Đã yêu cầu đặt lại mật khẩu ${result.count} lần trong 24h qua (giới hạn ${MAX_PER_DAY}). Thử lại sau ${timeStr}.`,
+      );
+    }
+
+    logger.info(
+      `[requestPasswordReset] email=${email} allowed (${result.count}/${MAX_PER_DAY})`,
+    );
+    return {
+      allowed: true,
+      remaining: MAX_PER_DAY - result.count,
+      maxPerDay: MAX_PER_DAY,
+    };
+  },
+);
+
 // Callable function để admin ép sync claim cho 1 uid. Use cases:
 //  - Bootstrap admin đầu tiên trước khi Cloud Function deploy.
 //  - Resync claim khi bị drift (script ngoài luồng set claim).

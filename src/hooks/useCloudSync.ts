@@ -78,11 +78,12 @@ interface UseCloudSyncOptions {
 /// tiếp theo (reset trong window) tăng ladder lên. Cap ở DEBOUNCE_MAX_MS.
 /// Kết quả: user edit liên tục → gộp thành 1 sync cuối thay vì N syncs.
 ///
-/// Tradeoff: user edit 1 lần xong thôi → debounce BASE (15s, UX snappy).
-/// User edit 10 lần trong 1 phút → debounce extend dần lên MAX (60s), chỉ
-/// 1 upload cuối.
-const DEBOUNCE_BASE_MS = 15_000;
-const DEBOUNCE_MAX_MS = 60_000;
+/// Tradeoff: user edit 1 lần xong thôi → debounce BASE (45s, giảm R2 ops).
+/// User edit 10 lần trong 1 phút → debounce extend dần lên MAX (120s), chỉ
+/// 1 upload cuối. Combined skip-identical hash (sync.rs) → mutation không
+/// đổi DB (revert + redo cùng state) KHÔNG tốn upload.
+const DEBOUNCE_BASE_MS = 45_000;
+const DEBOUNCE_MAX_MS = 120_000;
 const DEBOUNCE_STEP_MS = 15_000;
 const IDLE_MS = 30_000;
 const IDLE_CHECK_MS = 5_000;
@@ -95,10 +96,10 @@ function backoffFor(attempt: number): number {
 }
 
 /// Compute adaptive debounce delay dựa trên consecutive mutations.
-/// - 1st mutation: BASE (15s)
-/// - 2nd: BASE + STEP = 30s
-/// - 3rd: 45s
-/// - 4th+: capped at MAX (60s)
+/// - 1st mutation: BASE (45s)
+/// - 2nd: 60s
+/// - 3rd: 75s
+/// - 6th+: capped at MAX (120s)
 function adaptiveDebounce(consecutive: number): number {
   const delay = DEBOUNCE_BASE_MS + consecutive * DEBOUNCE_STEP_MS;
   return Math.min(delay, DEBOUNCE_MAX_MS);

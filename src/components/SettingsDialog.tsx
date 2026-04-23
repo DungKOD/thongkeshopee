@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import type { ProfitFees, Settings } from "../hooks/useSettings";
+import { ImportHistorySection } from "./ImportHistorySection";
 
 interface SettingsDialogProps {
   isOpen: boolean;
@@ -10,6 +11,10 @@ interface SettingsDialogProps {
   onToggleClickSource: (source: string, enabled: boolean) => void;
   onSetProfitFee: (key: keyof ProfitFees, value: number) => void;
   onClose: () => void;
+  /** Trigger reload lịch sử import ngoài (bump khi có import/delete). */
+  importHistoryReloadKey?: number;
+  /** Callback sau khi revert import — parent reload days/overview. */
+  onImportReverted?: () => void;
 }
 
 export function SettingsDialog({
@@ -20,6 +25,8 @@ export function SettingsDialog({
   onToggleClickSource,
   onSetProfitFee,
   onClose,
+  importHistoryReloadKey,
+  onImportReverted,
 }: SettingsDialogProps) {
   useEffect(() => {
     if (!isOpen) return;
@@ -178,6 +185,11 @@ export function SettingsDialog({
               </ul>
             )}
           </section>
+
+          <ImportHistorySection
+            reloadKey={importHistoryReloadKey}
+            onReverted={onImportReverted}
+          />
 
           {/* App info — version + build metadata. Cuối Settings làm footer info. */}
           <section className="rounded-xl border border-surface-8 bg-surface-1 px-4 py-3">

@@ -758,9 +758,24 @@ fn aggregate_rows_for_day(
 #[tauri::command]
 pub fn list_imported_files(state: State<'_, DbState>) -> CmdResult<Vec<ImportedFileInfo>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // v10: JOIN shopee_accounts để trả account_name + thêm reverted_at cho
+    // FE phân biệt active vs đã hoàn tác. active_rows = SUM mapping (cần để
+    // user biết bao nhiêu row thực tế còn active sau khi file khác revert).
     let mut stmt = conn.prepare(
-        "SELECT id, filename, kind, imported_at, row_count, day_date
-         FROM imported_files ORDER BY imported_at DESC",
+        "SELECT f.id, f.filename, f.kind, f.imported_at, f.row_count, f.day_date,
+                f.reverted_at, sa.name AS account_name,
+                COALESCE(
+                    (SELECT COUNT(*) FROM clicks_to_file WHERE file_id = f.id), 0
+                ) +
+                COALESCE(
+                    (SELECT COUNT(*) FROM orders_to_file WHERE file_id = f.id), 0
+                ) +
+                COALESCE(
+                    (SELECT COUNT(*) FROM fb_ads_to_file WHERE file_id = f.id), 0
+                ) AS active_rows
+         FROM imported_files f
+         LEFT JOIN shopee_accounts sa ON sa.id = f.shopee_account_id
+         ORDER BY f.imported_at DESC",
     )?;
     let rows: Vec<ImportedFileInfo> = stmt
         .query_map([], |r| {
@@ -771,6 +786,9 @@ pub fn list_imported_files(state: State<'_, DbState>) -> CmdResult<Vec<ImportedF
                 imported_at: r.get(3)?,
                 row_count: r.get(4)?,
                 day_date: r.get(5)?,
+                reverted_at: r.get(6)?,
+                account_name: r.get(7)?,
+                active_rows: r.get(8)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -785,7 +803,10 @@ pub struct ImportedFileInfo {
     pub kind: String,
     pub imported_at: String,
     pub row_count: i64,
-    pub day_date: String,
+    pub day_date: Option<String>,
+    pub reverted_at: Option<String>,
+    pub account_name: Option<String>,
+    pub active_rows: i64,
 }
 
 /// Snapshot toàn DB dùng cho FE autocomplete + summary. Gọi 1 lần khi app start

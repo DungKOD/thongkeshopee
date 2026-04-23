@@ -10,12 +10,14 @@ import {
 import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
+  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signInWithPopup,
   signOut as fbSignOut,
   type User,
 } from "firebase/auth";
-import { auth, googleProvider } from "../lib/firebase";
+import { httpsCallable } from "firebase/functions";
+import { auth, functions, googleProvider } from "../lib/firebase";
 
 interface AuthContextValue {
   user: User | null;
@@ -23,6 +25,7 @@ interface AuthContextValue {
   signInWithGoogle: () => Promise<void>;
   signInWithEmail: (email: string, password: string) => Promise<void>;
   signUpWithEmail: (email: string, password: string) => Promise<void>;
+  resetPassword: (email: string) => Promise<void>;
   signOut: () => Promise<void>;
 }
 
@@ -56,6 +59,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
     await createUserWithEmailAndPassword(auth, email, password);
   }, []);
 
+  const resetPassword = useCallback(async (email: string) => {
+    // Rate-limit check qua Cloud Function: 5 lần/24h + cooldown 1 phút.
+    // Function throw HttpsError nếu vượt → FE bắt error, show message.
+    const requestReset = httpsCallable<{ email: string }, { allowed: boolean }>(
+      functions,
+      "requestPasswordReset",
+    );
+    await requestReset({ email });
+    // Quota OK → gửi email reset qua Firebase Auth.
+    await sendPasswordResetEmail(auth, email);
+  }, []);
+
   const signOut = useCallback(async () => {
     await fbSignOut(auth);
   }, []);
@@ -67,9 +82,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
       signInWithGoogle,
       signInWithEmail,
       signUpWithEmail,
+      resetPassword,
       signOut,
     }),
-    [user, loading, signInWithGoogle, signInWithEmail, signUpWithEmail, signOut],
+    [
+      user,
+      loading,
+      signInWithGoogle,
+      signInWithEmail,
+      signUpWithEmail,
+      resetPassword,
+      signOut,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

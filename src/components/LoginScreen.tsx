@@ -6,6 +6,9 @@ type Mode = "signin" | "signup";
 
 function parseAuthError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
+  // Cloud Function rate-limit error pass-through (đã format tiếng Việt ở server).
+  const code = (err as { code?: string })?.code;
+  if (code === "functions/resource-exhausted") return msg;
   if (msg.includes("auth/invalid-credential") || msg.includes("auth/wrong-password"))
     return "Email hoặc mật khẩu không đúng";
   if (msg.includes("auth/user-not-found")) return "Tài khoản không tồn tại";
@@ -15,16 +18,20 @@ function parseAuthError(err: unknown): string {
   if (msg.includes("auth/popup-closed-by-user")) return "Đã hủy đăng nhập Google";
   if (msg.includes("auth/network-request-failed"))
     return "Mất kết nối mạng — kiểm tra lại internet";
+  if (msg.includes("auth/too-many-requests"))
+    return "Quá nhiều lần thử — đợi vài phút rồi thử lại";
   return msg;
 }
 
 export function LoginScreen() {
-  const { signInWithGoogle, signInWithEmail, signUpWithEmail } = useAuth();
+  const { signInWithGoogle, signInWithEmail, signUpWithEmail, resetPassword } =
+    useAuth();
   const [mode, setMode] = useState<Mode>("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [resetInfo, setResetInfo] = useState<string | null>(null);
 
   const handleGoogle = async () => {
     setError(null);
@@ -41,10 +48,32 @@ export function LoginScreen() {
   const handleEmailSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setResetInfo(null);
     setSubmitting(true);
     try {
       if (mode === "signin") await signInWithEmail(email, password);
       else await signUpWithEmail(email, password);
+    } catch (err) {
+      setError(parseAuthError(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleForgotPassword = async () => {
+    setError(null);
+    setResetInfo(null);
+    const trimmed = email.trim();
+    if (!trimmed) {
+      setError("Nhập email vào ô phía trên rồi bấm 'Quên mật khẩu?'");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await resetPassword(trimmed);
+      setResetInfo(
+        `Đã gửi link đặt lại mật khẩu đến ${trimmed}. Kiểm tra hộp thư (cả Spam).`,
+      );
     } catch (err) {
       setError(parseAuthError(err));
     } finally {
@@ -113,6 +142,11 @@ export function LoginScreen() {
               {error}
             </div>
           )}
+          {resetInfo && (
+            <div className="rounded-md border border-emerald-500/40 bg-emerald-900/30 px-3 py-2 text-xs text-emerald-200">
+              {resetInfo}
+            </div>
+          )}
           <button
             type="submit"
             disabled={submitting}
@@ -126,13 +160,25 @@ export function LoginScreen() {
           </button>
         </form>
 
+        {mode === "signin" && (
+          <button
+            type="button"
+            onClick={() => void handleForgotPassword()}
+            disabled={submitting}
+            className="mt-3 block w-full text-center text-xs text-white/60 hover:text-shopee-300 disabled:opacity-50"
+          >
+            Quên mật khẩu?
+          </button>
+        )}
+
         <button
           type="button"
           onClick={() => {
             setMode(mode === "signin" ? "signup" : "signin");
             setError(null);
+            setResetInfo(null);
           }}
-          className="mt-4 block w-full text-center text-xs text-white/60 hover:text-shopee-300"
+          className="mt-2 block w-full text-center text-xs text-white/60 hover:text-shopee-300"
         >
           {mode === "signin"
             ? "Chưa có tài khoản? Đăng ký"

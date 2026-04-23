@@ -8,6 +8,7 @@ import {
 } from "firebase/auth";
 import { getFirestore, type Firestore } from "firebase/firestore";
 import { getDatabase, type Database } from "firebase/database";
+import { getFunctions, type Functions } from "firebase/functions";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -27,6 +28,8 @@ export const db: Firestore = getFirestore(firebaseApp);
 export const rtdb: Database | null = import.meta.env.VITE_FIREBASE_DATABASE_URL
   ? getDatabase(firebaseApp)
   : null;
+/// Cloud Functions client — region match với deploy (asia-southeast1 Singapore).
+export const functions: Functions = getFunctions(firebaseApp, "asia-southeast1");
 export const googleProvider = new GoogleAuthProvider();
 
 void setPersistence(auth, browserLocalPersistence);

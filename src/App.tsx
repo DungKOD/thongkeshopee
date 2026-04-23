@@ -1009,6 +1009,7 @@ function AppInner() {
         onToggleClickSource={setClickSource}
         onSetProfitFee={setProfitFee}
         onClose={() => setSettingsOpen(false)}
+        onImportReverted={() => void refetch()}
       />
 
       <RulesDialog isOpen={rulesOpen} onClose={() => setRulesOpen(false)} />

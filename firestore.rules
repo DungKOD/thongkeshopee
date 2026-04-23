@@ -25,6 +25,12 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
+    // passwordResetQuota/{email} — server-only (Cloud Function admin SDK
+    // write). Client SDK chặn tuyệt đối để tránh user tự reset counter.
+    match /passwordResetQuota/{email} {
+      allow read, write: if false;
+    }
+
     match /{document=**} {
       allow read, write: if false;
     }
