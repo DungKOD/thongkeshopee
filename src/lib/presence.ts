@@ -219,11 +219,23 @@ export function trackMyPresence(
 /// Subscribe toàn bộ status. Callback nhận `PresenceMap` aggregated theo
 /// uid (mỗi user → list devices).
 ///
-/// **Backward compat**: nếu RTDB còn entry old shape `/status/{uid}` flat
-/// (DevicePresence không nest vào fingerprint sub-node) → wrap thành
-/// device giả `__legacy__` để UI vẫn hiển thị. Lần app login tiếp theo
-/// migrate sang shape mới (vì fingerprint write entry mới + onDisconnect
-/// + heartbeat của entry mới sẽ co-exist với old).
+/// **Backward compat — mixed shape parser**: RTDB sau khi migrate có thể
+/// chứa CẢ old flat fields VÀ new nested device entries cùng dưới
+/// `/status/{uid}/`:
+/// ```
+/// /status/{uid}/ = {
+///   state: "online", lastChangedAt: T1, lastHeartbeatAt: T1,  ← OLD flat
+///   fingerprint_abc: {state:"online", ...}                     ← NEW nested
+/// }
+/// ```
+/// Parser tách:
+/// - Flat fields (state/lastChangedAt/lastHeartbeatAt ở top-level) → wrap
+///   thành device "__legacy__"
+/// - Nested objects (key khác 3 reserved keys + value object có `state`)
+///   → device entries thật
+///
+/// Aggregate qua TẤT CẢ → user online nếu BẤT KỲ entry online (legacy
+/// hoặc fingerprint mới).
 export function subscribeToAllPresence(
   onUpdate: (statuses: PresenceMap) => void,
 ): Unsubscribe {
@@ -238,12 +250,48 @@ export function subscribeToAllPresence(
     const map: PresenceMap = {};
     for (const [uid, val] of Object.entries(raw)) {
       if (val === null || typeof val !== "object") continue;
-      // Detect old shape: object có field `state` ở top-level → flat DevicePresence.
-      if (typeof (val as DevicePresence).state === "string") {
-        map[uid] = { devices: { __legacy__: val as DevicePresence } };
-      } else {
-        // New shape: {fingerprint: DevicePresence}
-        map[uid] = { devices: val as Record<string, DevicePresence> };
+      const obj = val as Record<string, unknown>;
+      const devices: Record<string, DevicePresence> = {};
+
+      // 1. Detect flat legacy fields ở top-level.
+      if (
+        typeof obj.state === "string" &&
+        (typeof obj.lastHeartbeatAt === "number" ||
+          typeof obj.lastChangedAt === "number")
+      ) {
+        devices.__legacy__ = {
+          state: obj.state as "online" | "offline",
+          lastChangedAt: (obj.lastChangedAt as number) ?? 0,
+          lastHeartbeatAt: (obj.lastHeartbeatAt as number) ?? 0,
+        };
+      }
+
+      // 2. Detect nested device entries — key khác 3 flat fields + value
+      // có shape DevicePresence.
+      for (const [key, child] of Object.entries(obj)) {
+        if (
+          key === "state" ||
+          key === "lastChangedAt" ||
+          key === "lastHeartbeatAt"
+        ) {
+          continue;
+        }
+        if (
+          child !== null &&
+          typeof child === "object" &&
+          typeof (child as Record<string, unknown>).state === "string"
+        ) {
+          const c = child as Record<string, unknown>;
+          devices[key] = {
+            state: c.state as "online" | "offline",
+            lastChangedAt: (c.lastChangedAt as number) ?? 0,
+            lastHeartbeatAt: (c.lastHeartbeatAt as number) ?? 0,
+          };
+        }
+      }
+
+      if (Object.keys(devices).length > 0) {
+        map[uid] = { devices };
       }
     }
     onUpdate(map);
