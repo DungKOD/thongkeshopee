@@ -49,18 +49,27 @@ void setPersistence(auth, browserLocalPersistence);
 
 /** Lấy ID token của user hiện tại. Throw nếu chưa login — caller nên guard
  *  `auth.currentUser` trước khi gọi hoặc catch error. `forceRefresh=true`
- *  để bypass cache 1h (rare — dùng khi claim admin vừa toggle). */
+ *  để bypass cache 1h (rare — dùng khi claim admin vừa toggle).
+ *
+ *  **Logging policy**: chỉ log khi forceRefresh=true. Lý do:
+ *  - SDK cache 1h → 99% calls return từ memory ~1ms, KHÔNG hit network
+ *  - Net_log mục đích show network activity → cached calls = noise (user
+ *    thấy 3 getIdToken cùng giây tưởng bug, thực ra 0 request mạng)
+ *  - Force refresh thực sự hit network (POST securetoken.googleapis.com)
+ *    → log để observability + cost tracking
+ */
 export async function getAuthToken(forceRefresh = false): Promise<string> {
   const current = auth.currentUser;
   if (!current) throw new Error("Chưa đăng nhập");
-  // Log qua net_log để user xem được trong tab Requests. Firebase SDK
-  // cache token 1h, nên hầu hết call không hit network — `cached=true`
-  // hint sẽ show trong meta (hint only, không authoritative).
+  if (!forceRefresh) {
+    // Cache hit path — không log (instant, không hit network).
+    return current.getIdToken(false);
+  }
   return timed(
     "firebase_token",
-    forceRefresh ? "getIdToken(force)" : "getIdToken()",
-    () => current.getIdToken(forceRefresh),
-    { forceRefresh: forceRefresh ? "1" : "0" },
+    "getIdToken(force)",
+    () => current.getIdToken(true),
+    { forceRefresh: "1" },
   );
 }
 
