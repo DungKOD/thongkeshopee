@@ -41,12 +41,12 @@ pub struct SyncV9State {
 #[tauri::command]
 pub fn sync_v9_get_state(db: State<'_, DbState>) -> CmdResult<SyncV9State> {
     let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let m = manifest::read_state(&conn).map_err(|e| CmdError::msg(e.to_string()))?;
+    let m = manifest::read_state(&conn).map_err(|e| CmdError::msg(format!("{e:#}")))?;
 
     let mut pending_tables = Vec::new();
     for desc in descriptors::SYNC_TABLES {
         let cursor = push::read_cursor(&conn, desc.name)
-            .map_err(|e| CmdError::msg(e.to_string()))?;
+            .map_err(|e| CmdError::msg(format!("{e:#}")))?;
         // Check có row với cursor > last_uploaded không. Cheap SELECT.
         let has_more: i64 = match desc.cursor_kind {
             descriptors::CursorKind::RowId => conn.query_row(
@@ -82,7 +82,7 @@ pub fn sync_v9_get_state(db: State<'_, DbState>) -> CmdResult<SyncV9State> {
     }
 
     let pending_log_count =
-        event_log::count_pending(&conn).map_err(|e| CmdError::msg(e.to_string()))?;
+        event_log::count_pending(&conn).map_err(|e| CmdError::msg(format!("{e:#}")))?;
 
     Ok(SyncV9State {
         fresh_install_pending: m.fresh_install_pending,
@@ -126,13 +126,13 @@ pub async fn sync_v9_push_all(
     // 1. Plan bundle + capture + compress (lock held for DB read only).
     let (bundle_opt, fingerprint, clock_ms) = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-        if bootstrap::is_bootstrap_pending(&conn).map_err(|e| CmdError::msg(e.to_string()))? {
+        if bootstrap::is_bootstrap_pending(&conn).map_err(|e| CmdError::msg(format!("{e:#}")))? {
             return Ok(PushReport::default());
         }
         let clock = hlc::next_hlc_ms(&conn)?;
         let fp = machine_fingerprint_stable();
         let bundle = push::plan_push_bundle_default(&conn, clock)
-            .map_err(|e| CmdError::msg(e.to_string()))?;
+            .map_err(|e| CmdError::msg(format!("{e:#}")))?;
         (bundle, fp, clock)
     };
 
@@ -180,7 +180,7 @@ pub async fn sync_v9_push_all(
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         for range in &bundle.table_ranges {
             push::mark_uploaded(&conn, &range.table, &range.cursor_hi, &range.content_hash)
-                .map_err(|e| CmdError::msg(e.to_string()))?;
+                .map_err(|e| CmdError::msg(format!("{e:#}")))?;
             new_entries.push(ManifestDeltaEntry {
                 table: range.table.clone(),
                 // All entries share cùng r2_key — pull side dedup theo key.
@@ -242,7 +242,7 @@ async fn cas_append_manifest_retry(
             Ok(new_etag) => {
                 let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
                 manifest::set_etag(&conn, &new_etag)
-                    .map_err(|e| CmdError::msg(e.to_string()))?;
+                    .map_err(|e| CmdError::msg(format!("{e:#}")))?;
                 // Update cache với manifest mới + etag mới — push kế tiếp
                 // tiếp tục skip GET nếu trong TTL.
                 crate::sync_v9::manifest_cache::cache_put(cached_m, new_etag);
@@ -269,7 +269,7 @@ async fn cas_append_manifest_retry(
         match client::put_manifest(base_url, id_token, &manifest, fetched.etag.as_deref()).await {
             Ok(new_etag) => {
                 let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-                manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(e.to_string()))?;
+                manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(format!("{e:#}")))?;
                 // Update cache cho push kế tiếp.
                 crate::sync_v9::manifest_cache::cache_put(manifest, new_etag);
                 return Ok(retries);
@@ -487,7 +487,7 @@ pub async fn sync_v9_pull_all(
     // - Stale schema DB + new snapshot → replace local với remote state
     let restore_snapshot = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-        let state = manifest::read_state(&conn).map_err(|e| CmdError::msg(e.to_string()))?;
+        let state = manifest::read_state(&conn).map_err(|e| CmdError::msg(format!("{e:#}")))?;
         manifest::needs_snapshot_restore(&manifest, &state).cloned()
     };
 
@@ -515,16 +515,16 @@ pub async fn sync_v9_pull_all(
     // 3. Plan pending deltas (dùng local state).
     let pending = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-        pull::plan_pull(&conn, &manifest).map_err(|e| CmdError::msg(e.to_string()))?
+        pull::plan_pull(&conn, &manifest).map_err(|e| CmdError::msg(format!("{e:#}")))?
     };
 
     if pending.is_empty() {
         // Advance clock kể cả khi empty để UI state đúng.
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         manifest::advance_pulled_clock(&conn, manifest.updated_at_ms)
-            .map_err(|e| CmdError::msg(e.to_string()))?;
+            .map_err(|e| CmdError::msg(format!("{e:#}")))?;
         if let Some(etag) = &fetched.etag {
-            manifest::set_etag(&conn, etag).map_err(|e| CmdError::msg(e.to_string()))?;
+            manifest::set_etag(&conn, etag).map_err(|e| CmdError::msg(format!("{e:#}")))?;
         }
         return Ok(PullReport::default());
     }
@@ -563,12 +563,12 @@ pub async fn sync_v9_pull_all(
         let stats = {
             let mut conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
             let stats = pull::apply_events(&mut conn, &events)
-                .map_err(|e| CmdError::msg(e.to_string()))?;
+                .map_err(|e| CmdError::msg(format!("{e:#}")))?;
 
             // Advance cursor cho MỖI table trong bundle.
             for entry in entries {
                 pull::advance_pulled_cursor(&conn, &entry.table, &entry.cursor_hi)
-                    .map_err(|e| CmdError::msg(e.to_string()))?;
+                    .map_err(|e| CmdError::msg(format!("{e:#}")))?;
             }
             hlc::absorb_remote_clock(&conn, max_clock)?;
             stats
@@ -586,9 +586,9 @@ pub async fn sync_v9_pull_all(
     {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         manifest::advance_pulled_clock(&conn, manifest.updated_at_ms)
-            .map_err(|e| CmdError::msg(e.to_string()))?;
+            .map_err(|e| CmdError::msg(format!("{e:#}")))?;
         if let Some(etag) = &fetched.etag {
-            manifest::set_etag(&conn, etag).map_err(|e| CmdError::msg(e.to_string()))?;
+            manifest::set_etag(&conn, etag).map_err(|e| CmdError::msg(format!("{e:#}")))?;
         }
     }
 
@@ -754,7 +754,7 @@ async fn cas_put_full_manifest_retry(
         {
             Ok(new_etag) => {
                 let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-                manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(e.to_string()))?;
+                manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(format!("{e:#}")))?;
                 // Compaction = full replace → cache với manifest mới + etag mới.
                 crate::sync_v9::manifest_cache::cache_put(new_manifest.clone(), new_etag);
                 return Ok(retries);
@@ -818,7 +818,7 @@ pub async fn sync_v9_log_flush(
 ) -> CmdResult<u32> {
     let events = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-        event_log::fetch_pending(&conn, 500).map_err(|e| CmdError::msg(e.to_string()))?
+        event_log::fetch_pending(&conn, 500).map_err(|e| CmdError::msg(format!("{e:#}")))?
     };
     if events.is_empty() {
         return Ok(0);
@@ -854,7 +854,7 @@ pub async fn sync_v9_log_flush(
     let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let now = chrono::Utc::now().to_rfc3339();
     event_log::mark_uploaded(&conn, &uploaded_ids, &now)
-        .map_err(|e| CmdError::msg(e.to_string()))?;
+        .map_err(|e| CmdError::msg(format!("{e:#}")))?;
     Ok(uploaded_ids.len() as u32)
 }
 
@@ -873,7 +873,7 @@ pub fn sync_v9_log_list_local(
 ) -> CmdResult<Vec<AdminSyncLogEvent>> {
     let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let events = event_log::fetch_recent(&conn, limit, kind_filter.as_deref())
-        .map_err(|e| CmdError::msg(e.to_string()))?;
+        .map_err(|e| CmdError::msg(format!("{e:#}")))?;
     Ok(events.into_iter().map(local_event_to_dto).collect())
 }
 
