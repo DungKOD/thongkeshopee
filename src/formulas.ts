@@ -285,7 +285,8 @@ export function aggregateProductRows(
 // ADS ANALYTICS — metrics actionable cho quyết định chạy ads
 // =========================================================
 
-/// Data point cho trend chart: 1 ngày = 1 point.
+/// Data point cho trend chart: 1 ngày = 1 point (granularity day) hoặc
+/// 1 tuần / 1 tháng (sau aggregateTrend).
 /// profit, spend, netCommission, roi chạy cùng X-axis (date).
 export type DailyTrendPoint = {
   date: string;
@@ -298,6 +299,10 @@ export type DailyTrendPoint = {
   roi: number | null;
   orders: number;
   shopeeClicks: number;
+  /// Số ngày data thực tế trong bucket (1 cho granularity=day, 1-7 cho week,
+  /// 1-31 cho month). UI tooltip hiển thị cho user verify "tháng này gồm
+  /// bao nhiêu ngày data" (filter cắt giữa tháng / Feb 28 ngày / etc.).
+  dayCount: number;
 };
 
 /// Trend theo ngày cho chart. Days ASC by date để biểu đồ vẽ từ trái qua phải.
@@ -325,6 +330,7 @@ export function computeDailyTrend(
       roi,
       orders: t.ordersCount,
       shopeeClicks: sumFiltered(t.shopeeClicksByReferrer, clickSources),
+      dayCount: 1,
     });
     // Suppress unused var warning for `y`.
     void y;
@@ -585,6 +591,10 @@ export function aggregateTrend(
       roi,
       orders,
       shopeeClicks,
+      // Số ngày THỰC TẾ có data trong bucket — không phải số ngày calendar.
+      // Vd Feb 2026 có 28 ngày calendar, nhưng nếu user chỉ có 20 ngày data
+      // trong tháng đó thì dayCount = 20.
+      dayCount: group.length,
     });
   }
   result.sort((a, b) => a.date.localeCompare(b.date));
@@ -600,6 +610,9 @@ export type CumulativePoint = {
   cumulativeProfit: number;
   cumulativeSpend: number;
   cumulativeRevenue: number;
+  /// Carry từ DailyTrendPoint.dayCount — UI tooltip dùng cho biết bucket
+  /// gồm bao nhiêu ngày data (week/month aggregation).
+  dayCount: number;
 };
 
 export function computeCumulativeTrend(
@@ -619,6 +632,7 @@ export function computeCumulativeTrend(
       cumulativeProfit: cp,
       cumulativeSpend: cs,
       cumulativeRevenue: cr,
+      dayCount: p.dayCount,
     });
   }
   return out;

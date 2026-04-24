@@ -398,11 +398,17 @@ interface TrendTooltipProps {
 
 function CumulativeTooltip({ active, payload }: TrendTooltipProps) {
   if (!active || !payload || payload.length === 0) return null;
-  const point = payload[0].payload as CumulativePoint;
+  const point = payload[0].payload as CumulativePoint & { dayCount?: number };
+  const isAggregated = (point.dayCount ?? 1) > 1;
   return (
     <div className="rounded-lg border border-surface-8 bg-surface-0/95 px-3 py-2 shadow-elev-8 backdrop-blur">
       <div className="mb-1 text-xs font-semibold text-white/90">
         {fmtDate(point.date)}
+        {isAggregated && (
+          <span className="ml-1.5 rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-normal text-white/70">
+            {point.dayCount} ngày
+          </span>
+        )}
       </div>
       <dl className="space-y-0.5 text-xs">
         <TooltipRow
@@ -429,6 +435,8 @@ function CumulativeTooltip({ active, payload }: TrendTooltipProps) {
 }
 
 /// Custom tooltip: header = ngày đầy đủ (DD/MM/YYYY), body = từng metric.
+/// dayCount > 1 → bucket tuần/tháng → hiển thị range "X ngày" để user biết
+/// gom bao nhiêu ngày data thực sự (vd Feb 28 ngày, hoặc filter cắt giữa tháng).
 function TrendTooltip({
   active,
   payload,
@@ -437,10 +445,16 @@ function TrendTooltip({
 }: TrendTooltipProps & { mode: ChartMode }) {
   if (!active || !payload || payload.length === 0) return null;
   const point = payload[0].payload;
+  const isAggregated = (point.dayCount ?? 1) > 1;
   return (
     <div className="rounded-lg border border-surface-8 bg-surface-0/95 px-3 py-2 shadow-elev-8 backdrop-blur">
       <div className="mb-1 text-xs font-semibold text-white/90">
         {fmtDate(point.date)}
+        {isAggregated && (
+          <span className="ml-1.5 rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-normal text-white/70">
+            {point.dayCount} ngày
+          </span>
+        )}
         {label ? <span className="ml-1 text-white/40">({label})</span> : null}
       </div>
       {mode === "finance" ? (
