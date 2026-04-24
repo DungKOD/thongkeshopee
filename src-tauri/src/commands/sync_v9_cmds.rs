@@ -628,13 +628,27 @@ pub async fn sync_v9_compact_if_needed(
     base_url: String,
     id_token: String,
 ) -> CmdResult<CompactionReport> {
-    // 1. Fetch manifest.
-    let fetched = client::get_manifest(&base_url, &id_token)
-        .await
-        .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
-    let manifest = match fetched.manifest {
-        Some(m) => m,
-        None => return Ok(CompactionReport::default()), // nothing to compact
+    // 1. Ưu tiên đọc manifest từ cache — sync_v9_push_all vừa chạy trước
+    //    compact_if_needed (FE sequence) sẽ cache_put manifest mới nhất.
+    //    Tiết kiệm 1 R2 GET/sync cycle khi compact chưa đủ threshold (case
+    //    chiếm đa số — threshold ~100 deltas, mutation thông thường <20/ngày).
+    //    Cache TTL 60s → stale detection vẫn hoạt động nếu flow chậm.
+    let (manifest, cached_etag) = match crate::sync_v9::manifest_cache::cache_get() {
+        Some((m, e)) => (m, Some(e)),
+        None => {
+            let fetched = client::get_manifest(&base_url, &id_token)
+                .await
+                .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
+            match fetched.manifest {
+                Some(m) => {
+                    if let Some(etag) = fetched.etag.clone() {
+                        crate::sync_v9::manifest_cache::cache_put(m.clone(), etag);
+                    }
+                    (m, fetched.etag)
+                }
+                None => return Ok(CompactionReport::default()), // nothing to compact
+            }
+        }
     };
 
     if !compaction::should_compact(&manifest) {
@@ -668,7 +682,7 @@ pub async fn sync_v9_compact_if_needed(
 
     // 4. CAS put manifest — retry max 3 (theo pattern push_all).
     let cas_retries =
-        cas_put_full_manifest_retry(&db, &base_url, &id_token, &new_manifest, fetched.etag)
+        cas_put_full_manifest_retry(&db, &base_url, &id_token, &new_manifest, cached_etag)
             .await?;
 
     // 5. Log compaction_complete (best-effort).

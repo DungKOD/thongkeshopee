@@ -6,7 +6,12 @@ import {
 } from "../lib/sync";
 import { useAdminView } from "../contexts/AdminViewContext";
 import { useAllPresence } from "../hooks/usePresence";
-import { isOnline, lastSeenAt, type Presence } from "../lib/presence";
+import {
+  isUserOnline,
+  onlineDeviceCount,
+  userLastSeenAt,
+  type UserPresence,
+} from "../lib/presence";
 import { fmtTimeAgo } from "../formulas";
 import { ScrollToTopButton } from "./ScrollToTopButton";
 import { SyncLogViewerDialog } from "./SyncLogViewerDialog";
@@ -268,7 +273,7 @@ function Th({ label, active, desc, onClick }: ThProps) {
 
 interface UserRowProps {
   user: UserListEntry;
-  presence: Presence | undefined;
+  presence: UserPresence | undefined;
   onClose: () => void;
   onOpenSyncLog: () => void;
 }
@@ -394,18 +399,18 @@ function UserRow({ user, presence, onClose, onOpenSyncLog }: UserRowProps) {
 }
 
 interface PresenceCellProps {
-  presence: Presence | undefined;
+  presence: UserPresence | undefined;
 }
 
 function PresenceCell({ presence }: PresenceCellProps) {
-  if (!presence) {
+  if (!presence || Object.keys(presence.devices).length === 0) {
     return <span className="text-white/40">—</span>;
   }
-  // Derived status dựa trên heartbeat age, KHÔNG trust field `state` thẳng —
-  // onDisconnect có thể không fire trên Tauri → state stuck ở "online" dù
-  // user đã close app. Xem src/lib/presence.ts.
-  const online = isOnline(presence);
-  const lastSeen = lastSeenAt(presence);
+  // Aggregate qua mọi device — user online nếu ÍT NHẤT 1 device online
+  // (heartbeat age < 180s + state online + server clock correct).
+  const online = isUserOnline(presence);
+  const lastSeen = userLastSeenAt(presence);
+  const devCount = onlineDeviceCount(presence);
   return (
     <span className="inline-flex items-center gap-1.5">
       <span
@@ -414,7 +419,11 @@ function PresenceCell({ presence }: PresenceCellProps) {
         }`}
       />
       <span className={online ? "text-green-300" : "text-white/60"}>
-        {online ? "Đang online" : fmtTimeAgo(lastSeen)}
+        {online
+          ? devCount > 1
+            ? `Online (${devCount} thiết bị)`
+            : "Đang online"
+          : fmtTimeAgo(lastSeen)}
       </span>
     </span>
   );

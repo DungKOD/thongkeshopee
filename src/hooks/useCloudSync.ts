@@ -191,6 +191,16 @@ export function useCloudSync({
     onRemoteAppliedRef.current = onRemoteApplied;
   }, [onRemoteApplied]);
 
+  /// Mirror pausedByForm vào ref để callbacks trong subscribeRemotePushes
+  /// effect đọc giá trị mới nhất mà KHÔNG cần re-subscribe RTDB listener.
+  /// Mỗi lần form open/close sẽ không detach + attach lại listener (gây
+  /// initial snapshot fire lại + skip event ngắn ~100ms). Dep array của
+  /// RTDB effect giờ chỉ còn enabled/authUid/fingerprintReady.
+  const pausedByFormRef = useRef(pausedByForm);
+  useEffect(() => {
+    pausedByFormRef.current = pausedByForm;
+  }, [pausedByForm]);
+
   const clearDebounce = () => {
     if (debounceRef.current !== null) {
       clearTimeout(debounceRef.current);
@@ -326,11 +336,16 @@ export function useCloudSync({
       // - OR queue > 50 events pending — avoid dồn quá nhiều trong 1 ngày
       //   nếu user active cao (UX: user mở log dialog không thấy số lớn)
       // Safety: events persist local, beforeunload flush backup khi close.
+      //
+      // Guard pendingLogCount > 0: tránh Tauri IPC round-trip ở Rust khi
+      // queue rỗng (ví dụ đổi ngày nhưng hôm nay chưa có event nào).
+      // Rust return 0 nhanh, nhưng IPC vẫn tốn ~1-2ms/call × N sync cycles.
       const today = new Date().toISOString().slice(0, 10);
       const LOG_FLUSH_QUEUE_THRESHOLD = 50;
       const shouldFlushLog =
-        lastLogFlushDateRef.current !== today ||
-        state.pendingLogCount >= LOG_FLUSH_QUEUE_THRESHOLD;
+        state.pendingLogCount > 0 &&
+        (lastLogFlushDateRef.current !== today ||
+          state.pendingLogCount >= LOG_FLUSH_QUEUE_THRESHOLD);
       if (shouldFlushLog) {
         lastLogFlushDateRef.current = today;
         void syncV9LogFlush(idToken).catch((e) => {
@@ -637,6 +652,10 @@ export function useCloudSync({
     const wasPaused = prevPausedRef.current;
     prevPausedRef.current = pausedByForm;
     if (wasPaused && !pausedByForm) {
+      // Reset idle activity marker — tránh idle-flush effect (interval 5s)
+      // fire ngay lập tức sau form đóng nếu user đã idle > 30s trong lúc edit
+      // form. Form resume = activity signal, đếm idle lại từ đây.
+      lastActivityRef.current = Date.now();
       // Resume — flush pending + pull remote changes.
       if (statusRef.current === "dirty" || statusRef.current === "idle") {
         void doSync();
@@ -653,6 +672,11 @@ export function useCloudSync({
     clearDebounce();
     clearRetry();
     retryAttemptRef.current = 0;
+    // Ép pull: mutation path (scheduleDebounce/flushNow) có thể đã set
+    // needPullRef=false và doSync đang inflight. Set true trước khi gọi
+    // để inflight doSync thấy flag đúng ở check line 251, hoặc next call
+    // (nếu re-entry guard bail) vẫn pull. Intent "Đồng bộ ngay" = fetch remote.
+    needPullRef.current = true;
     await doSync();
   }, [doSync]);
 
@@ -697,13 +721,13 @@ export function useCloudSync({
         // resume. Syncing → doSync re-entry guard tự skip.
         setHasRemoteChangePending(true);
         if (statusRef.current === "offline") return;
-        if (pausedByForm) return;
+        if (pausedByFormRef.current) return;
         void doSync();
       },
     );
     return unsub;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, authUid, pausedByForm, fingerprintReady]);
+  }, [enabled, authUid, fingerprintReady]);
 
   return {
     status,
