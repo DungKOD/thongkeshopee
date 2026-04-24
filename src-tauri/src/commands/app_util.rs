@@ -85,6 +85,103 @@ pub fn get_app_data_paths(
 }
 
 // =============================================================
+// Persistent net log — append request entry vào file daily
+// =============================================================
+
+/// Folder chứa daily net log files. `{app_data}/net_log/`.
+const NET_LOG_SUBDIR: &str = "net_log";
+
+/// Payload từ FE — 1 entry cho 1 request log.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetLogPayload {
+    pub ts_start: String,        // ISO timestamp
+    pub duration_ms: u64,
+    pub kind: String,            // "tauri_sync_push" | "firebase_token" | etc.
+    pub label: String,           // "sync_v9_push_all" | etc.
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub bytes: Option<u64>,
+    #[serde(default)]
+    pub meta: Option<serde_json::Value>,
+}
+
+/// Resolve path file log của ngày (YYYY-MM-DD). Tạo folder nếu chưa có.
+fn resolve_net_log_path(app: &AppHandle, date: &str) -> anyhow::Result<std::path::PathBuf> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!("app_data_dir: {e}"))?;
+    let dir = base.join(NET_LOG_SUBDIR);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{date}.log")))
+}
+
+/// Format 1 line cho file. Plain text TSV-like, dễ grep/đọc bằng tay.
+/// Format: `[ISO_TS] [KIND] LABEL dur=Nms ok=B [bytes=X] [error="..."] [meta={...}]`
+fn format_log_line(p: &NetLogPayload) -> String {
+    let mut line = format!(
+        "[{}] [{}] {} dur={}ms ok={}",
+        p.ts_start, p.kind, p.label, p.duration_ms, p.ok
+    );
+    if let Some(b) = p.bytes {
+        line.push_str(&format!(" bytes={b}"));
+    }
+    if let Some(err) = &p.error {
+        // Escape newlines + quote để 1 entry = 1 line.
+        let safe = err.replace('\n', "\\n").replace('"', "\\\"");
+        line.push_str(&format!(" error=\"{safe}\""));
+    }
+    if let Some(meta) = &p.meta {
+        if !meta.is_null() {
+            let s = serde_json::to_string(meta).unwrap_or_default();
+            line.push_str(&format!(" meta={s}"));
+        }
+    }
+    line.push('\n');
+    line
+}
+
+/// Append 1 request log entry vào file daily. Fire-and-forget — FE không
+/// chờ kết quả, lỗi I/O chỉ log console (không break user flow).
+///
+/// File: `{app_data}/net_log/YYYY-MM-DD.log`. Per-day rotation tự động —
+/// mỗi date mới ghi vào file riêng. User có thể đọc/grep/phân tích sau.
+#[tauri::command]
+pub fn app_log_request(app: AppHandle, payload: NetLogPayload) -> CmdResult<()> {
+    use std::io::Write;
+    // Date từ ts_start (YYYY-MM-DD prefix). Fallback "unknown" nếu format sai.
+    let date = payload.ts_start.get(..10).unwrap_or("unknown");
+    let path = resolve_net_log_path(&app, date)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    let line = format_log_line(&payload);
+    // OpenOptions append mode — concurrent writes safe ở OS level cho 1 line.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| CmdError::msg(format!("open log file {}: {e}", path.display())))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| CmdError::msg(format!("write log: {e}")))?;
+    Ok(())
+}
+
+/// Resolve path folder net log — UI hiển thị cho user mở Explorer.
+#[tauri::command]
+pub fn get_net_log_dir(app: AppHandle) -> CmdResult<String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| CmdError::msg(format!("app_data_dir: {e}")))?;
+    let dir = base.join(NET_LOG_SUBDIR);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CmdError::msg(format!("create dir: {e}")))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+// =============================================================
 // App restart
 // =============================================================
 

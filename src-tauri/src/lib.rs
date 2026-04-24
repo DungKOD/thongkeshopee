@@ -89,6 +89,8 @@ pub fn run() {
             commands::app_util::switch_db_to_user,
             commands::app_util::admin_list_users,
             commands::app_util::get_app_data_paths,
+            commands::app_util::app_log_request,
+            commands::app_util::get_net_log_dir,
             commands::admin_view::admin_view_user_db,
             commands::admin_view::admin_exit_view_user_db,
             commands::admin_view::admin_view_state_get,

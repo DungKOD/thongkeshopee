@@ -1,6 +1,11 @@
 /// In-memory ring buffer log mọi request mà FE phát ra (Firebase Auth,
-/// Tauri invoke hit network, Apps Script, v.v.). Non-persistent — xoá khi
-/// reload app. Dùng debug network activity + user hiển thị trong SyncLog.
+/// Tauri invoke hit network, Apps Script, v.v.). Non-persistent in-memory,
+/// xoá khi reload app. Dùng debug network activity + UI Sync Log dialog.
+///
+/// **Persistent log** parallel: mỗi entry cũng được fire-and-forget gửi
+/// xuống Rust qua `app_log_request` Tauri command → append vào file daily
+/// `{app_data}/net_log/YYYY-MM-DD.log`. User mở folder qua Settings để
+/// xem/grep/phân tích sau (không bị xoá khi reload app).
 ///
 /// Event từ Rust sync layer (push_upload, pull_fetch) KHÔNG log ở đây vì
 /// đã persist trong `sync_event_log` DB. net_log bổ sung các call không đi
@@ -62,7 +67,33 @@ export function logRequest(
   entries.unshift(full); // newest first
   if (entries.length > MAX_ENTRIES) entries.length = MAX_ENTRIES;
   notify();
+  // Fire-and-forget persist xuống file. Không await — không slow user flow.
+  // Lỗi I/O chỉ console.warn, không break.
+  void persistToFile(full);
   return full;
+}
+
+/// Lazy-load Tauri invoke để tránh circular import + cho phép unit test
+/// trong môi trường non-Tauri.
+async function persistToFile(entry: NetLogEntry): Promise<void> {
+  try {
+    const { invoke } = await import("./tauri");
+    await invoke("app_log_request", {
+      payload: {
+        tsStart: entry.tsStart,
+        durationMs: entry.durationMs,
+        kind: entry.kind,
+        label: entry.label,
+        ok: entry.ok,
+        error: entry.error ?? null,
+        bytes: entry.bytes ?? null,
+        meta: entry.meta ?? null,
+      },
+    });
+  } catch (e) {
+    // Chỉ console — không break UX nếu file write fail (disk full / perm).
+    console.warn("[net_log] persist failed:", e);
+  }
 }
 
 export function getEntries(): NetLogEntry[] {

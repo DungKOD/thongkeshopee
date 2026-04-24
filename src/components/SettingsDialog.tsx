@@ -48,13 +48,20 @@ export function SettingsDialog({
   // Fetch app data paths khi dialog mở. Không fetch ở mount (lazy).
   const [paths, setPaths] = useState<AppDataPaths | null>(null);
   const [pathsError, setPathsError] = useState<string | null>(null);
+  const [netLogDir, setNetLogDir] = useState<string | null>(null);
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     (async () => {
       try {
-        const p = await invoke<AppDataPaths>("get_app_data_paths");
-        if (!cancelled) setPaths(p);
+        const [p, dir] = await Promise.all([
+          invoke<AppDataPaths>("get_app_data_paths"),
+          invoke<string>("get_net_log_dir"),
+        ]);
+        if (!cancelled) {
+          setPaths(p);
+          setNetLogDir(dir);
+        }
       } catch (e) {
         if (!cancelled) setPathsError((e as Error).message ?? String(e));
       }
@@ -250,10 +257,22 @@ export function SettingsDialog({
                   path={paths.activeImportsDir}
                   revealAsDir
                 />
+                {netLogDir && (
+                  <PathRow
+                    label="Net log (request history daily)"
+                    path={netLogDir}
+                    revealAsDir
+                  />
+                )}
               </div>
             ) : !pathsError ? (
               <div className="text-xs text-white/40">Đang tải...</div>
             ) : null}
+            <p className="mt-2 text-[11px] text-white/40">
+              Net log: 1 file/ngày (<code>YYYY-MM-DD.log</code>). Lưu mọi
+              request FE phát ra (R2, Firebase, admin) — phân tích cost +
+              optimize sau. Plain text, dễ grep.
+            </p>
           </section>
 
           {/* App info — version + build metadata. Cuối Settings làm footer info. */}
