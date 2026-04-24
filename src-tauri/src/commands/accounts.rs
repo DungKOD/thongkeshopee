@@ -81,18 +81,23 @@ pub fn create_shopee_account(
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
+    // v13: id = content_id(name). Cross-machine stable — không còn autoincrement
+    // collision khi 2 máy tạo cùng account fresh.
+    let id = crate::sync_v9::content_id::shopee_account_id(&trimmed);
     conn.execute(
-        "INSERT INTO shopee_accounts (name, color, created_at) VALUES (?1, ?2, ?3)",
-        params![trimmed, color, now],
+        "INSERT INTO shopee_accounts (id, name, color, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![id, trimmed, color, now],
     )
     .map_err(|e| {
-        if e.to_string().contains("UNIQUE constraint failed") {
+        if e.to_string().contains("UNIQUE constraint failed")
+            || e.to_string().contains("PRIMARY KEY")
+        {
             CmdError::msg(format!("Account '{trimmed}' đã tồn tại"))
         } else {
             CmdError::from(e)
         }
     })?;
-    Ok(conn.last_insert_rowid())
+    Ok(id)
 }
 
 /// Rename account. Không đụng FK data. Fail nếu name trùng với account khác.
@@ -359,12 +364,6 @@ pub fn delete_shopee_account(
          )",
         [],
     )?;
-    // Explicit bump sync_state — đảm bảo UI báo dirty + auto upload.
-    tx.execute(
-        "UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1",
-        [],
-    )?;
-
     tx.commit()?;
     Ok(())
 }

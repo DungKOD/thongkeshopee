@@ -1,7 +1,15 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { ProfitFees, Settings } from "../hooks/useSettings";
 import { ImportHistorySection } from "./ImportHistorySection";
+import { invoke } from "../lib/tauri";
+
+interface AppDataPaths {
+  appDataDir: string;
+  activeDbPath: string;
+  activeImportsDir: string;
+}
 
 interface SettingsDialogProps {
   isOpen: boolean;
@@ -36,6 +44,25 @@ export function SettingsDialog({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [isOpen, onClose]);
+
+  // Fetch app data paths khi dialog mở. Không fetch ở mount (lazy).
+  const [paths, setPaths] = useState<AppDataPaths | null>(null);
+  const [pathsError, setPathsError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await invoke<AppDataPaths>("get_app_data_paths");
+        if (!cancelled) setPaths(p);
+      } catch (e) {
+        if (!cancelled) setPathsError((e as Error).message ?? String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -191,6 +218,44 @@ export function SettingsDialog({
             onReverted={onImportReverted}
           />
 
+          {/* Đường dẫn data app — hữu ích cho support/debug/backup thủ công. */}
+          <section>
+            <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+              <span className="material-symbols-rounded text-base">folder</span>
+              Đường dẫn data app
+            </h3>
+            <p className="mb-3 text-xs text-white/50">
+              Data (DB + CSV imports) lưu ở local machine. Click{" "}
+              <b>Copy</b> để paste đường dẫn hoặc <b>Mở</b> để xem thư mục.
+            </p>
+            {pathsError && (
+              <div className="mb-2 rounded-lg border border-red-500/40 bg-red-900/20 p-2 text-xs text-red-200">
+                Lỗi: {pathsError}
+              </div>
+            )}
+            {paths ? (
+              <div className="space-y-2">
+                <PathRow
+                  label="Thư mục app data"
+                  path={paths.appDataDir}
+                  revealAsDir
+                />
+                <PathRow
+                  label="File database"
+                  path={paths.activeDbPath}
+                  revealAsDir={false}
+                />
+                <PathRow
+                  label="Thư mục CSV imports"
+                  path={paths.activeImportsDir}
+                  revealAsDir
+                />
+              </div>
+            ) : !pathsError ? (
+              <div className="text-xs text-white/40">Đang tải...</div>
+            ) : null}
+          </section>
+
           {/* App info — version + build metadata. Cuối Settings làm footer info. */}
           <section className="rounded-xl border border-surface-8 bg-surface-1 px-4 py-3">
             <div className="flex items-center justify-between text-xs text-white/60">
@@ -210,6 +275,90 @@ export function SettingsDialog({
       </div>
     </div>,
     document.body,
+  );
+}
+
+interface PathRowProps {
+  label: string;
+  path: string;
+  /// `true` = path là thư mục → `revealItemInDir(path)` mở Explorer vào
+  /// folder đó. `false` = path là file → reveal select file trong parent.
+  revealAsDir: boolean;
+}
+
+function PathRow({ label, path, revealAsDir }: PathRowProps) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(path);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Fallback — textarea trick cho old browsers/Tauri webview fallback.
+      const ta = document.createElement("textarea");
+      ta.value = path;
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      } catch {
+        // ignore
+      }
+      document.body.removeChild(ta);
+    }
+  };
+
+  const handleReveal = async () => {
+    try {
+      // revealItemInDir accept cả file lẫn folder. File → open parent +
+      // highlight. Folder → open folder.
+      await revealItemInDir(path);
+    } catch (e) {
+      console.error("[reveal] failed:", e);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-surface-8 bg-surface-6 px-3 py-2">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-xs text-white/55">{label}</span>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={handleCopy}
+            className={`btn-ripple flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors ${
+              copied
+                ? "bg-green-500/20 text-green-300"
+                : "bg-shopee-500/20 text-shopee-200 hover:bg-shopee-500/30"
+            }`}
+            title="Copy đường dẫn"
+          >
+            <span className="material-symbols-rounded text-sm">
+              {copied ? "check" : "content_copy"}
+            </span>
+            {copied ? "Đã copy" : "Copy"}
+          </button>
+          <button
+            type="button"
+            onClick={handleReveal}
+            className="btn-ripple flex items-center gap-1 rounded-md bg-surface-1 px-2 py-0.5 text-[11px] font-medium text-white/80 hover:bg-surface-4"
+            title={revealAsDir ? "Mở thư mục" : "Mở thư mục chứa file"}
+          >
+            <span className="material-symbols-rounded text-sm">folder_open</span>
+            Mở
+          </button>
+        </div>
+      </div>
+      <div
+        className="truncate font-mono text-xs text-white/80"
+        title={path}
+      >
+        {path}
+      </div>
+    </div>
   );
 }
 

@@ -8,14 +8,14 @@
 
 pub mod accounts;
 pub mod admin_view;
+pub mod app_util;
 pub mod batch;
 pub mod imports;
 pub mod manual;
 pub mod preview;
 pub mod query;
 pub mod screenshot;
-pub mod sync;
-pub mod sync_client;
+pub mod sync_v9_cmds;
 pub mod video;
 
 /// Wrapper lỗi cho Tauri command: serialize thành string để UI nhận được.

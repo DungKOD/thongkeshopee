@@ -13,7 +13,7 @@ use tauri::State;
 use crate::db::types::{ManualEntryInput, ManualRowKey};
 use crate::db::{tombstone_key_sub, DbState};
 
-use super::sync::next_hlc_rfc3339;
+use crate::sync_v9::hlc::next_hlc_rfc3339;
 use super::{CmdError, CmdResult};
 
 #[tauri::command]

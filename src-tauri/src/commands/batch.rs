@@ -16,7 +16,7 @@ use crate::db::types::BatchDeletePayload;
 use crate::db::{resolve_active_imports_dir, tombstone_key_sub, DbState};
 
 use super::query::{is_prefix, to_canonical, Canonical};
-use super::sync::next_hlc_rfc3339;
+use crate::sync_v9::hlc::next_hlc_rfc3339;
 use super::{CmdError, CmdResult};
 
 #[tauri::command]
@@ -114,14 +114,6 @@ pub fn batch_commit_deletes(
     for (id, _) in &orphan_files {
         tx.execute("DELETE FROM imported_files WHERE id = ?", params![id])?;
     }
-
-    // Explicit bump sync_state — FK CASCADE DELETE trên raw tables có thể
-    // không fire user triggers tùy SQLite config. Đảm bảo mọi thao tác xóa
-    // của `batch_commit_deletes` đều mark dirty để sync flow upload.
-    tx.execute(
-        "UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1",
-        [],
-    )?;
 
     tx.commit()?;
 
@@ -303,12 +295,6 @@ pub fn revert_import(
          SET reverted_at = ?, stored_path = NULL
          WHERE id = ?",
         params![now, file_id],
-    )?;
-
-    // 5. Bump sync_state → sync flow upload DB state mới (có reverted_at).
-    tx.execute(
-        "UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1",
-        [],
     )?;
 
     tx.commit()?;

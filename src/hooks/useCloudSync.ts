@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { auth, getAuthToken } from "../lib/firebase";
 import { invoke } from "../lib/tauri";
 import {
-  machineFingerprint,
-  syncMetadata,
-  syncPullMergePush,
-  syncUploadDb,
-  type SyncMetadataResult,
-} from "../lib/sync";
+  syncV9CompactIfNeeded,
+  syncV9GetState,
+  syncV9LogFlush,
+  syncV9PullAll,
+  syncV9PushAll,
+  type SyncV9State,
+} from "../lib/sync_v9";
+import { announceMyPush, subscribeRemotePushes } from "../lib/sync_notify";
 
 export type SyncStatus =
   | "checking"
@@ -16,7 +17,8 @@ export type SyncStatus =
   | "dirty"
   | "syncing"
   | "error"
-  | "offline";
+  | "offline"
+  | "bootstrap";
 
 /// Xóa localStorage keys mang dữ liệu user — gọi khi đổi owner (user B
 /// login trên máy vừa dùng user A). Không touch key của Firebase SDK /
@@ -40,18 +42,23 @@ function wipeUserLocalStorage(): void {
   }
 }
 
-export type SyncPhase = "downloading" | "merging" | "uploading" | null;
+/// Phase đang chạy trong 1 sync cycle. Dùng SplashScreen + SyncBadge render
+/// text phù hợp. FE tự track theo command đang gọi — v9 commands không emit
+/// event như v8, nên state chuyển chỉ quanh 2 tên "pulling" → "pushing".
+export type SyncPhase = "pulling" | "pushing" | null;
 
-interface SyncStateDto {
-  dirty: boolean;
-  /** Counter mutation — = 0 nghĩa là DB fresh (chưa edit gì từ install này).
-   *  Dùng detect reinstall-scenario để tránh upload DB rỗng đè remote. */
-  changeId: number;
-  lastUploadedChangeId: number;
-  last_synced_at_ms: number | null;
-  last_synced_remote_mtime_ms: number | null;
-  last_error: string | null;
-  ownerUid: string | null;
+/// Thống kê của sync cycle gần nhất — bytes + counts để UI hiển thị.
+export interface LastSyncStats {
+  /// Tổng bytes tải về từ R2 (zstd-compressed delta files).
+  downloadBytes: number;
+  /// Tổng bytes upload lên R2 (zstd-compressed delta files).
+  uploadBytes: number;
+  /// Số delta files đã pull + apply.
+  pulledDeltas: number;
+  /// Số delta files đã push.
+  pushedDeltas: number;
+  /// Số table skip upload do hash identical với lần trước (cost saved).
+  skippedIdentical: number;
 }
 
 interface UseCloudSyncResult {
@@ -59,10 +66,15 @@ interface UseCloudSyncResult {
   /// True từ lúc hook được mount đến khi startup check hoàn tất lần đầu.
   /// App.tsx dùng để chặn UI splash suốt startup kể cả khi status chuyển "syncing".
   isStartupPhase: boolean;
-  /// Phase hiện tại đang chạy trong backend (downloading/merging/uploading).
-  /// null khi không có sync đang chạy.
+  /// Phase hiện tại đang chạy trong backend (pulling / pushing).
   syncPhase: SyncPhase;
   lastSyncAt: Date | null;
+  /// Stats của sync cycle gần nhất (null = chưa sync lần nào).
+  lastSyncStats: LastSyncStats | null;
+  /// True = phát hiện máy khác vừa push (RTDB event chưa được apply). UI
+  /// dùng enable nút "Sync ngay" khi status=idle (không có thay đổi local
+  /// nhưng remote có). Reset false khi doSync() chạy xong (đã pull).
+  hasRemoteChangePending: boolean;
   error: string | null;
   forceSync: () => Promise<void>;
 }
@@ -70,8 +82,12 @@ interface UseCloudSyncResult {
 interface UseCloudSyncOptions {
   mutationVersion: number;
   enabled: boolean;
-  /// Gọi sau mỗi lần sync thành công (merge có thể đã thêm row từ remote
-  /// hoặc apply tombstones) để UI refetch data mới.
+  /// L1 form-dirty defer: user đang edit form (ManualEntryDialog) → hoãn
+  /// auto-sync (debounce/idle/cron tick) để pull không apply event cho row
+  /// đang edit → đè mất input. Force sync vẫn chạy khi user click.
+  /// Transition true→false sẽ trigger 1 sync catch-up ngay lập tức.
+  pausedByForm?: boolean;
+  /// Gọi sau mỗi lần pull đã apply deltas mới từ R2 (UI phải refetch).
   onRemoteApplied?: () => void | Promise<void>;
 }
 
@@ -79,10 +95,11 @@ interface UseCloudSyncOptions {
 /// tiếp theo (reset trong window) tăng ladder lên. Cap ở DEBOUNCE_MAX_MS.
 /// Kết quả: user edit liên tục → gộp thành 1 sync cuối thay vì N syncs.
 ///
-/// Tradeoff: user edit 1 lần xong thôi → debounce BASE (45s, giảm R2 ops).
-/// User edit 10 lần trong 1 phút → debounce extend dần lên MAX (120s), chỉ
-/// 1 upload cuối. Combined skip-identical hash (sync.rs) → mutation không
-/// đổi DB (revert + redo cùng state) KHÔNG tốn upload.
+/// v9 Q1 lock: auto-sync interval ≥ 5 phút. Nhưng adaptive debounce
+/// per-mutation vẫn giữ để tránh spam sync khi user edit liên tục — giá
+/// trị nhỏ hơn 5 phút vì đây là phản ứng với mutation cụ thể, không phải
+/// cron tick. Combined skip-identical hash (sync_v9/push.rs) → mutation
+/// không đổi content table KHÔNG tốn upload.
 const DEBOUNCE_BASE_MS = 45_000;
 const DEBOUNCE_MAX_MS = 120_000;
 const DEBOUNCE_STEP_MS = 15_000;
@@ -90,6 +107,17 @@ const IDLE_MS = 30_000;
 const IDLE_CHECK_MS = 5_000;
 // Exponential backoff: 30s, 60s, 120s, 300s (cap 5min).
 const RETRY_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000];
+/// Fallback auto-sync tick — **safety net** khi Firebase RTDB không kết nối
+/// được (mất mạng Firebase RTDB nhưng Cloudflare R2 OK, hoặc chưa cấu hình
+/// VITE_FIREBASE_DATABASE_URL). Realtime push notifications qua RTDB là
+/// primary path (xem `sync_notify.ts`).
+///
+/// Tăng từ 5 phút → 30 phút vì push notifications cover phần lớn case.
+/// 30 phút x 100 user x 24h = ~144k req/tháng (free tier R2 Class B
+/// không tốn trong 1M đầu). Zero request khi user chỉ có 1 máy online.
+const AUTO_SYNC_INTERVAL_MS = 30 * 60 * 1000;
+/// Force sync throttle cơ bản (spam click protection).
+const FORCE_SYNC_MIN_GAP_MS = 2_000;
 
 function backoffFor(attempt: number): number {
   const idx = Math.min(attempt, RETRY_BACKOFF_MS.length - 1);
@@ -108,18 +136,17 @@ function adaptiveDebounce(consecutive: number): number {
 
 const ACTIVITY_EVENTS = ["mousedown", "keydown", "wheel", "touchstart"] as const;
 
-/** Signal Rust trả khi CAS etag mismatch — keep in sync với `sync.rs` const. */
-const ETAG_CONFLICT_PREFIX = "ETAG_CONFLICT";
-
 export function useCloudSync({
   mutationVersion,
   enabled,
+  pausedByForm = false,
   onRemoteApplied,
 }: UseCloudSyncOptions): UseCloudSyncResult {
   const [status, setStatus] = useState<SyncStatus>(() =>
     typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "checking",
   );
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
+  const [lastSyncStats, setLastSyncStats] = useState<LastSyncStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isStartupPhase, setIsStartupPhase] = useState(true);
   const [syncPhase, setSyncPhase] = useState<SyncPhase>(null);
@@ -127,9 +154,22 @@ export function useCloudSync({
   const debounceRef = useRef<number | null>(null);
   const retryRef = useRef<number | null>(null);
   const idleCheckRef = useRef<number | null>(null);
+  const autoSyncTickRef = useRef<number | null>(null);
   const retryAttemptRef = useRef(0);
   const lastActivityRef = useRef(Date.now());
   const startupDoneRef = useRef(false);
+  /// Device fingerprint — lấy 1 lần sau mount qua Tauri cmd. Dùng cho RTDB
+  /// push notification (tránh echo về chính mình).
+  const myFingerprintRef = useRef<string | null>(null);
+  /// Flag "có thay đổi từ máy khác" — set true khi RTDB subscriber phát hiện
+  /// event từ fingerprint khác. Clear false khi doSync start (đã consume tín
+  /// hiệu). UI dùng enable nút sync trong status=idle.
+  const [hasRemoteChangePending, setHasRemoteChangePending] = useState(false);
+  /// Timestamp forceSync cuối cùng — dùng throttle 2s cho nút "Đồng bộ ngay".
+  const lastForceAtRef = useRef(0);
+  /// Guard re-entry — true từ lúc doSync bắt đầu đến khi finally. Tránh
+  /// 2 sync concurrent (force click khi debounce vừa fire chẳng hạn).
+  const syncInFlightRef = useRef(false);
   /// Đếm mutations liên tục trong window hiện tại (reset khi debounce fire).
   /// Dùng compute delay adaptive: edit càng nhiều liên tục → delay dài hơn.
   const consecutiveMutationsRef = useRef(0);
@@ -156,113 +196,49 @@ export function useCloudSync({
     }
   };
 
-  const refreshSyncState = useCallback(async (): Promise<SyncStateDto> => {
-    const s = await invoke<SyncStateDto>("sync_state_get");
-    setLastSyncAt(
-      s.last_synced_at_ms ? new Date(s.last_synced_at_ms) : null,
-    );
-    return s;
-  }, []);
-
-  /// Sync strategy thông minh:
-  /// - Fetch metadata trước. Nếu remote mới + khác máy → pull-merge-push (merge data).
-  /// - Ngược lại → upload thẳng (rẻ hơn, bỏ qua merge khi không cần).
-  ///
-  /// `prefetched` optional — khi caller vừa fetch metadata + syncState (vd
-  /// `doStartupCheck` ngay trước đó), pass xuống để skip Promise.all ở đầu
-  /// function. Tiết kiệm 1 Worker `/metadata` req + 1 local invoke. Values
-  /// vẫn valid vì giữa 2 await không có mutation (sequential trong startup).
-  const doSync = useCallback(
-    async (prefetched?: {
-      metadata: SyncMetadataResult;
-      localFp: string;
-      syncState: SyncStateDto;
-    }): Promise<void> => {
+  /// Pull (nhận remote) → push (gửi local). Thứ tự này giảm CAS conflict
+  /// khi 2 máy cùng sync. Mỗi phase emit syncPhase để SplashScreen/SyncBadge
+  /// đổi label text.
+  const doSync = useCallback(async (): Promise<void> => {
     const current = auth.currentUser;
     if (!current) return;
     if (!navigator.onLine) {
       setStatus("offline");
       return;
     }
+    // Reentry guard — 2 doSync concurrent sẽ ăn cùng DB lock ở Rust side,
+    // UI status bounce lung tung. Caller thứ 2 bail out.
+    if (syncInFlightRef.current) return;
+    syncInFlightRef.current = true;
     clearDebounce();
     clearRetry();
-    // Reset counter — sync vừa fire xong (bất kể qua debounce, idle flush,
-    // hay forceSync), next mutation sẽ start từ BASE = 15s (snappy UX).
+    // Reset counter — sync vừa fire xong, next mutation sẽ start từ BASE.
     consecutiveMutationsRef.current = 0;
+    // Clear remote-pending flag — sync đang consume tín hiệu RTDB.
+    setHasRemoteChangePending(false);
     setStatus("syncing");
     setError(null);
     try {
       const idToken = await getAuthToken();
-      const { metadata, localFp, beforeSync } = prefetched
-        ? {
-            metadata: prefetched.metadata,
-            localFp: prefetched.localFp,
-            beforeSync: prefetched.syncState,
-          }
-        : await (async () => {
-            const [m, fp, s] = await Promise.all([
-              syncMetadata(idToken),
-              machineFingerprint(),
-              refreshSyncState(),
-            ]);
-            return { metadata: m, localFp: fp, beforeSync: s };
-          })();
 
-      const remoteMtime = metadata.last_modified_ms ?? 0;
-      const remoteFp = metadata.fingerprint ?? null;
-      const storedRemoteMtime = beforeSync.last_synced_remote_mtime_ms ?? 0;
-      const remoteChanged =
-        (metadata.exists ?? false) && remoteMtime > storedRemoteMtime;
-      const differentMachine = remoteFp === null ? true : remoteFp !== localFp;
-      // Fresh install: local chưa có mutation nào (changeId=0) + R2 đã có
-      // data → BẮT BUỘC pull-merge-push bất kể fingerprint. Không dùng upload
-      // vì sẽ đè DB rỗng lên remote (Rust-side cũng reject, đây là defensive
-      // FE để UX tốt hơn: chạy merge thẳng thay vì fail error).
-      const localFresh =
-        beforeSync.changeId === 0 && beforeSync.lastUploadedChangeId === 0;
-      const freshWithRemote = localFresh && (metadata.exists ?? false);
-      const needMerge = freshWithRemote || (remoteChanged && differentMachine);
-      console.log("[sync] doSync decision:", {
-        localFresh,
-        "metadata.exists": metadata.exists,
-        freshWithRemote,
-        remoteChanged,
-        differentMachine,
-        needMerge,
-        action: needMerge ? "syncPullMergePush" : "syncUploadDb",
-        changeId: beforeSync.changeId,
-        lastUploadedChangeId: beforeSync.lastUploadedChangeId,
+      setSyncPhase("pulling");
+      const pullReport = await syncV9PullAll(idToken);
+
+      setSyncPhase("pushing");
+      const pushReport = await syncV9PushAll(idToken);
+
+      setLastSyncAt(new Date());
+      setLastSyncStats({
+        downloadBytes: pullReport.totalBytes,
+        uploadBytes: pushReport.totalBytes,
+        pulledDeltas: pullReport.appliedDeltas,
+        pushedDeltas: pushReport.uploadedCount,
+        skippedIdentical: pushReport.skippedIdentical,
       });
-
-      // CAS upload retry: nếu upload thẳng bị 412 (máy khác đã upload giữa
-      // chừng), Rust trả error message bắt đầu "ETAG_CONFLICT" → tự động
-      // route sang pull-merge-push để merge data máy kia rồi re-upload.
-      // pull-merge-push đã có internal retry 3 lần nên không cần wrap thêm.
-      let res;
-      let mergeHappened = needMerge;
-      if (needMerge) {
-        res = await syncPullMergePush(idToken);
-      } else {
-        try {
-          res = await syncUploadDb(idToken, metadata.exists ?? false);
-        } catch (e) {
-          const msg = (e as Error).message ?? String(e);
-          if (msg.startsWith(ETAG_CONFLICT_PREFIX)) {
-            console.log("[sync] upload CAS conflict → fallback pull-merge-push");
-            res = await syncPullMergePush(idToken);
-            mergeHappened = true;
-          } else {
-            throw e;
-          }
-        }
-      }
-      setLastSyncAt(new Date(res.last_modified_ms));
-
-      const state = await refreshSyncState();
       retryAttemptRef.current = 0;
 
-      // Chỉ refetch UI khi merge (đã chạm vào local DB). Upload thẳng không cần.
-      if (mergeHappened) {
+      // UI refetch nếu pull đã apply deltas (local DB có row mới từ máy khác).
+      if (pullReport.appliedDeltas > 0) {
         try {
           await onRemoteAppliedRef.current?.();
         } catch {
@@ -270,7 +246,52 @@ export function useCloudSync({
         }
       }
 
-      if (state.dirty) {
+      console.log("[sync v9]", {
+        pulled: pullReport.appliedDeltas,
+        pulledBytes: pullReport.totalBytes,
+        pushed: pushReport.uploadedCount,
+        pushedBytes: pushReport.totalBytes,
+        skippedIdentical: pushReport.skippedIdentical,
+        casRetries: pushReport.casRetries,
+      });
+
+      // Broadcast push event qua Firebase RTDB — máy khác cùng UID sẽ nhận
+      // trong <1s và tự pull. Chỉ announce khi thực sự có upload (> 0 file).
+      // Tolerant với lỗi: write fail không block sync flow.
+      if (pushReport.uploadedCount > 0 && myFingerprintRef.current) {
+        const uid = current.uid;
+        void announceMyPush(
+          uid,
+          myFingerprintRef.current,
+          pushReport.totalBytes,
+        );
+      }
+
+      // Flush sync event log lên R2 (best-effort, không block status).
+      // Nếu không flush, sync_event_log table accumulate forever.
+      void syncV9LogFlush(idToken).catch((e) => {
+        console.warn("[sync v9] log flush failed:", e);
+      });
+
+      // Check compaction trigger (P10, best-effort). Threshold > 100 deltas
+      // → tạo snapshot + clear manifest.deltas. Long-running (upload 500MB)
+      // nên detach — status UI không block.
+      void syncV9CompactIfNeeded(idToken)
+        .then((r) => {
+          if (r.triggered) {
+            console.log("[sync v9 compact]", r);
+          }
+        })
+        .catch((e) => {
+          console.warn("[sync v9] compact failed:", e);
+        });
+
+      // Dirty check sau sync: có thể user vừa edit trong lúc push đang chạy
+      // → pendingPushTables vẫn > 0 → debounce tiếp.
+      const state = await syncV9GetState();
+      if (state.freshInstallPending) {
+        setStatus("bootstrap");
+      } else if (state.pendingPushTables.length > 0) {
         setStatus("dirty");
         scheduleDebounce();
       } else {
@@ -280,11 +301,6 @@ export function useCloudSync({
       const msg = (e as Error).message ?? String(e);
       setError(msg);
       setStatus("error");
-      try {
-        await invoke("sync_state_record_error", { message: msg });
-      } catch {
-        // ignore — best effort.
-      }
       const delay = backoffFor(retryAttemptRef.current);
       retryAttemptRef.current += 1;
       retryRef.current = window.setTimeout(() => {
@@ -293,10 +309,11 @@ export function useCloudSync({
       }, delay);
     } finally {
       setSyncPhase(null);
+      syncInFlightRef.current = false;
     }
     // scheduleDebounce khai báo bên dưới — forward ref qua closure.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshSyncState]);
+  }, []);
 
   const scheduleDebounce = useCallback(() => {
     clearDebounce();
@@ -310,9 +327,10 @@ export function useCloudSync({
     debounceRef.current = timerId;
   }, [doSync]);
 
-  /// Startup check: kiểm tra metadata R2 → nếu có dirty local HOẶC remote mới
-  /// + khác máy → chạy doSync (pull-merge-push). Merge chạy trong cùng
-  /// connection nên không cần restart.
+  /// Startup check: trong v9 chỉ cần gọi doSync — sync_v9_sync_all cheap khi
+  /// không có gì đổi (fetch manifest + empty diff → no-op). Manifest etag +
+  /// cursor state ở Rust tự xác định cần fetch/apply gì. Không cần fingerprint
+  /// check như v8.
   const doStartupCheck = useCallback(async (): Promise<void> => {
     const current = auth.currentUser;
     if (!current) return;
@@ -323,67 +341,12 @@ export function useCloudSync({
     setStatus("checking");
     setError(null);
     try {
-      const [idToken, localFp] = await Promise.all([
-        getAuthToken(),
-        machineFingerprint(),
-      ]);
-      const remote = await syncMetadata(idToken);
-
-      const syncState = await refreshSyncState();
-
-      // Case 1: remote chưa tồn tại → doSync sẽ skip pull + upload lần đầu.
-      // Pass prefetched để doSync reuse metadata + syncState thay vì refetch.
-      if (!remote.exists) {
-        console.log("[sync] startupCheck: remote không tồn tại → doSync (upload init)");
-        await doSync({ metadata: remote, localFp, syncState });
-        return;
+      // Peek state trước để UI hiển thị đúng splash (bootstrap vs normal sync).
+      const beforeState: SyncV9State = await syncV9GetState();
+      if (beforeState.freshInstallPending) {
+        setStatus("bootstrap");
       }
-
-      const remoteMtime = remote.last_modified_ms ?? 0;
-      const remoteFp = remote.fingerprint ?? null;
-      const storedRemoteMtime = syncState.last_synced_remote_mtime_ms ?? 0;
-
-      const remoteChanged = remoteMtime > storedRemoteMtime;
-      const differentMachine =
-        remoteFp === null ? true : remoteFp !== localFp;
-      // Local fresh = changeId=0 + lastUploadedChangeId=0 → DB chưa có mutation
-      // nào từ install này (reinstall, clear DB, fresh login). BẮT BUỘC pull khi
-      // remote có data — nếu không, user sẽ thấy UI rỗng và mutation kế sẽ đè
-      // mất R2 backup (change_id > 0 sau mutation → Rust-side guard không trigger).
-      // Trước đây chỉ check (remoteChanged && differentMachine) → miss khi same
-      // machine reinstall (fingerprint giống) → data loss.
-      const localFresh =
-        syncState.changeId === 0 && syncState.lastUploadedChangeId === 0;
-
-      console.log("[sync] doStartupCheck state:", {
-        "remote.exists": remote.exists,
-        dirty: syncState.dirty,
-        changeId: syncState.changeId,
-        lastUploadedChangeId: syncState.lastUploadedChangeId,
-        localFresh,
-        remoteChanged,
-        differentMachine,
-        willSync:
-          syncState.dirty || localFresh || (remoteChanged && differentMachine),
-      });
-
-      // Case 2: fresh install + remote có data (reinstall, cùng máy)
-      //         HOẶC dirty local
-      //         HOẶC remote mới từ máy khác
-      //         → pull-merge-push.
-      if (
-        syncState.dirty ||
-        localFresh ||
-        (remoteChanged && differentMachine)
-      ) {
-        await doSync({ metadata: remote, localFp, syncState });
-        return;
-      }
-
-      // Case 3: đã đồng bộ, không cần làm gì.
-      console.log("[sync] startupCheck: không cần sync (đã đồng bộ)");
-      retryAttemptRef.current = 0;
-      setStatus("idle");
+      await doSync();
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       setError(msg);
@@ -395,7 +358,7 @@ export function useCloudSync({
         void doStartupCheck();
       }, delay);
     }
-  }, [doSync, refreshSyncState]);
+  }, [doSync]);
 
   // Track Firebase auth UID — logout/login cùng app session phải trigger
   // startup check lại (nếu không → flow "logout → xóa DB → login" miss sync).
@@ -412,10 +375,10 @@ export function useCloudSync({
   // Startup check — chạy MỖI LẦN login (kể cả cùng user, sau logout).
   // Reset ref trên logout → login tiếp theo re-run.
   //
-  // CRITICAL: trước khi sync, gọi `sync_reset_for_new_user(authUid)` để đảm
-  // bảo local DB thuộc về user hiện tại. Nếu DB của user khác → wipe + refetch
-  // sync_state. Tránh leak data user A sang UI user B + tránh upload DB của A
-  // lên R2 path users/{uid_B}/.
+  // CRITICAL: trước khi sync, gọi `sync_reset_for_new_user(authUid)` (qua
+  // `switch_db_to_user`) để đảm bảo local DB thuộc về user hiện tại. Nếu
+  // DB của user khác → wipe + refetch state. Tránh leak data user A sang
+  // UI user B + tránh upload DB của A lên R2 path users/{uid_B}/.
   useEffect(() => {
     if (!enabled) return;
     if (!authUid) {
@@ -429,37 +392,34 @@ export function useCloudSync({
       // CRITICAL: nếu switch_db_to_user fail, DbState vẫn trỏ _pre_auth (rỗng)
       // → unlock UI sẽ hiển thị empty state, user tưởng mất data. Tách try
       // riêng cho switch: fail → keep splash + error banner. doStartupCheck
-      // fail thì được unlock vì DB đã swap đúng, merge fail cũng không corrupt.
+      // fail thì được unlock vì DB đã swap đúng, sync fail cũng không corrupt.
       try {
         const ownerChanged = await invoke<boolean>("switch_db_to_user", {
           newUid: authUid,
         });
         if (ownerChanged) {
           console.log(
-            "[sync] swapped DB to users/" + authUid + "/ folder",
+            "[sync v9] swapped DB to users/" + authUid + "/ folder",
           );
-          // Clear localStorage scoped per-app (calculator history + filter +
-          // settings) vì toàn bộ đều mang dấu vết user cũ. KHÔNG clear all
-          // localStorage vì Firebase SDK / Tauri có key riêng — chỉ key app.
           wipeUserLocalStorage();
         }
       } catch (e) {
         const msg = (e as Error).message ?? String(e);
-        console.error("[sync] switch_db_to_user failed:", msg);
+        console.error("[sync v9] switch_db_to_user failed:", msg);
         setError(msg);
         setStatus("error");
         startupDoneRef.current = false; // allow retry on re-auth / reload
         return; // KHÔNG setIsStartupPhase(false) — splash stays với error
       }
 
-      // Switch xong → UI có thể unlock safely. doStartupCheck/merge fail vẫn
+      // Switch xong → UI có thể unlock safely. doStartupCheck/sync fail vẫn
       // OK vì DB đã đúng folder user.
       try {
         // CRITICAL phân quyền: LUÔN refetch FE state sau khi switch_db_to_user
-        // xong (bất kể ownerChanged), vì DbState connection đã trỏ sang DB mới
-        // của user hiện tại. AccountContext + useDbStats gọi list/query trước
-        // khi switch xong sẽ đọc từ DB cũ (race condition) — refresh ở đây
-        // overwrite state với data từ DB đúng.
+        // xong (bất kể ownerChanged), vì DbState connection đã trỏ sang DB
+        // mới của user hiện tại. AccountContext + useDbStats gọi list/query
+        // trước khi switch xong sẽ đọc từ DB cũ (race condition) — refresh ở
+        // đây overwrite state với data từ DB đúng.
         try {
           await onRemoteAppliedRef.current?.();
         } catch {
@@ -472,52 +432,34 @@ export function useCloudSync({
     })();
   }, [enabled, authUid, doStartupCheck]);
 
-  // Listen sync-phase events từ Rust backend — update syncPhase để UI render text đúng.
-  useEffect(() => {
-    if (!enabled) return;
-    let unlisten: UnlistenFn | null = null;
-    let cancelled = false;
-    listen<string>("sync-phase", (event) => {
-      const p = event.payload;
-      if (p === "downloading" || p === "merging" || p === "uploading") {
-        setSyncPhase(p);
-      } else {
-        setSyncPhase(null);
-      }
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
-    };
-  }, [enabled]);
-
-  // Mutation → debounce sync. Reset timer mỗi mutation (user đề xuất: giây thứ 7
-  // có mutation mới → adaptive debounce đếm lại + ladder tăng delay.
+  // Mutation → debounce sync. Reset timer mỗi mutation (user đề xuất: giây
+  // thứ 7 có mutation mới → adaptive debounce đếm lại + ladder tăng delay).
+  // pausedByForm: user đang mở form → không lên lịch sync (tránh apply event
+  // đè lên state form đang edit). Mutation vẫn mark status=dirty, debounce
+  // sẽ schedule khi resume.
   useEffect(() => {
     if (!enabled) return;
     if (
       status === "checking" ||
       status === "syncing" ||
-      status === "offline"
+      status === "offline" ||
+      status === "bootstrap"
     ) {
       return;
     }
     if (mutationVersion === 0) return;
 
     setStatus("dirty");
-    // Tăng consecutive counter — mutation tiếp theo sẽ có delay lớn hơn
-    // (ladder BASE → +STEP → +STEP → ... → MAX). Cap ở MAX (60s).
     consecutiveMutationsRef.current += 1;
-    scheduleDebounce();
+    if (!pausedByForm) {
+      scheduleDebounce();
+    }
 
     return () => {
       clearDebounce();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mutationVersion, enabled, scheduleDebounce]);
+  }, [mutationVersion, enabled, pausedByForm, scheduleDebounce]);
 
   // Idle flush: user idle IDLE_MS + status dirty → sync sớm (bỏ qua debounce).
   useEffect(() => {
@@ -529,6 +471,7 @@ export function useCloudSync({
       window.addEventListener(ev, onActivity, { passive: true }),
     );
     idleCheckRef.current = window.setInterval(() => {
+      if (pausedByForm) return;
       if (statusRef.current !== "dirty") return;
       if (Date.now() - lastActivityRef.current < IDLE_MS) return;
       clearDebounce();
@@ -552,8 +495,8 @@ export function useCloudSync({
       retryAttemptRef.current = 0;
       clearRetry();
       void (async () => {
-        const s = await refreshSyncState();
-        if (s.dirty) {
+        const s = await syncV9GetState();
+        if (s.pendingPushTables.length > 0) {
           await doSync();
         } else {
           setStatus("idle");
@@ -571,7 +514,7 @@ export function useCloudSync({
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
     };
-  }, [enabled, doSync, refreshSyncState]);
+  }, [enabled, doSync]);
 
   // On-exit flush — user tắt app khi dirty → best effort push.
   useEffect(() => {
@@ -585,12 +528,113 @@ export function useCloudSync({
     return () => window.removeEventListener("beforeunload", handler);
   }, [enabled, doSync]);
 
+  // Auto-sync periodic tick — nhận remote changes passively mỗi
+  // AUTO_SYNC_INTERVAL_MS khi status=idle (không dirty/syncing/offline/
+  // bootstrap/checking/error). Plan Q1 lock ≥5 phút để không drain cost.
+  //
+  // Dirty không chạy tick vì debounce + idle flush đã handle. Syncing bail
+  // ra vì reentry guard. Error đang có retry backoff riêng. pausedByForm →
+  // skip tick (tránh pull apply ghi đè form đang edit).
+  useEffect(() => {
+    if (!enabled) return;
+    autoSyncTickRef.current = window.setInterval(() => {
+      if (pausedByForm) return;
+      if (statusRef.current !== "idle") return;
+      if (!navigator.onLine) return;
+      void doSync();
+    }, AUTO_SYNC_INTERVAL_MS);
+    return () => {
+      if (autoSyncTickRef.current !== null) {
+        clearInterval(autoSyncTickRef.current);
+        autoSyncTickRef.current = null;
+      }
+    };
+  }, [enabled, pausedByForm, doSync]);
+
+  // Transition pausedByForm true → false: form vừa đóng. Trigger sync
+  // catch-up nếu dirty (mutations trong lúc edit + remote có thể có update).
+  const prevPausedRef = useRef(pausedByForm);
+  useEffect(() => {
+    if (!enabled) return;
+    const wasPaused = prevPausedRef.current;
+    prevPausedRef.current = pausedByForm;
+    if (wasPaused && !pausedByForm) {
+      // Resume — flush pending + pull remote changes.
+      if (statusRef.current === "dirty" || statusRef.current === "idle") {
+        void doSync();
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pausedByForm, enabled]);
+
   const forceSync = useCallback(async (): Promise<void> => {
+    // Throttle 2s — user spam click nút "Đồng bộ ngay" chỉ fire 1 lần.
+    const now = Date.now();
+    if (now - lastForceAtRef.current < FORCE_SYNC_MIN_GAP_MS) return;
+    lastForceAtRef.current = now;
     clearDebounce();
     clearRetry();
     retryAttemptRef.current = 0;
     await doSync();
   }, [doSync]);
 
-  return { status, isStartupPhase, syncPhase, lastSyncAt, error, forceSync };
+  // Fetch machine fingerprint 1 lần — dùng cho RTDB push notification.
+  // setFingerprintReady toggle để trigger subscribe effect tái chạy.
+  const [fingerprintReady, setFingerprintReady] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string>("machine_fingerprint")
+      .then((fp) => {
+        if (cancelled) return;
+        myFingerprintRef.current = fp;
+        setFingerprintReady(true);
+      })
+      .catch((e) => {
+        console.warn("[sync] machine_fingerprint failed:", e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Subscribe Firebase RTDB push events — máy khác push → ta pull ngay.
+  // Event-driven thay thế cho polling 5 phút → zero R2 cost khi idle.
+  // Initial snapshot KHÔNG trigger sync (đã có startup sync handle).
+  useEffect(() => {
+    if (!enabled) return;
+    if (!authUid) return;
+    const fp = myFingerprintRef.current;
+    if (!fp) return; // fingerprintReady sẽ re-trigger effect khi sẵn sàng
+    const unsub = subscribeRemotePushes(
+      authUid,
+      fp,
+      ({ fingerprint, initial }) => {
+        if (initial) {
+          console.log("[sync] RTDB baseline:", fingerprint);
+          return;
+        }
+        console.log("[sync] RTDB remote push detected:", fingerprint);
+        // Mark flag để UI enable nút sync. Nếu app đang idle + online, tự
+        // chạy doSync luôn (pull về ngay). pausedByForm → giữ flag đợi
+        // resume. Syncing → doSync re-entry guard tự skip.
+        setHasRemoteChangePending(true);
+        if (statusRef.current === "offline") return;
+        if (pausedByForm) return;
+        void doSync();
+      },
+    );
+    return unsub;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, authUid, pausedByForm, fingerprintReady]);
+
+  return {
+    status,
+    isStartupPhase,
+    syncPhase,
+    lastSyncAt,
+    lastSyncStats,
+    hasRemoteChangePending,
+    error,
+    forceSync,
+  };
 }

@@ -34,6 +34,7 @@ import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
 import { useSelfPresence } from "./hooks/usePresence";
 import { SyncBadge } from "./components/SyncBadge";
+import { BootstrapSplash } from "./components/BootstrapSplash";
 import { UpdatesDropdown } from "./components/UpdatesDropdown";
 import { CloseWarningDialog } from "./components/CloseWarningDialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -146,16 +147,24 @@ function AppInner() {
     await refreshAccounts();
   }, [refetch, refreshAccounts]);
 
+  // L1 form-dirty defer state — update sau khi entryDialog/previewBatch
+  // state được khai báo (phía dưới). Khởi tạo false; effect sau set-true
+  // khi form mở, useCloudSync re-run với giá trị mới.
+  const [pausedByForm, setPausedByForm] = useState(false);
+
   const {
     status: syncStatus,
     isStartupPhase,
     syncPhase,
     lastSyncAt,
+    lastSyncStats,
+    hasRemoteChangePending,
     error: syncError,
     forceSync,
   } = useCloudSync({
     mutationVersion,
     enabled: !inAdminView,
+    pausedByForm,
     onRemoteApplied,
   });
 
@@ -333,6 +342,11 @@ function AppInner() {
     row?: UiRow | null;
   } | null>(null);
   const [previewBatch, setPreviewBatch] = useState<PreviewBatch | null>(null);
+  // L1 form-dirty: sync pausedByForm state theo form-open state.
+  const pausedNow = entryDialog !== null || previewBatch !== null;
+  useEffect(() => {
+    setPausedByForm(pausedNow);
+  }, [pausedNow]);
   // TK user pick trong ImportAccountPickerDialog — giữ xuyên suốt flow import.
   // null khi chưa pick (dialog đóng) hoặc không có batch pending.
   const [importAccountId, setImportAccountId] = useState<number | null>(null);
@@ -532,6 +546,19 @@ function AppInner() {
         />
       );
     }
+    // Bootstrap splash dedicated — fresh install cần UX khác (progress
+    // per-phase, cảnh báo không tắt app). Trigger khi sync_v9_get_state
+    // báo freshInstallPending = true HOẶC backend set status = bootstrap
+    // mid-sync.
+    if (syncStatus === "bootstrap") {
+      return (
+        <BootstrapSplash
+          phase={syncPhase}
+          lastSyncAt={lastSyncAt}
+          error={syncError}
+        />
+      );
+    }
     return (
       <SplashScreen {...splashTextFor(syncPhase)} lastSyncAt={lastSyncAt} />
     );
@@ -579,6 +606,8 @@ function AppInner() {
               <SyncBadge
                 status={syncStatus}
                 lastSyncAt={lastSyncAt}
+                lastSyncStats={lastSyncStats}
+                hasRemoteChangePending={hasRemoteChangePending}
                 error={syncError}
                 onForce={forceSync}
               />
@@ -1238,28 +1267,23 @@ function AuthGate() {
   );
 }
 
-/// Map sync phase → text cho SplashScreen. Null (chưa có event) → default
-/// "Đang đồng bộ lên R2..." để UX nhất quán với lúc init.
+/// Map sync phase (v9) → text cho SplashScreen. Null (chưa có phase) →
+/// default "Đang đồng bộ..." để UX nhất quán với lúc init.
 function splashTextFor(phase: SyncPhase): { title: string; subtitle?: string } {
   switch (phase) {
-    case "downloading":
+    case "pulling":
       return {
-        title: "Đang tải xuống...",
-        subtitle: "Lấy dữ liệu mới từ R2.",
+        title: "Đang nhận dữ liệu mới...",
+        subtitle: "Kéo delta từ R2 và áp dụng vào DB local.",
       };
-    case "merging":
-      return {
-        title: "Đang hợp nhất...",
-        subtitle: "Kết hợp dữ liệu local với bản từ R2.",
-      };
-    case "uploading":
+    case "pushing":
       return {
         title: "Đang đẩy lên R2...",
-        subtitle: "Lưu thay đổi cuối cùng.",
+        subtitle: "Upload thay đổi local + cập nhật manifest.",
       };
     default:
       return {
-        title: "Đang đồng bộ lên R2...",
+        title: "Đang đồng bộ R2...",
         subtitle: "Hợp nhất dữ liệu từ các máy khác, vui lòng chờ.",
       };
   }

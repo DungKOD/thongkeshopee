@@ -1305,7 +1305,7 @@ pub async fn admin_fetch_user_list(
     sync_api_url: String,
     id_token: String,
 ) -> CmdResult<AdminUserListCache> {
-    let users = super::sync_client::admin_list_users(&sync_api_url, &id_token).await?;
+    let users = super::app_util::admin_list_users(sync_api_url, id_token).await?;
     let users_json = serde_json::to_string(&users)
         .map_err(|e| CmdError::msg(format!("serialize users: {e}")))?;
     let now = now_ms();

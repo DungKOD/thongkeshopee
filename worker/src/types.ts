@@ -16,36 +16,59 @@ export interface AuthContext {
   createdAt: string | null;
 }
 
-export interface MetadataResponse {
+// =============================================================
+// Sync v9 wire formats
+// =============================================================
+
+/**
+ * Manifest schema — phải match Rust `sync_v9::types::Manifest` exact.
+ * JSON thuần, không có binary.
+ */
+export interface V9Manifest {
+  version: number;
+  uid: string;
+  latest_snapshot: V9ManifestSnapshot | null;
+  deltas: V9ManifestDeltaEntry[];
+  updated_at_ms: number;
+}
+
+export interface V9ManifestSnapshot {
+  key: string;
+  clock_ms: number;
+  size_bytes: number;
+}
+
+export interface V9ManifestDeltaEntry {
+  table: string;
+  key: string;
+  cursor_lo: string;
+  cursor_hi: string;
+  clock_ms: number;
+  size_bytes: number;
+  row_count: number;
+}
+
+export interface ManifestGetResponse {
   ok: true;
-  exists: boolean;
-  fileId: string | null;
-  sizeBytes: number | null;
-  lastModified: number | null;
-  fingerprint: string | null;
-  /// R2 etag — client dùng làm `expectedEtag` trong upload kế tiếp (CAS).
-  /// null nếu object không tồn tại.
+  manifest: V9Manifest | null;
   etag: string | null;
 }
 
-/// v8.1+ upload: body là raw zstd bytes, metadata trong HTTP headers
-/// (X-Mtime-Ms, X-Fingerprint, X-Expected-Etag). Không còn JSON body.
-///
-/// Worker response shape sau upload thành công:
-export interface UploadResponse {
+export interface ManifestPutRequest {
+  manifest: V9Manifest;
+  expectedEtag: string | null;
+}
+
+export interface ManifestPutResponse {
   ok: true;
-  fileId: string;
-  sizeBytes: number;
-  lastModified: number;
-  fingerprint: string;
-  /// Etag MỚI sau upload thành công — client lưu vào sync_state để
-  /// upload lần sau attach làm expectedEtag.
   etag: string;
 }
 
-/// v8.1+ download: response body là raw zstd bytes, metadata trong response
-/// headers (X-Size-Bytes, X-Last-Modified-Ms, ETag). Không còn JSON envelope.
-/// Giữ interface này chỉ cho doc — không còn được deserialize vì không phải JSON.
+export interface DeltaUploadResponse {
+  ok: true;
+  etag: string;
+  sizeBytes: number;
+}
 
 export interface ErrorResponse {
   ok: false;

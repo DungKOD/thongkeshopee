@@ -1,34 +1,36 @@
 //! Admin-only: xem DB của user khác (Phase B).
 //!
-//! Flow: admin gọi `admin_view_user_db(target_uid, target_local_part, target_email)` →
-//! Worker `/admin/download?uid=<uid>` verify admin + trả base64 → Rust decode
-//! và ghi vào `app_data_dir/admin_view/<uid>.db` → mở connection read-only →
-//! swap `DbState` sang connection mới (connection cũ drop, handles release).
+//! Flow (v9): admin gọi `admin_view_user_db(target_uid, ...)` → Worker
+//! `GET /v9/admin/snapshot?uid=<uid>` verify admin + stream zstd bytes của
+//! snapshot mới nhất → Rust decompress + ghi vào
+//! `app_data_dir/admin_view/<uid>.db` → mở connection read-only → swap
+//! `DbState` sang connection mới (connection cũ drop, release handles).
 //!
-//! Khi admin exit → `admin_exit_view_user_db` reopen DB gốc (`resolve_db_path`)
-//! ở chế độ read-write với PRAGMA + migrate như bình thường → swap back.
+//! Khi admin exit → `admin_exit_view_user_db` reopen DB gốc ở chế độ RW
+//! với PRAGMA.
+//!
+//! v9 snapshot = P10 compaction output. Nếu user target chưa compact lần
+//! nào → Worker trả 404, admin hiện thấy error "chưa có snapshot".
 //!
 //! Safety:
-//! - Mở read-only (`SQLITE_OPEN_READ_ONLY`) → mọi mutation command sẽ fail
-//!   với `SQLITE_READONLY` nếu FE không tắt nút — 2 lớp bảo vệ.
-//! - Cloud sync PHẢI được tắt ở FE (`useCloudSync({ enabled: false })`) trong
-//!   lúc view mode — nếu không, dirty flag của DB user khác sẽ trigger upload
-//!   lên R2 của admin.
-//! - AdminViewState lưu trong Tauri state (memory). Restart app → state mất
-//!   → `db::setup` load DB gốc như bình thường, không cần cleanup logic.
+//! - Mở read-only (`SQLITE_OPEN_READ_ONLY`) → mọi mutation command fail
+//!   với `SQLITE_READONLY`.
+//! - Cloud sync PHẢI tắt ở FE (`useCloudSync({ enabled: false })`).
+//! - AdminViewState lưu trong Tauri state (memory); restart app → state mất.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use tokio::fs;
 
-use super::sync::zstd_decompress;
-use super::sync_client;
 use super::{CmdError, CmdResult};
 use crate::db::{resolve_active_db_path, DbState};
+use crate::sync_v9::compress::zstd_decompress;
 
 /// Tauri managed state — track user đang được admin xem.
 /// `None` = chế độ bình thường (DB của chính admin).
@@ -77,12 +79,15 @@ pub async fn admin_view_user_db(
     target_local_part: String,
     target_email: Option<String>,
 ) -> CmdResult<AdminViewInfo> {
-    // 1. Gọi Worker /admin/download?uid=<uid> — verify admin + trả raw zstd bytes.
+    // 1. Gọi Worker GET /v9/admin/snapshot?uid=<uid> — verify admin + stream
+    //    bytes snapshot mới nhất. 404 nếu user chưa compact lần nào.
     let (compressed, size_bytes, last_modified_ms) =
-        sync_client::admin_download(&sync_api_url, &id_token, &target_uid).await?;
+        admin_fetch_user_snapshot(&sync_api_url, &id_token, &target_uid)
+            .await
+            .map_err(|e| CmdError::msg(e.to_string()))?;
 
     // R2 lưu zstd bytes. Decompress trước khi write làm SQLite file.
-    let bytes = zstd_decompress(&compressed)?;
+    let bytes = zstd_decompress(&compressed).map_err(|e| CmdError::msg(e.to_string()))?;
     eprintln!(
         "admin_view download: payload={} KB → sqlite={} KB",
         compressed.len() / 1024,
@@ -201,4 +206,67 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+const ADMIN_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Fetch snapshot của user target từ Worker. Trả raw zstd bytes + size +
+/// last_modified_ms (từ header `X-Snapshot-Clock-Ms` nếu có, fallback now).
+///
+/// 404 (chưa có snapshot) → error rõ ràng cho admin UI.
+async fn admin_fetch_user_snapshot(
+    sync_api_url: &str,
+    id_token: &str,
+    target_uid: &str,
+) -> anyhow::Result<(Vec<u8>, u64, i64)> {
+    let url = format!(
+        "{}/v9/admin/snapshot?uid={}",
+        sync_api_url.trim_end_matches('/'),
+        urlencoding_encode(target_uid),
+    );
+    let client = reqwest::Client::builder()
+        .timeout(ADMIN_HTTP_TIMEOUT)
+        .build()
+        .context("build reqwest")?;
+    let res = client
+        .get(&url)
+        .bearer_auth(id_token)
+        .send()
+        .await
+        .context("admin snapshot fetch")?;
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        if status.as_u16() == 404 {
+            anyhow::bail!(
+                "User target chưa có snapshot (chưa chạy compaction P10). Chỉ xem được user đã có snapshot."
+            );
+        }
+        anyhow::bail!("HTTP {} admin snapshot fetch: {body}", status.as_u16());
+    }
+    let snapshot_clock_ms: i64 = res
+        .headers()
+        .get("X-Snapshot-Clock-Ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(now_ms);
+    let bytes = res.bytes().await.context("read snapshot bytes")?;
+    let size_bytes = bytes.len() as u64;
+    Ok((bytes.to_vec(), size_bytes, snapshot_clock_ms))
+}
+
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' => out.push(c),
+            _ => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).as_bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+        }
+    }
+    out
 }
