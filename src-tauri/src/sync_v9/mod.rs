@@ -19,6 +19,7 @@ pub mod capture;
 pub mod compress;
 pub mod descriptors;
 pub mod event_log;
+pub mod manifest;
 pub mod push;
 pub mod types;
 
