@@ -73,6 +73,7 @@ export function ImportPreviewDialog({
   const totalNew = activeFiles.reduce((a, f) => a + f.preview.newRows, 0);
   const totalSkipped = activeFiles.reduce((a, f) => a + f.preview.skipped, 0);
   const anyDayHasData = activeFiles.some((f) => f.preview.dayHasData);
+  const mostlyEmptyFiles = activeFiles.filter((f) => f.preview.mostlyEmpty);
   const hasReplacements = totalReplace > 0;
   const hasAnyShopee = activeFiles.some(
     (f) =>
@@ -188,6 +189,36 @@ export function ImportPreviewDialog({
                 warning
               </span>{" "}
               {totalSkipped} dòng bị bỏ qua do không parse được ngày (check format CSV)
+            </div>
+          )}
+
+          {mostlyEmptyFiles.length > 0 && (
+            <div
+              role="alert"
+              className="rounded-lg border-2 border-orange-500 bg-orange-950/40 px-4 py-3 text-sm"
+            >
+              <p className="mb-2 font-semibold text-orange-200">
+                <span className="material-symbols-rounded align-middle text-base">
+                  warning
+                </span>{" "}
+                {mostlyEmptyFiles.length} file FB không có data (spend=0,
+                clicks=0) cho phần lớn rows
+              </p>
+              <ul className="mb-2 space-y-0.5 pl-6 text-xs text-white/80">
+                {mostlyEmptyFiles.map((f, i) => (
+                  <li key={i} className="truncate" title={f.preview.filename}>
+                    • {f.preview.filename}{" "}
+                    <span className="text-white/50">
+                      ({f.preview.emptyRows}/{f.preview.totalRows} rows trống)
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="text-xs text-orange-200/80">
+                Data cũ <b>không bị đè</b> bằng 0 (DB guard). Nhưng file này
+                cũng KHÔNG add value mới — kiểm tra lại xem có phải file đúng
+                không trước khi import.
+              </p>
             </div>
           )}
 

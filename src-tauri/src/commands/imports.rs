@@ -807,6 +807,16 @@ pub fn import_fb_ad_groups(
 /// v10: RETURNING id để mapping fb_ads_to_file (SQLite 3.35+).
 /// v13: id = content_id(day_date, level, name) — first param, cross-machine
 /// deterministic. Caller compute qua `content_id::fb_ad_id`.
+/// FB UPSERT với **no-overwrite-with-zero guard** cho metric numeric:
+/// nếu excluded.spend (hoặc clicks/cpc/impressions/reach) là NULL hoặc 0
+/// thì giữ existing value. Latest report > 0 mới replace.
+///
+/// Lý do: FB report export 2 lần cùng day+name có thể có spend=0 ở lần 2
+/// (ad đã pause sau export 1, hoặc user nhầm import file rỗng). Không
+/// guard → UPSERT đè value tốt thành 0 → mất data.
+///
+/// Identity fields (sub_ids, status, report dates) vẫn replace — vì
+/// chúng reflect intent mới nhất, không có concept "tốt hơn = giữ".
 const FB_ADS_UPSERT_SQL: &str = "
     INSERT INTO raw_fb_ads
     (id, level, name,
@@ -821,8 +831,11 @@ const FB_ADS_UPSERT_SQL: &str = "
        sub_id5 = excluded.sub_id5,
        report_start = excluded.report_start, report_end = excluded.report_end,
        status = excluded.status,
-       spend = excluded.spend, clicks = excluded.clicks, cpc = excluded.cpc,
-       impressions = excluded.impressions, reach = excluded.reach,
+       spend       = CASE WHEN COALESCE(excluded.spend, 0)       > 0 THEN excluded.spend       ELSE spend       END,
+       clicks      = CASE WHEN COALESCE(excluded.clicks, 0)      > 0 THEN excluded.clicks      ELSE clicks      END,
+       cpc         = CASE WHEN COALESCE(excluded.cpc, 0)         > 0 THEN excluded.cpc         ELSE cpc         END,
+       impressions = CASE WHEN COALESCE(excluded.impressions, 0) > 0 THEN excluded.impressions ELSE impressions END,
+       reach       = CASE WHEN COALESCE(excluded.reach, 0)       > 0 THEN excluded.reach       ELSE reach       END,
        source_file_id = excluded.source_file_id
     RETURNING id
 ";
@@ -1012,5 +1025,124 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 64);
+    }
+
+    // ========================================================
+    // FB UPSERT no-overwrite-with-zero guard
+    // ========================================================
+
+    fn fresh_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+        // Seed day + imported_files cho FK.
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-17', '2026-04-17T00:00:00Z')",
+            [],
+        ).unwrap();
+        let file_id = crate::sync_v9::content_id::imported_file_id("hash_x");
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+             VALUES(?, 'a.csv', 'fb_ad_group', '2026-04-17T00:00:00Z', 'hash_x', '2026-04-17')",
+            params![file_id],
+        ).unwrap();
+        conn
+    }
+
+    fn upsert_fb_ad(
+        conn: &rusqlite::Connection,
+        name: &str,
+        spend: Option<f64>,
+        clicks: Option<i64>,
+    ) -> i64 {
+        let file_id = crate::sync_v9::content_id::imported_file_id("hash_x");
+        let id = crate::sync_v9::content_id::fb_ad_id("2026-04-17", "ad_group", name);
+        conn.query_row(
+            FB_ADS_UPSERT_SQL,
+            params![
+                id,                  // id
+                "ad_group",          // level
+                name,                // name
+                "", "", "", "", "",  // sub_ids
+                "2026-04-17", "2026-04-17",  // report dates
+                Some("active"),      // status
+                spend,               // spend
+                clicks,              // clicks
+                Option::<f64>::None, // cpc
+                Option::<i64>::None, // impressions
+                Option::<i64>::None, // reach
+                "2026-04-17",        // day_date
+                file_id,             // source_file_id
+            ],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    fn read_fb_ad(conn: &rusqlite::Connection, name: &str) -> (Option<f64>, Option<i64>) {
+        conn.query_row(
+            "SELECT spend, clicks FROM raw_fb_ads WHERE name = ? AND day_date = '2026-04-17'",
+            [name],
+            |r| Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fb_upsert_zero_does_not_overwrite_positive_value() {
+        let conn = fresh_db();
+        // Lần 1: spend=1000, clicks=50 (file value).
+        upsert_fb_ad(&conn, "ad_A", Some(1000.0), Some(50));
+        let (s1, c1) = read_fb_ad(&conn, "ad_A");
+        assert_eq!(s1, Some(1000.0));
+        assert_eq!(c1, Some(50));
+
+        // Lần 2: spend=0, clicks=0 (file rỗng) → KHÔNG đè.
+        upsert_fb_ad(&conn, "ad_A", Some(0.0), Some(0));
+        let (s2, c2) = read_fb_ad(&conn, "ad_A");
+        assert_eq!(s2, Some(1000.0), "spend > 0 không được đè bằng 0");
+        assert_eq!(c2, Some(50), "clicks > 0 không được đè bằng 0");
+    }
+
+    #[test]
+    fn fb_upsert_null_does_not_overwrite_positive_value() {
+        let conn = fresh_db();
+        upsert_fb_ad(&conn, "ad_B", Some(500.0), Some(20));
+        // NULL excluded → giữ existing.
+        upsert_fb_ad(&conn, "ad_B", None, None);
+        let (s, c) = read_fb_ad(&conn, "ad_B");
+        assert_eq!(s, Some(500.0));
+        assert_eq!(c, Some(20));
+    }
+
+    #[test]
+    fn fb_upsert_higher_value_replaces_lower() {
+        let conn = fresh_db();
+        upsert_fb_ad(&conn, "ad_C", Some(100.0), Some(5));
+        // Latest report > 0 → replace.
+        upsert_fb_ad(&conn, "ad_C", Some(2000.0), Some(80));
+        let (s, c) = read_fb_ad(&conn, "ad_C");
+        assert_eq!(s, Some(2000.0), "value > 0 mới replace");
+        assert_eq!(c, Some(80));
+    }
+
+    #[test]
+    fn fb_upsert_initial_zero_inserts_zero() {
+        let conn = fresh_db();
+        // Insert đầu tiên với 0 — KHÔNG conflict, OK insert 0.
+        upsert_fb_ad(&conn, "ad_D", Some(0.0), Some(0));
+        let (s, c) = read_fb_ad(&conn, "ad_D");
+        assert_eq!(s, Some(0.0), "lần đầu insert 0 OK (không có existing)");
+        assert_eq!(c, Some(0));
+    }
+
+    #[test]
+    fn fb_upsert_partial_zero_only_protects_those_fields() {
+        let conn = fresh_db();
+        upsert_fb_ad(&conn, "ad_E", Some(800.0), Some(40));
+        // spend mới = 1500 (replace), clicks = 0 (giữ).
+        upsert_fb_ad(&conn, "ad_E", Some(1500.0), Some(0));
+        let (s, c) = read_fb_ad(&conn, "ad_E");
+        assert_eq!(s, Some(1500.0), "spend > 0 replace");
+        assert_eq!(c, Some(40), "clicks 0 không đè");
     }
 }

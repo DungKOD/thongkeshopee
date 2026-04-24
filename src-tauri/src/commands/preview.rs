@@ -56,9 +56,35 @@ pub struct ImportPreview {
     pub existing_day_date: Option<String>,
     /// Số rows không parse được date → skip khi import (Shopee multi-day only).
     pub skipped: i64,
+    /// **FB only** — số rows có spend=0 AND clicks=0 (thực chất "no data" rows).
+    /// 0 cho Shopee files (concept không áp dụng). FE dùng tính tỷ lệ với
+    /// total_rows + cảnh báo nếu file mostly_empty.
+    #[serde(default)]
+    pub empty_rows: i64,
+    /// **FB only** — true nếu > 50% rows toàn 0 (spend+clicks). FE hiển
+    /// thị warning "File này không có data — import có thể đè value cũ
+    /// thành 0?". User confirm explicit trước commit.
+    ///
+    /// Note: SQL UPSERT đã có guard "no overwrite > 0 với 0", nhưng
+    /// preview cảnh báo vẫn hữu ích để user biết file không add data mới.
+    #[serde(default)]
+    pub mostly_empty: bool,
 }
 
 const SAMPLE_LIMIT: usize = 5;
+const MOSTLY_EMPTY_THRESHOLD_PCT: f64 = 0.5;
+
+/// Tính (empty_count, mostly_empty_flag) từ rows FB.
+/// `is_empty_fn`: row → true nếu spend=0/NULL AND clicks=0/NULL.
+/// Threshold = > 50% → mostly_empty=true → FE warning.
+fn count_empty_rows<T, F: Fn(&T) -> bool>(rows: &[T], is_empty_fn: F) -> (i64, bool) {
+    if rows.is_empty() {
+        return (0, false);
+    }
+    let empty: i64 = rows.iter().filter(|r| is_empty_fn(r)).count() as i64;
+    let pct = empty as f64 / rows.len() as f64;
+    (empty, pct > MOSTLY_EMPTY_THRESHOLD_PCT)
+}
 
 /// Check hash đã tồn tại trong imported_files chưa. Trả (bool, Option<existing_day_date>).
 /// KHÔNG error — preview hiện thông tin, FE quyết định skip.
@@ -201,6 +227,8 @@ pub fn preview_import_shopee_clicks(
         hash_match,
         existing_day_date: existing_day,
         skipped,
+        empty_rows: 0,
+        mostly_empty: false,
     })
 }
 
@@ -295,6 +323,8 @@ pub fn preview_import_shopee_orders(
         hash_match,
         existing_day_date: existing_day,
         skipped,
+        empty_rows: 0,
+        mostly_empty: false,
     })
 }
 
@@ -341,6 +371,16 @@ pub fn preview_import_fb_ad_groups(
     let new_rows = total - replace_rows;
     let sample_replace: Vec<String> = replace.into_iter().take(SAMPLE_LIMIT).collect();
 
+    // Đếm rows toàn 0 (no data) — clicks normalize qua link/all/result.
+    let (empty_rows, mostly_empty) = count_empty_rows(&payload.rows, |r| {
+        let spend_zero = r.spend.map(|v| v <= 0.0).unwrap_or(true);
+        let clicks_zero = r.link_clicks.unwrap_or(0)
+            + r.all_clicks.unwrap_or(0)
+            + r.result_count.unwrap_or(0)
+            == 0;
+        spend_zero && clicks_zero
+    });
+
     Ok(ImportPreview {
         kind: "fb_ad_group".into(),
         filename: payload.filename,
@@ -356,6 +396,8 @@ pub fn preview_import_fb_ad_groups(
         hash_match,
         existing_day_date: existing_day,
         skipped: 0,
+        empty_rows,
+        mostly_empty,
     })
 }
 
@@ -402,6 +444,15 @@ pub fn preview_import_fb_campaigns(
     let new_rows = total - replace_rows;
     let sample_replace: Vec<String> = replace.into_iter().take(SAMPLE_LIMIT).collect();
 
+    let (empty_rows, mostly_empty) = count_empty_rows(&payload.rows, |r| {
+        let spend_zero = r.spend.map(|v| v <= 0.0).unwrap_or(true);
+        let clicks_zero = r.link_clicks.unwrap_or(0)
+            + r.all_clicks.unwrap_or(0)
+            + r.result_count.unwrap_or(0)
+            == 0;
+        spend_zero && clicks_zero
+    });
+
     Ok(ImportPreview {
         kind: "fb_campaign".into(),
         filename: payload.filename,
@@ -417,5 +468,7 @@ pub fn preview_import_fb_campaigns(
         hash_match,
         existing_day_date: existing_day,
         skipped: 0,
+        empty_rows,
+        mostly_empty,
     })
 }

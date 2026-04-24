@@ -321,6 +321,12 @@ export interface ImportPreview {
   existingDayDate: string | null;
   /** Rows không parse được date (Shopee multi-day only). */
   skipped: number;
+  /** **FB only** — số rows toàn 0 (spend=0 AND clicks=0). 0 cho Shopee. */
+  emptyRows: number;
+  /** **FB only** — true nếu > 50% rows toàn 0. UI cảnh báo "file rỗng,
+   *  import có thể không add value mới — confirm explicit?". SQL UPSERT
+   *  đã có guard không đè value > 0 bằng 0, warning bổ sung observability. */
+  mostlyEmpty: boolean;
   /** File này trùng nội dung với file khác trong CÙNG batch này (FE detect
    *  client-side, tránh commit 2 file giống nhau → UNIQUE constraint fail). */
   batchDuplicate: boolean;
