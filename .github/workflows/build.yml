@@ -9,6 +9,13 @@ on:
 permissions:
   contents: write
 
+# Opt-in Node 24 cho JavaScript actions — GitHub deprecate Node 20 runner
+# từ June 2026. `actions/upload-artifact@v4` internal dùng Node 20 → warning
+# ở mỗi build. Set flag này ở workflow level áp dụng cho mọi job + action.
+# Khi action authors release version chạy native Node 24 thì có thể xóa.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   # Preflight: cargo test + typecheck. Chạy nhanh trên ubuntu, block matrix
   # build nếu có regression. Gate trước khi tốn minutes build 3 platform.
