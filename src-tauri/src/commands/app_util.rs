@@ -264,6 +264,10 @@ pub async fn switch_db_to_user(
         *slot = new_conn;
     }
 
+    // 7b. Invalidate sync_v9 manifest cache — cache cũ của user khác hoặc
+    // session trước, không valid cho user mới. Tránh leak hoặc CAS sai.
+    crate::sync_v9::manifest_cache::cache_invalidate();
+
     // 8. Swap video DB (v8+ multi-tenant video logs per-user).
     let user_video_db_path = crate::db::video_db::resolve_video_db_path_for_user(&app, &new_uid)
         .map_err(|e| CmdError::msg(e.to_string()))?;

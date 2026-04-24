@@ -1182,6 +1182,164 @@ fn restore_idempotent_when_called_twice() {
     assert!(!state.fresh_install_pending);
 }
 
+// =============================================================
+// Manifest cache (PUT-first CAS optimization)
+// =============================================================
+
+/// Cache invalidate trước test để cross-test không leak state qua static.
+fn cache_reset() {
+    crate::sync_v9::manifest_cache::cache_invalidate();
+}
+
+/// Cache empty → push CAS phải GET fresh (không skip). Test ở mức state
+/// transition — verify cache_get returns None before, has data after put.
+#[test]
+fn cache_starts_empty_then_populated_after_put() {
+    use crate::sync_v9::manifest_cache::{cache_get, cache_put, TEST_LOCK};
+    use crate::sync_v9::types::Manifest;
+    let _g = TEST_LOCK.lock().unwrap();
+    cache_reset();
+
+    assert!(cache_get().is_none(), "cache fresh = empty");
+
+    let m = Manifest::empty("uid-test".to_string());
+    cache_put(m.clone(), "etag-A".to_string());
+
+    let got = cache_get();
+    assert!(got.is_some());
+    let (got_m, got_etag) = got.unwrap();
+    assert_eq!(got_etag, "etag-A");
+    assert_eq!(got_m.uid, "uid-test");
+    cache_reset();
+}
+
+/// Pull cache full body → push tiếp theo có data đầy đủ để PUT (không phải
+/// build từ scratch). Verify roundtrip: append entries vào cached → cache
+/// updated reflect mới.
+#[test]
+fn cache_supports_append_workflow() {
+    use crate::sync_v9::manifest::append_delta_entries;
+    use crate::sync_v9::manifest_cache::{cache_get, cache_put, TEST_LOCK};
+    use crate::sync_v9::types::{Manifest, ManifestDeltaEntry};
+    let _g = TEST_LOCK.lock().unwrap();
+    cache_reset();
+
+    // Pull cache: manifest với 1 delta đã có.
+    let mut original = Manifest::empty("uid-x".to_string());
+    append_delta_entries(
+        &mut original,
+        vec![ManifestDeltaEntry {
+            table: "raw_shopee_clicks".to_string(),
+            key: "deltas/old.ndjson.zst".to_string(),
+            cursor_lo: "0".to_string(),
+            cursor_hi: "100".to_string(),
+            clock_ms: 1000,
+            size_bytes: 500,
+            row_count: 10,
+        }],
+    );
+    cache_put(original.clone(), "etag-pull".to_string());
+
+    // Push CAS dùng cached: append 1 entry mới.
+    let (mut working, etag) = cache_get().unwrap();
+    assert_eq!(etag, "etag-pull");
+    assert_eq!(working.deltas.len(), 1);
+    append_delta_entries(
+        &mut working,
+        vec![ManifestDeltaEntry {
+            table: "manual_entries".to_string(),
+            key: "deltas/new.ndjson.zst".to_string(),
+            cursor_lo: "100".to_string(),
+            cursor_hi: "200".to_string(),
+            clock_ms: 2000,
+            size_bytes: 300,
+            row_count: 5,
+        }],
+    );
+    assert_eq!(working.deltas.len(), 2, "append vào cached body OK");
+
+    // Push thành công → update cache với manifest mới + etag mới.
+    cache_put(working, "etag-after-put".to_string());
+
+    let (final_m, final_etag) = cache_get().unwrap();
+    assert_eq!(final_etag, "etag-after-put", "cache update etag mới");
+    assert_eq!(final_m.deltas.len(), 2, "cache giữ both deltas");
+    cache_reset();
+}
+
+/// Conflict 412 → invalidate cache → next read returns None → fallback GET.
+#[test]
+fn cache_invalidate_on_conflict_falls_back_to_get() {
+    use crate::sync_v9::manifest_cache::{cache_get, cache_invalidate, cache_put, TEST_LOCK};
+    use crate::sync_v9::types::Manifest;
+    let _g = TEST_LOCK.lock().unwrap();
+    cache_reset();
+
+    cache_put(Manifest::empty("u".to_string()), "stale-etag".to_string());
+    assert!(cache_get().is_some());
+
+    // Simulate 412 conflict handler → invalidate.
+    cache_invalidate();
+    assert!(
+        cache_get().is_none(),
+        "post-conflict cache empty → caller phải GET fresh"
+    );
+    cache_reset();
+}
+
+/// Sequence push 1 → push 2 dùng cùng cached state — verify cache đủ
+/// support multi-push streak (mỗi push tích lũy 1 entry, cache update).
+#[test]
+fn cache_supports_consecutive_push_streak() {
+    use crate::sync_v9::manifest::append_delta_entries;
+    use crate::sync_v9::manifest_cache::{cache_get, cache_put, TEST_LOCK};
+    use crate::sync_v9::types::{Manifest, ManifestDeltaEntry};
+    let _g = TEST_LOCK.lock().unwrap();
+    cache_reset();
+
+    let initial = Manifest::empty("u-streak".to_string());
+    cache_put(initial, "e0".to_string());
+
+    // Push 1
+    let (mut m1, _) = cache_get().unwrap();
+    append_delta_entries(
+        &mut m1,
+        vec![ManifestDeltaEntry {
+            table: "tombstones".to_string(),
+            key: "k1".to_string(),
+            cursor_lo: "0".to_string(),
+            cursor_hi: "1".to_string(),
+            clock_ms: 100,
+            size_bytes: 10,
+            row_count: 1,
+        }],
+    );
+    cache_put(m1, "e1".to_string());
+
+    // Push 2 (consecutive — không cần GET, dùng cached e1)
+    let (mut m2, etag2) = cache_get().unwrap();
+    assert_eq!(etag2, "e1");
+    assert_eq!(m2.deltas.len(), 1, "deltas từ push 1 còn trong cache");
+    append_delta_entries(
+        &mut m2,
+        vec![ManifestDeltaEntry {
+            table: "shopee_accounts".to_string(),
+            key: "k2".to_string(),
+            cursor_lo: "0".to_string(),
+            cursor_hi: "1".to_string(),
+            clock_ms: 200,
+            size_bytes: 20,
+            row_count: 1,
+        }],
+    );
+    cache_put(m2, "e2".to_string());
+
+    let (final_m, final_etag) = cache_get().unwrap();
+    assert_eq!(final_etag, "e2");
+    assert_eq!(final_m.deltas.len(), 2, "streak tích lũy đủ 2 entries");
+    cache_reset();
+}
+
 /// Restore overwrites local state: local có data "cũ" + schema khác → sau
 /// restore local reflect EXACTLY snapshot content (không merge).
 #[test]

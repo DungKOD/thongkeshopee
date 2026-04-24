@@ -117,7 +117,11 @@ const RETRY_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000];
 /// Tăng từ 5 phút → 30 phút vì push notifications cover phần lớn case.
 /// 30 phút x 100 user x 24h = ~144k req/tháng (free tier R2 Class B
 /// không tốn trong 1M đầu). Zero request khi user chỉ có 1 máy online.
-const AUTO_SYNC_INTERVAL_MS = 30 * 60 * 1000;
+/// 2h: RTDB notify đã là primary path realtime → tick chỉ là safety net khi
+/// RTDB lỡ event (rare). Tăng từ 30min → 2h tiết kiệm ~36 GET manifest/day/
+/// máy. Worst case lỡ tick: user thấy data máy khác chậm 2h (chỉ khi RTDB
+/// fail hoàn toàn, normally < 1s qua notify).
+const AUTO_SYNC_INTERVAL_MS = 2 * 60 * 60 * 1000;
 /// Force sync throttle cơ bản (spam click protection).
 const FORCE_SYNC_MIN_GAP_MS = 2_000;
 

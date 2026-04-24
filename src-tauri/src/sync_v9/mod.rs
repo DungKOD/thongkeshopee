@@ -26,6 +26,7 @@ pub mod descriptors;
 pub mod event_log;
 pub mod hlc;
 pub mod manifest;
+pub mod manifest_cache;
 pub mod pull;
 pub mod push;
 pub mod snapshot;

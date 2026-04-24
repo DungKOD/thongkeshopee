@@ -232,6 +232,31 @@ async fn cas_append_manifest_retry(
         .unwrap_or_default()
     };
 
+    // Optimistic attempt 0: dùng cached manifest+etag từ pull/push trước.
+    // Skip GET → tiết kiệm 1 Class B op mỗi push khi cache valid (~50/day/máy).
+    // Conflict 412 → invalidate cache, fallthrough vào loop GET-fresh.
+    if let Some((mut cached_m, cached_etag)) = crate::sync_v9::manifest_cache::cache_get() {
+        manifest::append_delta_entries(&mut cached_m, new_entries.to_vec());
+        manifest::bump_updated_at(&mut cached_m, clock_ms);
+        match client::put_manifest(base_url, id_token, &cached_m, Some(&cached_etag)).await {
+            Ok(new_etag) => {
+                let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+                manifest::set_etag(&conn, &new_etag)
+                    .map_err(|e| CmdError::msg(e.to_string()))?;
+                // Update cache với manifest mới + etag mới — push kế tiếp
+                // tiếp tục skip GET nếu trong TTL.
+                crate::sync_v9::manifest_cache::cache_put(cached_m, new_etag);
+                return Ok(0);
+            }
+            Err(e) if e.to_string().starts_with(client::CAS_CONFLICT) => {
+                // Cache stale (máy khác push xen) — invalidate + fallthrough loop.
+                crate::sync_v9::manifest_cache::cache_invalidate();
+                retries += 1;
+            }
+            Err(e) => return Err(CmdError::msg(format!("put_manifest (cached): {e}"))),
+        }
+    }
+
     for attempt in 0..=CAS_MAX_RETRY {
         let fetched = client::get_manifest(base_url, id_token)
             .await
@@ -245,6 +270,8 @@ async fn cas_append_manifest_retry(
             Ok(new_etag) => {
                 let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
                 manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(e.to_string()))?;
+                // Update cache cho push kế tiếp.
+                crate::sync_v9::manifest_cache::cache_put(manifest, new_etag);
                 return Ok(retries);
             }
             Err(e) if e.to_string().starts_with(client::CAS_CONFLICT) => {
@@ -354,7 +381,9 @@ pub fn apply_snapshot_bytes(
 
     // 5. Seed cursor + complete bootstrap + emit events trên connection MỚI
     //    (post-swap DB). Events pre-swap đã bị overwrite, phải log ở đây để
-    //    user thấy trong sync log.
+    //    user thấy trong sync log. Đồng thời invalidate manifest cache —
+    //    snapshot restore thay đổi state triệt để, cache cũ stale.
+    crate::sync_v9::manifest_cache::cache_invalidate();
     {
         let conn = db_mutex.lock().map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
         bootstrap::seed_cursor_after_restore(&conn, snap.clock_ms)?;
@@ -414,9 +443,16 @@ pub async fn sync_v9_pull_all(
         .await
         .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
     let Some(mut manifest) = fetched.manifest else {
-        // No manifest — không có gì để pull.
+        // No manifest — không có gì để pull. Vẫn invalidate cache (manifest
+        // cũ trên cache có thể stale nếu R2 vừa bị wipe).
+        crate::sync_v9::manifest_cache::cache_invalidate();
         return Ok(PullReport::default());
     };
+
+    // Cache manifest body + etag → push tiếp theo skip GET (CAS optimistic).
+    if let Some(etag) = &fetched.etag {
+        crate::sync_v9::manifest_cache::cache_put(manifest.clone(), etag.clone());
+    }
 
     // 2. Stale-local detection: nếu local clock đi sau snapshot clock của
     // remote → delta giữa [local_clock, snapshot_clock] đã compact khỏi
@@ -676,9 +712,13 @@ async fn cas_put_full_manifest_retry(
             Ok(new_etag) => {
                 let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
                 manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(e.to_string()))?;
+                // Compaction = full replace → cache với manifest mới + etag mới.
+                crate::sync_v9::manifest_cache::cache_put(new_manifest.clone(), new_etag);
                 return Ok(retries);
             }
             Err(e) if e.to_string().starts_with(client::CAS_CONFLICT) => {
+                // Cache stale do conflict → invalidate.
+                crate::sync_v9::manifest_cache::cache_invalidate();
                 retries += 1;
                 if attempt >= CAS_MAX_RETRY {
                     return Err(CmdError::msg(format!(
