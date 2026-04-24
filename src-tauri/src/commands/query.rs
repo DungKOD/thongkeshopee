@@ -77,9 +77,24 @@ impl Default for AccountFilterMode {
     }
 }
 
-/// ID được reserve cho account "Mặc định" — catch-all bucket cho sub_id chưa
-/// gán explicit account nào. Seed trong migration (db/mod.rs).
-const DEFAULT_ACCOUNT_ID: i64 = 1;
+/// Tên reserved cho account "Mặc định" — catch-all bucket cho sub_id chưa
+/// gán explicit account nào. Sau v13 migration id = content_id hash (không
+/// còn = 1), nên lookup theo name mỗi query.
+const DEFAULT_ACCOUNT_NAME: &str = "Mặc định";
+
+/// Lookup id account "Mặc định" từ DB. Cache 1 lần per query. Return None
+/// nếu account không tồn tại (lỗi setup DB — không nên xảy ra vì seed migration).
+fn default_account_id_lookup(conn: &rusqlite::Connection) -> Option<i64> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT id FROM shopee_accounts WHERE name = ?",
+        [DEFAULT_ACCOUNT_NAME],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
 
 #[tauri::command]
 pub fn list_days_with_rows(
@@ -529,15 +544,18 @@ fn aggregate_rows_for_day(
 
     // Filter FB ads theo account mode dùng prefix matching qua resolve.
     // - All: giữ hết
-    // - Account(X) X != 1: giữ nếu owners[resolve(fb)] chứa X
-    // - Account(1) Mặc định: giữ nếu no owner HOẶC owner chứa 1 (catch-all)
+    // - Account(X) X != Mặc định: giữ nếu owners[resolve(fb)] chứa X
+    // - Account(Mặc định): giữ nếu no owner HOẶC owner chứa id Mặc định (catch-all)
+    //
+    // Lookup Mặc định id 1 lần per query (sau v13 không còn = 1).
+    let default_id = default_account_id_lookup(conn);
     fb_ads.retain(|ad| {
         let rep = resolve(&ad.canonical);
         let owners = owners_for_day.get(&rep);
         match account_filter {
             AccountFilterMode::All => true,
             AccountFilterMode::Account { id } => {
-                if *id == DEFAULT_ACCOUNT_ID {
+                if Some(*id) == default_id {
                     match owners {
                         None => true,
                         Some(set) => set.is_empty() || set.contains(id),

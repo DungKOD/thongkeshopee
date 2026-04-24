@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { useAccounts, DEFAULT_ACCOUNT_ID } from "../contexts/AccountContext";
+import {
+  useAccounts,
+  isDefaultAccount,
+} from "../contexts/AccountContext";
 import { createShopeeAccount } from "../lib/accounts";
 
 interface ImportAccountPickerDialogProps {
@@ -18,7 +21,8 @@ export function ImportAccountPickerDialog({
   onPick,
   onClose,
 }: ImportAccountPickerDialogProps) {
-  const { accounts, activeAccountId, refresh } = useAccounts();
+  const { accounts, activeAccountId, defaultAccountId, refresh } =
+    useAccounts();
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
@@ -27,19 +31,19 @@ export function ImportAccountPickerDialog({
 
   // Filter Mặc định ra — user không được chọn account này (reserved cho orphan).
   const pickableAccounts = useMemo(
-    () => (accounts ?? []).filter((a) => a.id !== DEFAULT_ACCOUNT_ID),
+    () => (accounts ?? []).filter((a) => !isDefaultAccount(a)),
     [accounts],
   );
 
   // Default selection: activeAccountId (nếu non-default) → hoặc account đầu
   // tiên trong list pickable → hoặc null (user phải tạo mới).
   const defaultId = useMemo(() => {
-    if (activeAccountId !== null && activeAccountId !== DEFAULT_ACCOUNT_ID) {
+    if (activeAccountId !== null && activeAccountId !== defaultAccountId) {
       return activeAccountId;
     }
     if (pickableAccounts.length > 0) return pickableAccounts[0].id;
     return null;
-  }, [activeAccountId, pickableAccounts]);
+  }, [activeAccountId, defaultAccountId, pickableAccounts]);
 
   useEffect(() => {
     if (!isOpen) return;

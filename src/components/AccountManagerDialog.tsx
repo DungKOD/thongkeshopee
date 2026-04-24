@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { useAccounts, DEFAULT_ACCOUNT_ID } from "../contexts/AccountContext";
+import { useAccounts, isDefaultAccount } from "../contexts/AccountContext";
 import {
   countFbLinkedToAccount,
   createShopeeAccount,
@@ -208,7 +208,7 @@ export function AccountManagerDialog({
           <ul className="space-y-1.5">
             {(accounts ?? []).map((a) => {
               const isEditing = editingId === a.id;
-              const isDefault = a.id === DEFAULT_ACCOUNT_ID;
+              const isDefault = isDefaultAccount(a);
               return (
                 <li
                   key={a.id}

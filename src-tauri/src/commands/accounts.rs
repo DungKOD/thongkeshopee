@@ -17,9 +17,23 @@ use super::query::{is_prefix, to_canonical, Canonical};
 use super::{CmdError, CmdResult};
 use crate::db::DbState;
 
-/// Reserved — account "Mặc định" catch-all cho sub_id chưa gán TK. Không cho
-/// rename/delete; migration seed id=1 ở `db::mod::migrate_shopee_accounts`.
-const DEFAULT_ACCOUNT_ID: i64 = 1;
+/// Tên reserved cho account "Mặc định" — catch-all cho sub_id chưa gán TK.
+/// Sau v13 migration id là content_id hash (không còn = 1), nên check bằng
+/// NAME thay vì ID. Migration seed ở `db::mod::migrate_shopee_accounts`.
+const DEFAULT_ACCOUNT_NAME: &str = "Mặc định";
+
+/// Check account có phải là "Mặc định" không (lookup theo id).
+fn is_default_account(conn: &rusqlite::Connection, id: i64) -> CmdResult<bool> {
+    use rusqlite::OptionalExtension;
+    let name: Option<String> = conn
+        .query_row(
+            "SELECT name FROM shopee_accounts WHERE id = ?",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(name.as_deref() == Some(DEFAULT_ACCOUNT_NAME))
+}
 
 /// 1 account Shopee affiliate trong DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,11 +121,13 @@ pub fn rename_shopee_account(
     id: i64,
     new_name: String,
 ) -> CmdResult<()> {
-    if id == DEFAULT_ACCOUNT_ID {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    if is_default_account(&conn, id)? {
         return Err(CmdError::msg(
             "TK hệ thống 'Mặc định' không thể đổi tên",
         ));
     }
+    drop(conn); // release lock, reacquire below
     let trimmed = new_name.trim().to_string();
     if trimmed.is_empty() {
         return Err(CmdError::msg("Tên account không được để trống"));
@@ -251,12 +267,12 @@ pub fn delete_shopee_account(
     id: i64,
     also_delete_fb: Option<bool>,
 ) -> CmdResult<()> {
-    if id == DEFAULT_ACCOUNT_ID {
-        return Err(CmdError::msg("TK hệ thống 'Mặc định' không thể xóa"));
-    }
     let also_delete_fb = also_delete_fb.unwrap_or(false);
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    if is_default_account(&conn, id)? {
+        return Err(CmdError::msg("TK hệ thống 'Mặc định' không thể xóa"));
+    }
 
     // Pre-compute FB ads cần xóa TRƯỚC khi DELETE Shopee rows (sau DELETE thì
     // shop_target rỗng → không match được). Collect list (day, tuple) để
@@ -380,12 +396,12 @@ pub fn reassign_shopee_account_data(
     if from_id == to_id {
         return Err(CmdError::msg("from_id và to_id phải khác nhau"));
     }
-    if to_id == DEFAULT_ACCOUNT_ID {
+    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    if is_default_account(&conn, to_id)? {
         return Err(CmdError::msg(
             "Không thể chuyển data về TK 'Mặc định' — chọn TK thật",
         ));
     }
-    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Validate cả 2 account tồn tại.
     let to_exists: bool = conn
         .query_row(
