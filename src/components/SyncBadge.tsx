@@ -56,8 +56,8 @@ function getDisplay(
       };
     case "dirty":
       return {
-        icon: "pending",
-        label: "Chờ đồng bộ R2",
+        icon: "sync",
+        label: "Chờ đồng bộ...",
         color: "text-amber-300",
       };
     case "error":
@@ -113,34 +113,80 @@ export function SyncBadge({
     status === "error" ||
     (status === "idle" && hasRemoteChangePending);
 
-  // Dirty/error → highlight container (ring + subtle pulse) để user thấy
-  // rõ DB chưa sync, khuyến khích click "Sync ngay" hoặc đợi auto.
-  const needsAttention = status === "dirty" || status === "error";
+  // Dirty → highlight animation (breathing + ring) để user biết có data
+  // chờ sync. Error → red ring, attention-grabbing. Idle + remote pending →
+  // subtle blue pulse để user biết có thay đổi từ máy khác.
+  const isDirty = status === "dirty";
+  const isError = status === "error";
+  const hasRemote = status === "idle" && hasRemoteChangePending;
+
+  let containerCls: string;
+  if (isDirty) {
+    // Amber breathing: gradient shimmer + ring pulse + icon rotate slow.
+    containerCls =
+      "bg-gradient-to-r from-amber-500/15 via-amber-400/25 to-amber-500/15 ring-1 ring-amber-400/60 animate-pulse hover:bg-amber-500/30 hover:ring-amber-400";
+  } else if (isError) {
+    containerCls =
+      "bg-red-500/20 ring-1 ring-red-400/70 animate-pulse hover:bg-red-500/30";
+  } else if (hasRemote) {
+    containerCls =
+      "bg-blue-500/10 ring-1 ring-blue-400/50 animate-pulse hover:bg-blue-500/20";
+  } else {
+    containerCls = "hover:bg-white/10";
+  }
 
   return (
     <div className="relative">
       <button
         type="button"
         onClick={() => setShowMenu((v) => !v)}
-        className={`btn-ripple flex max-w-[180px] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-white transition-all ${
-          needsAttention
-            ? "bg-amber-500/15 ring-1 ring-amber-400/60 animate-pulse hover:bg-amber-500/25 hover:ring-amber-400"
-            : "hover:bg-white/10"
-        }`}
+        className={`btn-ripple relative flex max-w-[200px] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-white transition-all ${containerCls}`}
         title={
           error ??
-          (lastSyncAt ? `Sync lần cuối: ${lastSyncAt.toLocaleString("vi-VN")}` : "")
+          (isDirty
+            ? "Có thay đổi local — sẽ tự đồng bộ sau 45s (reset khi có thao tác mới)"
+            : hasRemote
+              ? "Máy khác vừa cập nhật dữ liệu — click để pull về"
+              : lastSyncAt
+                ? `Sync lần cuối: ${lastSyncAt.toLocaleString("vi-VN")}`
+                : "")
         }
       >
+        {/* Pulsing dot indicator ở góc trên-phải cho dirty/error/hasRemote */}
+        {(isDirty || isError || hasRemote) && (
+          <span
+            className={`absolute -right-0.5 -top-0.5 flex h-2 w-2 ${
+              isError ? "" : ""
+            }`}
+          >
+            <span
+              className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${
+                isError
+                  ? "bg-red-400"
+                  : isDirty
+                    ? "bg-amber-400"
+                    : "bg-blue-400"
+              }`}
+            />
+            <span
+              className={`relative inline-flex h-2 w-2 rounded-full ${
+                isError
+                  ? "bg-red-500"
+                  : isDirty
+                    ? "bg-amber-500"
+                    : "bg-blue-500"
+              }`}
+            />
+          </span>
+        )}
         <span
-          className={`material-symbols-rounded text-base ${display.color} ${display.spin ? "animate-spin" : ""}`}
+          className={`material-symbols-rounded text-base ${display.color} ${
+            display.spin ? "animate-spin" : isDirty ? "animate-spin-slow" : ""
+          }`}
         >
           {display.icon}
         </span>
-        <span
-          className={`truncate ${display.color}`}
-          title={display.label}
-        >
+        <span className={`truncate ${display.color}`} title={display.label}>
           {display.label}
         </span>
       </button>

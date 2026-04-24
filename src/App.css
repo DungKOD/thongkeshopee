@@ -101,6 +101,18 @@ html:not(.fonts-loaded) .material-symbols-rounded {
   will-change: transform;
 }
 
+/* Slow spin cho icon "chờ đồng bộ" — subtle hơn animate-spin mặc định
+   (Tailwind default 1s/rotation). Dùng ở SyncBadge status=dirty để user
+   thấy app đang "chuẩn bị" mà không quá nhấp nháy. */
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.animate-spin-slow {
+  animation: spin-slow 3s linear infinite;
+  will-change: transform;
+}
+
 /* Indeterminate progress bar — thanh chạy qua-lại khi không biết % */
 @keyframes progress-indeterminate {
   0% { transform: translateX(-100%); }
