@@ -172,7 +172,7 @@ pub async fn sync_v9_push_all(
     // 3. Upload 1 bundle file (no lock).
     client::upload_delta(&base_url, &id_token, &bundle.r2_key, &bundle.bytes)
         .await
-        .map_err(|e| CmdError::msg(format!("upload_delta bundle: {e}")))?;
+        .map_err(|e| CmdError::msg(format!("upload_delta bundle: {e:#}")))?;
 
     // 4. Advance cursor + build manifest entries per-table (idempotent retry safe).
     let mut new_entries: Vec<ManifestDeltaEntry> = Vec::new();
@@ -253,14 +253,14 @@ async fn cas_append_manifest_retry(
                 crate::sync_v9::manifest_cache::cache_invalidate();
                 retries += 1;
             }
-            Err(e) => return Err(CmdError::msg(format!("put_manifest (cached): {e}"))),
+            Err(e) => return Err(CmdError::msg(format!("put_manifest (cached): {e:#}"))),
         }
     }
 
     for attempt in 0..=CAS_MAX_RETRY {
         let fetched = client::get_manifest(base_url, id_token)
             .await
-            .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
+            .map_err(|e| CmdError::msg(format!("get_manifest: {e:#}")))?;
 
         let mut manifest = fetched.manifest.unwrap_or_else(|| Manifest::empty(uid.clone()));
         manifest::append_delta_entries(&mut manifest, new_entries.to_vec());
@@ -283,7 +283,7 @@ async fn cas_append_manifest_retry(
                 }
                 continue;
             }
-            Err(e) => return Err(CmdError::msg(format!("put_manifest: {e}"))),
+            Err(e) => return Err(CmdError::msg(format!("put_manifest: {e:#}"))),
         }
     }
     Ok(retries)
@@ -392,13 +392,13 @@ pub fn apply_snapshot_bytes(
         // atomic. Cover cả 2 case.
         if live_path.exists() {
             std::fs::remove_file(&live_path)
-                .map_err(|e| anyhow::anyhow!("remove old live DB: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("remove old live DB: {e:#}"))?;
         }
         std::fs::rename(&pending_path, &live_path)
-            .map_err(|e| anyhow::anyhow!("rename pending → live: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("rename pending → live: {e:#}"))?;
 
         *slot = crate::db::init_db_at(&live_path)
-            .map_err(|e| anyhow::anyhow!("init_db_at post-swap: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("init_db_at post-swap: {e:#}"))?;
     }
 
     // 5. Seed cursor + complete bootstrap + emit events trên connection MỚI
@@ -464,7 +464,7 @@ pub async fn sync_v9_pull_all(
     // 1. Fetch manifest.
     let fetched = client::get_manifest(&base_url, &id_token)
         .await
-        .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
+        .map_err(|e| CmdError::msg(format!("get_manifest: {e:#}")))?;
     let Some(mut manifest) = fetched.manifest else {
         // No manifest — không có gì để pull. Vẫn invalidate cache (manifest
         // cũ trên cache có thể stale nếu R2 vừa bị wipe).
@@ -494,14 +494,14 @@ pub async fn sync_v9_pull_all(
     if let Some(snap_ref) = restore_snapshot {
         perform_snapshot_restore(&app, &db, &base_url, &id_token, &snap_ref)
             .await
-            .map_err(|e| CmdError::msg(format!("snapshot restore: {e}")))?;
+            .map_err(|e| CmdError::msg(format!("snapshot restore: {e:#}")))?;
 
         // State đã reset sau restore — refetch manifest để pull đúng delta
         // SAU snapshot_clock mới (thay vì manifest cũ có thể đã outdated
         // trong thời gian fetch+restore chạy, nếu máy khác vừa push).
         let refetched = client::get_manifest(&base_url, &id_token)
             .await
-            .map_err(|e| CmdError::msg(format!("get_manifest post-restore: {e}")))?;
+            .map_err(|e| CmdError::msg(format!("get_manifest post-restore: {e:#}")))?;
         manifest = match refetched.manifest {
             Some(m) => m,
             None => return Ok(PullReport::default()),
@@ -551,10 +551,10 @@ pub async fn sync_v9_pull_all(
     for (key, entries) in &keys_sorted {
         let bytes = client::fetch_delta(&base_url, &id_token, key)
             .await
-            .map_err(|e| CmdError::msg(format!("fetch_delta {}: {e}", key)))?;
+            .map_err(|e| CmdError::msg(format!("fetch_delta {}: {e:#}", key)))?;
         report.total_bytes += bytes.len() as u64;
         let events = pull::parse_delta_file(&bytes)
-            .map_err(|e| CmdError::msg(format!("parse {}: {e}", key)))?;
+            .map_err(|e| CmdError::msg(format!("parse {}: {e:#}", key)))?;
         let max_clock = pull::max_event_clock_ms(&events);
 
         // Apply trong TX (lock held qua apply — tiny vs network).
@@ -667,7 +667,7 @@ pub async fn sync_v9_compact_if_needed(
         None => {
             let fetched = client::get_manifest(&base_url, &id_token)
                 .await
-                .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
+                .map_err(|e| CmdError::msg(format!("get_manifest: {e:#}")))?;
             match fetched.manifest {
                 Some(m) => {
                     if let Some(etag) = fetched.etag.clone() {
@@ -699,7 +699,7 @@ pub async fn sync_v9_compact_if_needed(
         let temp_dir = std::env::temp_dir().join("thongkeshopee_v9_snapshot");
         let (art, mut new_m, res) =
             compaction::prepare_compaction(&conn, &manifest, &temp_dir, clock, &uid)
-                .map_err(|e| CmdError::msg(format!("prepare_compaction: {e}")))?;
+                .map_err(|e| CmdError::msg(format!("prepare_compaction: {e:#}")))?;
         new_m.uid = uid; // preserve
         (art, new_m, res, clock)
     };
@@ -707,7 +707,7 @@ pub async fn sync_v9_compact_if_needed(
     // 3. Upload snapshot lên R2 (long-running).
     client::upload_snapshot(&base_url, &id_token, &artifact.suggested_r2_key, &artifact.bytes)
         .await
-        .map_err(|e| CmdError::msg(format!("upload_snapshot: {e}")))?;
+        .map_err(|e| CmdError::msg(format!("upload_snapshot: {e:#}")))?;
 
     // 4. CAS put manifest — retry max 3 (theo pattern push_all).
     let cas_retries =
@@ -774,7 +774,7 @@ async fn cas_put_full_manifest_retry(
                 // phải giữ). Reload + re-merge remote deltas.
                 let fetched = client::get_manifest(base_url, id_token)
                     .await
-                    .map_err(|e| CmdError::msg(format!("get_manifest retry: {e}")))?;
+                    .map_err(|e| CmdError::msg(format!("get_manifest retry: {e:#}")))?;
                 expected_etag = fetched.etag;
                 // Nếu remote có delta mới → đưa lại vào manifest mới sau snapshot
                 // (những delta này có clock_ms > snapshot.clock_ms).
@@ -796,7 +796,7 @@ async fn cas_put_full_manifest_retry(
                 }
                 continue;
             }
-            Err(e) => return Err(CmdError::msg(format!("put_manifest compaction: {e}"))),
+            Err(e) => return Err(CmdError::msg(format!("put_manifest compaction: {e:#}"))),
         }
     }
     Ok(retries)
@@ -841,10 +841,10 @@ pub async fn sync_v9_log_flush(
             ndjson.push(b'\n');
         }
         let compressed = compress::zstd_compress(&ndjson)
-            .map_err(|e| CmdError::msg(format!("zstd log: {e}")))?;
+            .map_err(|e| CmdError::msg(format!("zstd log: {e:#}")))?;
         client::push_sync_log(&base_url, &id_token, date, &compressed)
             .await
-            .map_err(|e| CmdError::msg(format!("push_sync_log: {e}")))?;
+            .map_err(|e| CmdError::msg(format!("push_sync_log: {e:#}")))?;
         for ev in evs {
             uploaded_ids.push(ev.event_id);
         }
@@ -933,7 +933,7 @@ pub async fn admin_v9_sync_log_list(
         &to_date,
     )
     .await
-    .map_err(|e| CmdError::msg(format!("admin_v9_sync_log_list: {e}")))?;
+    .map_err(|e| CmdError::msg(format!("admin_v9_sync_log_list: {e:#}")))?;
 
     Ok(AdminSyncLogListDto {
         files: list.files,
@@ -951,10 +951,10 @@ pub async fn admin_v9_sync_log_fetch_events(
 ) -> CmdResult<Vec<AdminSyncLogEvent>> {
     let zst_bytes = client::admin_fetch_sync_log_file(&base_url, &id_token, &key)
         .await
-        .map_err(|e| CmdError::msg(format!("admin_v9_sync_log_fetch_events: {e}")))?;
+        .map_err(|e| CmdError::msg(format!("admin_v9_sync_log_fetch_events: {e:#}")))?;
 
     let ndjson = compress::zstd_decompress(&zst_bytes)
-        .map_err(|e| CmdError::msg(format!("zstd decompress log: {e}")))?;
+        .map_err(|e| CmdError::msg(format!("zstd decompress log: {e:#}")))?;
 
     let mut events = Vec::new();
     for (idx, line) in ndjson.split(|b| *b == b'\n').enumerate() {
@@ -962,7 +962,7 @@ pub async fn admin_v9_sync_log_fetch_events(
             continue;
         }
         let value: serde_json::Value = serde_json::from_slice(line)
-            .map_err(|e| CmdError::msg(format!("parse NDJSON line {idx}: {e}")))?;
+            .map_err(|e| CmdError::msg(format!("parse NDJSON line {idx}: {e:#}")))?;
         events.push(parse_log_event(value));
     }
     Ok(events)

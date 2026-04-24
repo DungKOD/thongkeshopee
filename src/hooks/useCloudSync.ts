@@ -726,10 +726,10 @@ export function useCloudSync({
       fp,
       ({ fingerprint, initial }) => {
         if (initial) {
-          console.log("[sync] RTDB baseline:", fingerprint);
+          if (import.meta.env.DEV) console.log("[sync] RTDB baseline:", fingerprint);
           return;
         }
-        console.log("[sync] RTDB remote push detected:", fingerprint);
+        if (import.meta.env.DEV) console.log("[sync] RTDB remote push detected:", fingerprint);
         // Mark flag để UI enable nút sync. Nếu app đang idle + online, tự
         // chạy doSync luôn (pull về ngay). pausedByForm → giữ flag đợi
         // resume. Syncing → doSync re-entry guard tự skip.

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { fmtBytes } from "../formulas";
 
 /// Pretty-print 1 sync event với layout card thân thiện thay cho raw JSON.
 /// Dùng chung cho MySyncLogDialog (local events) và SyncLogViewerDialog
@@ -155,12 +156,6 @@ function kindVisual(kind: string): KindVisual {
   }
 }
 
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
 
 function fmtCount(n: number): string {
   return n.toLocaleString("vi-VN");

@@ -11,7 +11,7 @@
 //! giữ live DB cũ. Crash giữa download → pending partial → next start detect
 //! qua integrity_check, reject + delete.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -225,20 +225,6 @@ fn verify_has_sync_state(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Đọc `owner_uid` từ snapshot file. Caller dùng để verify multi-tenant
-/// match trước khi swap (rule A5: không restore DB user khác vào folder
-/// user hiện tại).
-pub fn read_snapshot_owner_uid(db_path: &Path) -> Result<Option<String>> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open for owner check: {}", db_path.display()))?;
-    conn.query_row(
-        "SELECT owner_uid FROM sync_state WHERE id = 1",
-        [],
-        |r| r.get(0),
-    )
-    .context("read owner_uid")
-}
-
 // =============================================================
 // Tests
 // =============================================================
@@ -247,7 +233,6 @@ pub fn read_snapshot_owner_uid(db_path: &Path) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::db::migrate_for_tests;
-    use rusqlite::params;
 
     fn make_test_db() -> (tempfile::TempDir, PathBuf, Connection) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -356,19 +341,6 @@ mod tests {
     fn verify_integrity_passes_for_valid_db() {
         let (_dir, db_path, _conn) = make_test_db();
         verify_integrity(&db_path).unwrap();
-    }
-
-    #[test]
-    fn read_snapshot_owner_uid_returns_set_value() {
-        let (dir, db_path, conn) = make_test_db();
-        conn.execute(
-            "UPDATE sync_state SET owner_uid = ? WHERE id = 1",
-            params!["test_uid_abc"],
-        )
-        .unwrap();
-        drop(conn);
-        let uid = read_snapshot_owner_uid(&db_path).unwrap();
-        assert_eq!(uid.as_deref(), Some("test_uid_abc"));
     }
 
     #[test]

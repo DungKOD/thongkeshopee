@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { LastSyncStats, SyncStatus } from "../hooks/useCloudSync";
 import { MySyncLogDialog } from "./MySyncLogDialog";
+import { fmtBytes } from "../formulas";
 
 interface SyncBadgeProps {
   status: SyncStatus;
@@ -11,14 +12,6 @@ interface SyncBadgeProps {
   hasRemoteChangePending: boolean;
   error: string | null;
   onForce: () => Promise<void>;
-}
-
-function fmtBytes(n: number): string {
-  if (n === 0) return "0 B";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 interface Display {
