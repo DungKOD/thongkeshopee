@@ -110,8 +110,6 @@ interface UseCloudSyncOptions {
 const DEBOUNCE_MS = 45_000;
 const COUNT_THRESHOLD = 100;
 const MAX_WAIT_MS = 300_000;
-const IDLE_MS = 30_000;
-const IDLE_CHECK_MS = 5_000;
 // Exponential backoff: 30s, 60s, 120s, 300s (cap 5min).
 const RETRY_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000];
 /// Fallback auto-sync tick — **safety net** khi Firebase RTDB không kết nối
@@ -135,8 +133,6 @@ function backoffFor(attempt: number): number {
   return RETRY_BACKOFF_MS[idx];
 }
 
-const ACTIVITY_EVENTS = ["mousedown", "keydown", "wheel", "touchstart"] as const;
-
 export function useCloudSync({
   mutationVersion,
   enabled,
@@ -154,10 +150,8 @@ export function useCloudSync({
 
   const debounceRef = useRef<number | null>(null);
   const retryRef = useRef<number | null>(null);
-  const idleCheckRef = useRef<number | null>(null);
   const autoSyncTickRef = useRef<number | null>(null);
   const retryAttemptRef = useRef(0);
-  const lastActivityRef = useRef(Date.now());
   const startupDoneRef = useRef(false);
   /// Device fingerprint — lấy 1 lần sau mount qua Tauri cmd. Dùng cho RTDB
   /// push notification (tránh echo về chính mình).
@@ -571,32 +565,15 @@ export function useCloudSync({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mutationVersion, enabled, pausedByForm, scheduleDebounce, flushNow]);
 
-  // Idle flush: user idle IDLE_MS + status dirty → sync sớm (bỏ qua debounce).
-  useEffect(() => {
-    if (!enabled) return;
-    const onActivity = () => {
-      lastActivityRef.current = Date.now();
-    };
-    ACTIVITY_EVENTS.forEach((ev) =>
-      window.addEventListener(ev, onActivity, { passive: true }),
-    );
-    idleCheckRef.current = window.setInterval(() => {
-      if (pausedByForm) return;
-      if (statusRef.current !== "dirty") return;
-      if (Date.now() - lastActivityRef.current < IDLE_MS) return;
-      clearDebounce();
-      void doSync();
-    }, IDLE_CHECK_MS);
-    return () => {
-      ACTIVITY_EVENTS.forEach((ev) =>
-        window.removeEventListener(ev, onActivity),
-      );
-      if (idleCheckRef.current !== null) {
-        clearInterval(idleCheckRef.current);
-        idleCheckRef.current = null;
-      }
-    };
-  }, [enabled, doSync]);
+  // Idle flush ĐÃ XÓA. Lý do user request: edit save manual entry trong
+  // bảng ngày → user thường idle ~30s sau click → idle flush fire ở 30s
+  // (sớm hơn debounce 45s) → cảm giác "đồng bộ ngay" thay vì đợi 45s đúng.
+  // Import/delete user mất nhiều giây tương tác (đọc dialog confirm) →
+  // activity reset idle timer → debounce 45s thắng → user thấy "đợi 45s OK".
+  // Hai flow phải nhất quán: bỏ idle flush, debounce 45s là authoritative.
+  //
+  // Hybrid trigger (count 100 + max-wait 5min) đã đủ safety net cho case
+  // edge (user edit liên tục không cho debounce expire).
 
   // Online/offline listeners.
   useEffect(() => {
@@ -694,25 +671,12 @@ export function useCloudSync({
     };
   }, [enabled, pausedByForm, doSync]);
 
-  // Transition pausedByForm true → false: form vừa đóng. Trigger sync
-  // catch-up nếu dirty (mutations trong lúc edit + remote có thể có update).
-  const prevPausedRef = useRef(pausedByForm);
-  useEffect(() => {
-    if (!enabled) return;
-    const wasPaused = prevPausedRef.current;
-    prevPausedRef.current = pausedByForm;
-    if (wasPaused && !pausedByForm) {
-      // Reset idle activity marker — tránh idle-flush effect (interval 5s)
-      // fire ngay lập tức sau form đóng nếu user đã idle > 30s trong lúc edit
-      // form. Form resume = activity signal, đếm idle lại từ đây.
-      lastActivityRef.current = Date.now();
-      // Resume — flush pending + pull remote changes.
-      if (statusRef.current === "dirty" || statusRef.current === "idle") {
-        void doSync();
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pausedByForm, enabled]);
+  // Note: form resume (pausedByForm true → false) KHÔNG còn auto fire
+  // doSync. Trước đây resume gọi sync ngay → user save edit → form đóng
+  // → sync chạy NGAY thay vì đợi 45s như import/delete. Nhất quán: mọi
+  // mutation đợi DEBOUNCE_MS (45s) hoặc COUNT_THRESHOLD/MAX_WAIT_MS.
+  //
+  // User muốn sync ngay → click nút "Đồng bộ ngay" trong UI (forceSync).
 
   const forceSync = useCallback(async (): Promise<void> => {
     // Throttle 2s — user spam click nút "Đồng bộ ngay" chỉ fire 1 lần.

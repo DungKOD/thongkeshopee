@@ -430,6 +430,10 @@ function AppInner() {
     const totalNew = results.reduce((a, r) => a + r.inserted, 0);
     const totalReplace = results.reduce((a, r) => a + r.duplicated, 0);
     const totalSkipped = results.reduce((a, r) => a + r.skipped, 0);
+    const totalMcnMismatch = results.reduce(
+      (a, r) => a + (r.mcnMismatchCount ?? 0),
+      0,
+    );
     // Date range của batch thực tế đã commit (dayDateFrom/To từ kết quả Rust).
     const dateRange = (() => {
       if (results.length === 0) return "";
@@ -449,6 +453,14 @@ function AppInner() {
             }${totalSkipped > 0 ? `, ${fmtInt(totalSkipped)} skip` : ""}`,
       duration: 5000,
     });
+    // Warning banner riêng nếu Shopee commission có row lệch MCN —
+    // cảnh báo user check lại export (Shopee có thể trả số sai lẻ vài đồng).
+    if (totalMcnMismatch > 0) {
+      showToast({
+        message: `Cảnh báo: ${fmtInt(totalMcnMismatch)} đơn lệch công thức MCN (net ≠ total - fee > 0.5đ). Check lại export Shopee.`,
+        duration: 8000,
+      });
+    }
   }, [previewBatch, refetch, showToast, markMutation, importAccountId, refreshAccounts]);
 
   const handleSaveEntry = useCallback(

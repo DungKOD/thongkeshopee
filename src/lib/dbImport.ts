@@ -116,6 +116,9 @@ export interface ImportResult {
   duplicated: number;
   /** Rows bị skip do date không parse (Shopee multi-day). */
   skipped: number;
+  /** Shopee commission only: số row lệch `net = order_total - mcn_fee` > 0.5đ.
+   *  0 cho các kind khác. FE nên show warning banner nếu > 0. */
+  mcnMismatchCount?: number;
 }
 
 // =========================================================
@@ -413,6 +416,20 @@ async function parseFile(file: File): Promise<ParsedFile> {
       };
     }
     case "shopee_commission": {
+      // Guard: "ID Model" column bắt buộc phải có. Thiếu cột này → modelId
+      // default="" → UPSERT key (checkout_id, item_id, "") collapse mọi
+      // model variant của cùng 1 item vào 1 row → data loss commission.
+      // Shopee export thường có cột này, nhưng nếu user chọn format khác
+      // khi export thì thiếu. Fail sớm tốt hơn silently mất data.
+      const hasModelIdCol = headers.some(
+        (h) => (h ?? "").trim().toLowerCase() === "id model",
+      );
+      if (!hasModelIdCol) {
+        throw new Error(
+          `File '${file.name}' thiếu cột "ID Model". Export lại từ Shopee ` +
+            `với đủ cột, nếu không các item cùng order sẽ bị gộp sai.`,
+        );
+      }
       const parsedRows = parsed.data
         .map(toShopeeOrderRow)
         .filter((r): r is ShopeeOrderRow => r !== null);

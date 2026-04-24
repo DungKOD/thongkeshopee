@@ -285,7 +285,11 @@ export function SmartCalculator({ isOpen, onClose }: SmartCalculatorProps) {
       timestamp: Date.now(),
     };
     setHistory((prev) => [item, ...prev].slice(0, HISTORY_MAX));
-    setExpression(String(evalResult.value));
+    // Round về 8 decimals giống fmt() — tránh IEEE 754 residue (VD 0.1+0.2
+    // = 0.30000000000000004) bị commit vào input, khi chain calc tiếp sẽ
+    // khuếch đại drift. Match đúng số user đang thấy ở live result.
+    const cleaned = Math.round(evalResult.value * 1e8) / 1e8;
+    setExpression(String(cleaned));
   };
 
   const append = (s: string) => {

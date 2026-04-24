@@ -115,6 +115,11 @@ pub struct ImportResult {
     /// single date nên 0). FE hiện warning nếu > 0.
     #[serde(default)]
     pub skipped: i64,
+    /// Shopee commission only: số row có `net_commission ≠ order_commission_total
+    /// - mcn_fee` (tolerance 0.5đ). 0 cho các kind khác. FE hiện warning banner
+    /// nếu > 0 để user biết export có thể lỗi, không silent trong stderr.
+    #[serde(default)]
+    pub mcn_mismatch_count: i64,
 }
 
 /// Kind hợp lệ trong bảng `imported_files.kind`.
@@ -340,6 +345,7 @@ pub fn import_shopee_clicks(
         inserted,
         duplicated,
         skipped,
+        mcn_mismatch_count: 0,
     })
 }
 
@@ -466,6 +472,8 @@ pub fn import_shopee_orders(
     let mut inserted: i64 = 0;
     let mut updated: i64 = 0;
     let mut skipped: i64 = 0;
+    // Declare ngoài block để return vào ImportResult sau tx.commit.
+    let mut mcn_mismatch_count: i64 = 0;
     {
         // v13: id = content_id(checkout_id, item_id, model_id). Cross-machine
         // deterministic — cùng order line trên A và B → cùng id → FK ổn định.
@@ -506,7 +514,6 @@ pub fn import_shopee_orders(
         // Chỉ verify khi cả 3 field có giá trị. Tolerance 0.5đ cho rounding.
         // Lệch quá → log warning (không fail import — data vẫn ghi được, user
         // tự quyết định có refresh export lại hay không).
-        let mut mcn_mismatch_count: i64 = 0;
         for (r, date_opt) in &rows_with_dates {
             let Some(day_date) = date_opt else {
                 skipped += 1;
@@ -612,6 +619,7 @@ pub fn import_shopee_orders(
         inserted,
         duplicated: updated, // ở đây = số row bị overwrite
         skipped,
+        mcn_mismatch_count,
     })
 }
 
@@ -799,6 +807,7 @@ pub fn import_fb_ad_groups(
         inserted,
         duplicated,
         skipped: 0,
+        mcn_mismatch_count: 0,
     })
 }
 
@@ -972,6 +981,7 @@ pub fn import_fb_campaigns(
         inserted,
         duplicated,
         skipped: 0,
+        mcn_mismatch_count: 0,
     })
 }
 
