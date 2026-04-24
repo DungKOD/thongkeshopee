@@ -352,7 +352,14 @@ function AppInner() {
     if (!overviewCaptureRef.current || overviewCapturing) return;
     setOverviewCapturing(true);
     try {
-      const blob = await captureElementToBlob(overviewCaptureRef.current, {
+      // Target inner content (OverviewTab root có `mx-auto max-w-[1400px]`)
+      // thay vì wrapper div — tránh capture whitespace 2 bên trên màn rộng.
+      // firstElementChild = OverviewTab root có bounding box = content width
+      // thực tế (auto-fit hoặc 1400px max).
+      const target = (overviewCaptureRef.current
+        .firstElementChild as HTMLElement | null) ??
+        overviewCaptureRef.current;
+      const blob = await captureElementToBlob(target, {
         pixelRatio: 2,
         backgroundColor: "#121212",
       });
