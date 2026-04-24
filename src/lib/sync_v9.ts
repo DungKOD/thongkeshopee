@@ -65,6 +65,15 @@ function syncApiUrl(): string {
   return u;
 }
 
+/// Guard cho mọi lệnh network. Check `navigator.onLine` trước khi invoke.
+/// Offline → throw Error với message rõ ràng (tiếng Việt) để UI hiển thị.
+/// `timed()` wrapper log lại failure vào sync_event_log local cho user trace.
+function requireOnline(opName: string): void {
+  if (!navigator.onLine) {
+    throw new Error(`${opName}: không có kết nối mạng — vui lòng kiểm tra internet`);
+  }
+}
+
 /// Snapshot UI state. Cheap — chỉ read local DB, không HTTP.
 export function syncV9GetState(): Promise<SyncV9State> {
   return invoke<SyncV9State>("sync_v9_get_state");
@@ -74,6 +83,7 @@ export function syncV9GetState(): Promise<SyncV9State> {
 /// Skip-identical hash check bỏ qua upload khi table content không đổi.
 export function syncV9PushAll(idToken: string): Promise<PushReport> {
   return timed("tauri_sync_push", "sync_v9_push_all", async () => {
+    requireOnline("Đẩy R2");
     const r = await invoke<PushReport>("sync_v9_push_all", {
       baseUrl: syncApiUrl(),
       idToken,
@@ -86,6 +96,7 @@ export function syncV9PushAll(idToken: string): Promise<PushReport> {
 /// on error). HLC absorb từ max event clock → HLC monotonic cross-machine.
 export function syncV9PullAll(idToken: string): Promise<PullReport> {
   return timed("tauri_sync_pull", "sync_v9_pull_all", async () => {
+    requireOnline("Kéo R2");
     const r = await invoke<PullReport>("sync_v9_pull_all", {
       baseUrl: syncApiUrl(),
       idToken,
@@ -97,6 +108,7 @@ export function syncV9PullAll(idToken: string): Promise<PullReport> {
 /// Pull rồi push. Thứ tự này giảm CAS conflict khi 2 máy cùng sync.
 export function syncV9SyncAll(idToken: string): Promise<SyncReport> {
   return timed("tauri_sync_all", "sync_v9_sync_all", async () => {
+    requireOnline("Đồng bộ R2");
     const r = await invoke<SyncReport>("sync_v9_sync_all", {
       baseUrl: syncApiUrl(),
       idToken,
@@ -109,6 +121,7 @@ export function syncV9SyncAll(idToken: string): Promise<SyncReport> {
 /// zstd + NDJSON. Batch max 500 events/call. Return số events đã upload.
 export function syncV9LogFlush(idToken: string): Promise<number> {
   return timed("tauri_sync_log_flush", "sync_v9_log_flush", async () => {
+    requireOnline("Flush log");
     const r = await invoke<number>("sync_v9_log_flush", {
       baseUrl: syncApiUrl(),
       idToken,
@@ -121,6 +134,7 @@ export function syncV9LogFlush(idToken: string): Promise<number> {
 /// Auto-trigger khi manifest.deltas > threshold. No-op nếu chưa cần.
 export function syncV9CompactIfNeeded(idToken: string): Promise<CompactionReport> {
   return timed("tauri_sync_compact", "sync_v9_compact_if_needed", async () => {
+    requireOnline("Compact R2");
     const r = await invoke<CompactionReport>("sync_v9_compact_if_needed", {
       baseUrl: syncApiUrl(),
       idToken,

@@ -138,6 +138,29 @@ pub fn compute_pending_pulls<'a>(
     out
 }
 
+/// Detect: local có tụt hậu so với snapshot remote không? Nếu có →
+/// trả về snapshot ref để caller trigger restore path.
+///
+/// Case trigger:
+/// - Fresh install (local_clock=0) + remote có snapshot → bootstrap
+/// - Long offline (local_clock < snap_clock, delta gap đã compact) → restore
+/// - Schema mismatch sau reinstall → restore từ snapshot đồng bộ state
+///
+/// Case không trigger:
+/// - Remote không có snapshot (early stage) → normal pull
+/// - local_clock >= snap_clock → manifest.deltas đủ cover gap → normal pull
+pub fn needs_snapshot_restore<'a>(
+    manifest: &'a Manifest,
+    local_state: &ManifestState,
+) -> Option<&'a super::types::ManifestSnapshot> {
+    match &manifest.latest_snapshot {
+        Some(snap) if local_state.last_pulled_manifest_clock_ms < snap.clock_ms => {
+            Some(snap)
+        }
+        _ => None,
+    }
+}
+
 /// Sau compaction: drop deltas có clock_ms <= snapshot.clock_ms (chúng đã
 /// được consolidate vào snapshot), set `latest_snapshot`. Return số deltas
 /// dropped.
@@ -356,6 +379,105 @@ mod tests {
     }
 
     // ---------- Diff for pull ----------
+
+    // ---------- Snapshot restore detection (Option 1) ----------
+
+    fn mk_state(last_clock: i64) -> ManifestState {
+        ManifestState {
+            last_remote_etag: None,
+            last_pulled_manifest_clock_ms: last_clock,
+            last_snapshot_key: None,
+            last_snapshot_clock_ms: 0,
+            fresh_install_pending: false,
+        }
+    }
+
+    fn mk_snapshot(clock: i64, key: &str) -> ManifestSnapshot {
+        ManifestSnapshot {
+            key: key.to_string(),
+            clock_ms: clock,
+            size_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn needs_restore_none_when_no_remote_snapshot() {
+        // Early-stage R2: chỉ có delta, chưa compact → không cần restore.
+        let mut m = Manifest::empty("uid".to_string());
+        append_delta_entries(&mut m, vec![make_entry("t", "k1", 100)]);
+        assert!(m.latest_snapshot.is_none());
+
+        let state = mk_state(50);
+        assert!(
+            needs_snapshot_restore(&m, &state).is_none(),
+            "không snapshot remote → không trigger restore"
+        );
+    }
+
+    #[test]
+    fn needs_restore_triggers_when_local_behind_snapshot() {
+        // Scenario: máy A offline dài, máy B đã compact lên clock 500.
+        // Local đang ở clock 100 → gap 100-500 không còn trong manifest.deltas.
+        let mut m = Manifest::empty("uid".to_string());
+        m.latest_snapshot = Some(mk_snapshot(500, "snapshots/snap_500.db.zst"));
+
+        let state = mk_state(100);
+        let restore = needs_snapshot_restore(&m, &state);
+        assert!(restore.is_some(), "local=100 < snap=500 → phải restore");
+        assert_eq!(restore.unwrap().clock_ms, 500);
+    }
+
+    #[test]
+    fn needs_restore_triggers_for_fresh_install() {
+        // Fresh install: local_clock = 0 (default). Remote có snapshot → bootstrap.
+        let mut m = Manifest::empty("uid".to_string());
+        m.latest_snapshot = Some(mk_snapshot(1000, "snap_1000"));
+
+        let state = mk_state(0);
+        assert!(
+            needs_snapshot_restore(&m, &state).is_some(),
+            "local=0 + remote snap=1000 → trigger (covers fresh install)"
+        );
+    }
+
+    #[test]
+    fn needs_restore_skips_when_caught_up() {
+        // Local đã apply tới snap_clock — delta sau đó vẫn trong manifest → normal pull.
+        let mut m = Manifest::empty("uid".to_string());
+        m.latest_snapshot = Some(mk_snapshot(500, "snap_500"));
+        append_delta_entries(&mut m, vec![make_entry("t", "k1", 600)]);
+
+        let state = mk_state(500);
+        assert!(
+            needs_snapshot_restore(&m, &state).is_none(),
+            "local == snap_clock → deltas trong manifest đủ cover, không restore"
+        );
+    }
+
+    #[test]
+    fn needs_restore_skips_when_local_ahead_of_snapshot() {
+        // Edge case: local đã pull deltas sau snapshot — không trigger restore again.
+        let mut m = Manifest::empty("uid".to_string());
+        m.latest_snapshot = Some(mk_snapshot(500, "snap_500"));
+
+        let state = mk_state(700);
+        assert!(
+            needs_snapshot_restore(&m, &state).is_none(),
+            "local ahead of snapshot → không cần restore"
+        );
+    }
+
+    #[test]
+    fn needs_restore_idempotent_across_calls() {
+        // Gọi 2 lần cùng state → cùng kết quả.
+        let mut m = Manifest::empty("uid".to_string());
+        m.latest_snapshot = Some(mk_snapshot(500, "snap_500"));
+        let state = mk_state(100);
+
+        let r1 = needs_snapshot_restore(&m, &state);
+        let r2 = needs_snapshot_restore(&m, &state);
+        assert_eq!(r1.map(|s| s.clock_ms), r2.map(|s| s.clock_ms));
+    }
 
     #[test]
     fn compute_pending_pulls_filters_by_clock() {

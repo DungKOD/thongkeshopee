@@ -1031,3 +1031,220 @@ fn hlc_monotonic_smoke() {
     let c = hlc::next_hlc_ms(&conn).unwrap();
     assert!(c > remote, "HLC absorb: {remote} → {c}");
 }
+
+// =============================================================
+// Option 1 — snapshot restore khi local_clock < snapshot_clock
+// =============================================================
+
+/// End-to-end: máy "remote" tạo snapshot có data, máy "local" fresh hoàn
+/// toàn → apply_snapshot_bytes → verify local giờ có data của remote +
+/// cursor state đúng + bootstrap flag đã clear.
+#[test]
+fn restore_fresh_machine_from_snapshot_end_to_end() {
+    use crate::commands::sync_v9_cmds::apply_snapshot_bytes;
+    use crate::sync_v9::snapshot::create_snapshot;
+    use crate::sync_v9::types::ManifestSnapshot;
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. "Remote" máy B: tạo data + snapshot.
+    let remote_path = dir.path().join("remote.db");
+    {
+        let remote = crate::db::init_db_at(&remote_path).unwrap();
+        remote.execute(
+            "UPDATE sync_state SET owner_uid='uid-shared' WHERE id=1",
+            [],
+        ).unwrap();
+        insert_day(&remote, "2026-04-20");
+        let fid = insert_file(&remote, "hashX", "shopee_clicks");
+        insert_raw_click(&remote, "2026-04-20", fid, "click_A");
+        insert_raw_click(&remote, "2026-04-20", fid, "click_B");
+        insert_manual(&remote, "2026-04-20", "sub_manual", "2026-04-20T10:00:00.000Z", 100.0);
+    }
+
+    // Tạo snapshot từ remote (dùng create_snapshot production function).
+    let (snap_bytes, snap_key, snap_clock) = {
+        let remote = rusqlite::Connection::open(&remote_path).unwrap();
+        let artifact = create_snapshot(&remote, dir.path(), 500_000).unwrap();
+        (artifact.bytes, artifact.suggested_r2_key, artifact.clock_ms)
+    };
+
+    // 2. "Local" máy A: fresh install (không có data) tại path khác.
+    let local_path = dir.path().join("local.db");
+    let local_conn = crate::db::init_db_at(&local_path).unwrap();
+    local_conn.execute(
+        "UPDATE sync_state SET owner_uid='uid-shared' WHERE id=1",
+        [],
+    ).unwrap();
+
+    // Verify trước restore: local không có data.
+    assert_eq!(count_rows(&local_conn, "days"), 0);
+    assert_eq!(count_rows(&local_conn, "raw_shopee_clicks"), 0);
+    assert_eq!(count_rows(&local_conn, "manual_entries"), 0);
+
+    let local_mutex = Mutex::new(local_conn);
+    let snap_ref = ManifestSnapshot {
+        key: snap_key.clone(),
+        clock_ms: snap_clock,
+        size_bytes: snap_bytes.len() as i64,
+    };
+
+    // 3. Apply snapshot (= logic perform_snapshot_restore minus HTTP).
+    apply_snapshot_bytes(&local_mutex, &snap_bytes, &snap_ref).unwrap();
+
+    // 4. Verify: local giờ có đủ data của remote.
+    let conn = local_mutex.lock().unwrap();
+    assert_eq!(count_rows(&conn, "days"), 1, "day restored");
+    assert_eq!(count_rows(&conn, "raw_shopee_clicks"), 2, "2 clicks restored");
+    assert_eq!(count_rows(&conn, "manual_entries"), 1, "manual restored");
+
+    // 5. Verify: manifest state cập nhật (snapshot pointer + clock).
+    let state = super::manifest::read_state(&conn).unwrap();
+    assert_eq!(state.last_snapshot_key.as_deref(), Some(snap_key.as_str()));
+    assert_eq!(state.last_snapshot_clock_ms, snap_clock);
+    assert_eq!(state.last_pulled_manifest_clock_ms, snap_clock, "clock advanced");
+    assert!(!state.fresh_install_pending, "bootstrap flag cleared");
+
+    // 6. Verify: event log có Recovery + BootstrapSnapshot entries.
+    let kinds: Vec<String> = conn
+        .prepare("SELECT kind FROM sync_event_log ORDER BY event_id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    // Events pre-swap bị overwrite bởi snapshot content — post-swap log có
+    // recovery + bootstrap_snapshot. begin_bootstrap không emit event (chỉ
+    // set flag), nên kiểm 2 events này đủ.
+    assert!(kinds.contains(&"recovery".to_string()), "recovery emitted post-swap");
+    assert!(
+        kinds.contains(&"bootstrap_snapshot".to_string()),
+        "bootstrap_snapshot emitted post-swap"
+    );
+}
+
+/// Idempotency: restore lần 2 trên cùng DB (đã restored) → không corrupt.
+/// Scenario: crash sau apply snapshot nhưng trước khi clear flag → next sync
+/// detect lại (state chưa advance) → retry restore → OK.
+#[test]
+fn restore_idempotent_when_called_twice() {
+    use crate::commands::sync_v9_cmds::apply_snapshot_bytes;
+    use crate::sync_v9::snapshot::create_snapshot;
+    use crate::sync_v9::types::ManifestSnapshot;
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let remote_path = dir.path().join("remote.db");
+    {
+        let remote = crate::db::init_db_at(&remote_path).unwrap();
+        insert_day(&remote, "2026-04-20");
+        let fid = insert_file(&remote, "hash_id", "shopee_clicks");
+        insert_raw_click(&remote, "2026-04-20", fid, "c1");
+    }
+
+    let (snap_bytes, snap_key, snap_clock) = {
+        let remote = rusqlite::Connection::open(&remote_path).unwrap();
+        let artifact = create_snapshot(&remote, dir.path(), 777_000).unwrap();
+        (artifact.bytes, artifact.suggested_r2_key, artifact.clock_ms)
+    };
+
+    let local_path = dir.path().join("local.db");
+    let local_conn = crate::db::init_db_at(&local_path).unwrap();
+    let local_mutex = Mutex::new(local_conn);
+
+    let snap_ref = ManifestSnapshot {
+        key: snap_key,
+        clock_ms: snap_clock,
+        size_bytes: snap_bytes.len() as i64,
+    };
+
+    // Lần 1.
+    apply_snapshot_bytes(&local_mutex, &snap_bytes, &snap_ref).unwrap();
+    let rows_after_1 = {
+        let c = local_mutex.lock().unwrap();
+        count_rows(&c, "raw_shopee_clicks")
+    };
+    assert_eq!(rows_after_1, 1);
+
+    // Lần 2 (retry sau crash giả lập).
+    apply_snapshot_bytes(&local_mutex, &snap_bytes, &snap_ref).unwrap();
+    let rows_after_2 = {
+        let c = local_mutex.lock().unwrap();
+        count_rows(&c, "raw_shopee_clicks")
+    };
+    assert_eq!(rows_after_2, 1, "idempotent: không duplicate sau retry");
+
+    let state = {
+        let c = local_mutex.lock().unwrap();
+        super::manifest::read_state(&c).unwrap()
+    };
+    assert!(!state.fresh_install_pending);
+}
+
+/// Restore overwrites local state: local có data "cũ" + schema khác → sau
+/// restore local reflect EXACTLY snapshot content (không merge).
+#[test]
+fn restore_overwrites_stale_local_completely() {
+    use crate::commands::sync_v9_cmds::apply_snapshot_bytes;
+    use crate::sync_v9::snapshot::create_snapshot;
+    use crate::sync_v9::types::ManifestSnapshot;
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Remote có click_B.
+    let remote_path = dir.path().join("remote.db");
+    {
+        let remote = crate::db::init_db_at(&remote_path).unwrap();
+        insert_day(&remote, "2026-04-20");
+        let fid = insert_file(&remote, "remote_hash", "shopee_clicks");
+        insert_raw_click(&remote, "2026-04-20", fid, "click_REMOTE_only");
+    }
+    let (snap_bytes, snap_key, snap_clock) = {
+        let remote = rusqlite::Connection::open(&remote_path).unwrap();
+        let artifact = create_snapshot(&remote, dir.path(), 999_000).unwrap();
+        (artifact.bytes, artifact.suggested_r2_key, artifact.clock_ms)
+    };
+
+    // Local có click_A (data cũ, không có trong snapshot).
+    let local_path = dir.path().join("local.db");
+    let local_conn = crate::db::init_db_at(&local_path).unwrap();
+    insert_day(&local_conn, "2026-04-19");
+    let local_fid = insert_file(&local_conn, "local_hash", "shopee_clicks");
+    insert_raw_click(&local_conn, "2026-04-19", local_fid, "click_LOCAL_only");
+
+    let local_mutex = Mutex::new(local_conn);
+
+    // Restore.
+    apply_snapshot_bytes(
+        &local_mutex,
+        &snap_bytes,
+        &ManifestSnapshot {
+            key: snap_key,
+            clock_ms: snap_clock,
+            size_bytes: snap_bytes.len() as i64,
+        },
+    )
+    .unwrap();
+
+    // Local giờ CHỈ có data remote, không còn click_LOCAL_only.
+    let conn = local_mutex.lock().unwrap();
+    let click_ids: Vec<String> = conn
+        .prepare("SELECT click_id FROM raw_shopee_clicks ORDER BY click_id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(click_ids, vec!["click_REMOTE_only"], "local data bị overwrite");
+
+    let days: Vec<String> = conn
+        .prepare("SELECT date FROM days ORDER BY date")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(days, vec!["2026-04-20"], "local day cũ đã bị replace");
+}

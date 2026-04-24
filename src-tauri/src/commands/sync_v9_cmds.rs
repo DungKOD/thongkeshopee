@@ -263,6 +263,128 @@ async fn cas_append_manifest_retry(
 }
 
 // =============================================================
+// SNAPSHOT RESTORE — stale local clock recovery
+// =============================================================
+
+/// Fetch snapshot từ R2, atomic swap file DB, re-seed cursor state.
+///
+/// **Rule giữ data**:
+/// - `begin_bootstrap` set `fresh_install_pending=1` trước → push path bị
+///   guard bypass trong lúc restore chạy (tránh push empty đè remote).
+/// - `restore_snapshot_to_pending` có RAII guard — verify integrity +
+///   sync_state exist trước khi declare success. Fail → pending file cleanup.
+/// - File swap: close current conn → rename pending→live → reopen.
+///   Nếu rename crash giữa chừng, lần start sau `apply_pending_sync` trong
+///   `switch_db_to_user` apply lại (resume).
+/// - `complete_bootstrap` clear flag sau khi hoàn tất — idempotent nếu
+///   crash giữa restore và complete (next run detect vẫn trigger vì
+///   clock chưa advance).
+///
+/// Caller: `sync_v9_pull_all` khi detect `local_clock < snapshot_clock`.
+async fn perform_snapshot_restore(
+    db: &State<'_, DbState>,
+    base_url: &str,
+    id_token: &str,
+    snap: &crate::sync_v9::types::ManifestSnapshot,
+) -> anyhow::Result<()> {
+    // 1. Fetch snapshot bytes từ R2. Tách step này riêng → HTTP không giữ
+    //    DB lock. Step 2 (apply_snapshot_bytes) là pure — testable ngoài Tauri.
+    let bytes = client::fetch_snapshot(base_url, id_token, &snap.key).await?;
+    apply_snapshot_bytes(&db.0, &bytes, snap)
+}
+
+/// Apply snapshot bytes đã fetch được vào local DB. Pure (không HTTP) để
+/// integration test call trực tiếp không cần Tauri test harness.
+///
+/// Flow:
+/// 1. `begin_bootstrap` set flag (push path bypass).
+/// 2. `restore_snapshot_to_pending` write + verify pending.db.
+/// 3. File swap: drop conn → rename pending→live → reopen.
+/// 4. `seed_cursor_after_restore` + `complete_bootstrap` (clear flag).
+/// 5. Emit event_log entries cho observability.
+///
+/// Rule giữ data: fail giữa chừng → pending file cleanup (RAII guard trong
+/// restore_snapshot_to_pending), fresh_install_pending vẫn =1 → next call
+/// idempotent detect + retry.
+pub fn apply_snapshot_bytes(
+    db_mutex: &std::sync::Mutex<rusqlite::Connection>,
+    bytes: &[u8],
+    snap: &crate::sync_v9::types::ManifestSnapshot,
+) -> anyhow::Result<()> {
+    let snapshot_bytes_len = bytes.len() as u64;
+
+    // 1. Set bootstrap flag trên OLD DB → concurrent push bị guard block
+    //    trong lúc restore chạy (HTTP fetch window ở caller perform_snapshot_restore).
+    //    Events emit SAU swap vì OLD DB sắp bị overwrite — event log pre-swap
+    //    sẽ mất, lãng phí I/O.
+    {
+        let conn = db_mutex.lock().map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
+        bootstrap::begin_bootstrap(&conn)?;
+    }
+
+    // 2. Resolve live DB path (query từ connection).
+    let live_path = {
+        let conn = db_mutex.lock().map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
+        crate::db::resolve_active_db_path(&conn)?
+    };
+    let pending_path = live_path.with_extension("pending.db");
+
+    // 3. Write snapshot → pending.db + verify integrity.
+    snapshot::restore_snapshot_to_pending(bytes, &pending_path)?;
+
+    // 4. File swap atomic: drop conn → rename → reopen.
+    {
+        let mut slot = db_mutex.lock().map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
+        let tmp = rusqlite::Connection::open_in_memory()?;
+        let old = std::mem::replace(&mut *slot, tmp);
+        drop(old);
+
+        // Windows: cần remove target trước khi rename. Unix: rename replaces
+        // atomic. Cover cả 2 case.
+        if live_path.exists() {
+            std::fs::remove_file(&live_path)
+                .map_err(|e| anyhow::anyhow!("remove old live DB: {e}"))?;
+        }
+        std::fs::rename(&pending_path, &live_path)
+            .map_err(|e| anyhow::anyhow!("rename pending → live: {e}"))?;
+
+        *slot = crate::db::init_db_at(&live_path)
+            .map_err(|e| anyhow::anyhow!("init_db_at post-swap: {e}"))?;
+    }
+
+    // 5. Seed cursor + complete bootstrap + emit events trên connection MỚI
+    //    (post-swap DB). Events pre-swap đã bị overwrite, phải log ở đây để
+    //    user thấy trong sync log.
+    {
+        let conn = db_mutex.lock().map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
+        bootstrap::seed_cursor_after_restore(&conn, snap.clock_ms)?;
+        bootstrap::complete_bootstrap(&conn, &snap.key, snap.clock_ms)?;
+
+        let ts = hlc::next_hlc_rfc3339(&conn)?;
+        let _ = event_log::append(
+            &conn,
+            &ts,
+            &machine_fingerprint_stable(),
+            &SyncEventCtx::Recovery {
+                reason: "stale_local_clock".to_string(),
+            },
+        );
+        let _ = event_log::append(
+            &conn,
+            &ts,
+            &machine_fingerprint_stable(),
+            &SyncEventCtx::BootstrapSnapshot {
+                snapshot_key: snap.key.clone(),
+                bytes: snapshot_bytes_len,
+                duration_ms: 0,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+// =============================================================
 // PULL — full pass
 // =============================================================
 
@@ -291,12 +413,43 @@ pub async fn sync_v9_pull_all(
     let fetched = client::get_manifest(&base_url, &id_token)
         .await
         .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
-    let Some(manifest) = fetched.manifest else {
+    let Some(mut manifest) = fetched.manifest else {
         // No manifest — không có gì để pull.
         return Ok(PullReport::default());
     };
 
-    // 2. Plan pending deltas (dùng local state).
+    // 2. Stale-local detection: nếu local clock đi sau snapshot clock của
+    // remote → delta giữa [local_clock, snapshot_clock] đã compact khỏi
+    // manifest. Pull raw deltas sẽ FK fail. Phải snapshot restore trước.
+    //
+    // Scope covered:
+    // - Long offline (2+ tuần) → máy khác đã compact nhiều vòng
+    // - Fresh install (local_clock=0) + remote có snapshot → auto bootstrap
+    // - Stale schema DB + new snapshot → replace local với remote state
+    let restore_snapshot = {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        let state = manifest::read_state(&conn).map_err(|e| CmdError::msg(e.to_string()))?;
+        manifest::needs_snapshot_restore(&manifest, &state).cloned()
+    };
+
+    if let Some(snap_ref) = restore_snapshot {
+        perform_snapshot_restore(&db, &base_url, &id_token, &snap_ref)
+            .await
+            .map_err(|e| CmdError::msg(format!("snapshot restore: {e}")))?;
+
+        // State đã reset sau restore — refetch manifest để pull đúng delta
+        // SAU snapshot_clock mới (thay vì manifest cũ có thể đã outdated
+        // trong thời gian fetch+restore chạy, nếu máy khác vừa push).
+        let refetched = client::get_manifest(&base_url, &id_token)
+            .await
+            .map_err(|e| CmdError::msg(format!("get_manifest post-restore: {e}")))?;
+        manifest = match refetched.manifest {
+            Some(m) => m,
+            None => return Ok(PullReport::default()),
+        };
+    }
+
+    // 3. Plan pending deltas (dùng local state).
     let pending = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         pull::plan_pull(&conn, &manifest).map_err(|e| CmdError::msg(e.to_string()))?
