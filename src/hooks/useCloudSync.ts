@@ -91,16 +91,20 @@ interface UseCloudSyncOptions {
   onRemoteApplied?: () => void | Promise<void>;
 }
 
-/// Flat debounce — mỗi mutation reset timer về DEBOUNCE_MS fresh.
+/// Hybrid trigger — 3 điều kiện song song flush sync lên R2.
 ///
-/// User flow:
-/// - Edit CV1 → timer 45s
-/// - Edit CV2 sau 15s → throw away 30s còn lại, bắt đầu 45s mới
-/// - Không edit gì tiếp → sau 45s, sync fire
+/// 1. **DEBOUNCE_MS** (45s): idle quiet → user đã ngừng edit, push.
+/// 2. **COUNT_THRESHOLD** (100 mutations): gom đủ 1 bundle lớn → push ngay
+///    kể cả user vẫn đang edit. Tránh case "continuous edit 1mut/20s" →
+///    debounce reset vĩnh viễn → KHÔNG BAO GIỜ push (bug correctness).
+/// 3. **MAX_WAIT_MS** (5min): safety cap — chưa đủ 100 mut cũng force push
+///    khi mutation đầu tiên quá xa. Cap data-loss-if-crash window.
 ///
 /// Combined skip-identical hash (sync_v9/push.rs) → mutation không đổi
-/// content table KHÔNG tốn upload dù debounce fire.
+/// content table KHÔNG tốn upload dù trigger fire.
 const DEBOUNCE_MS = 45_000;
+const COUNT_THRESHOLD = 100;
+const MAX_WAIT_MS = 300_000;
 const IDLE_MS = 30_000;
 const IDLE_CHECK_MS = 5_000;
 // Exponential backoff: 30s, 60s, 120s, 300s (cap 5min).
@@ -168,6 +172,11 @@ export function useCloudSync({
   /// Timestamp mutation gần nhất — FE dùng để tính timer có reset không.
   /// Flat debounce 45s, không còn counter ladder.
   const lastMutationAtRef = useRef(0);
+  /// Số mutations tích lũy từ lần sync gần nhất. Dùng COUNT_THRESHOLD trigger.
+  const pendingCountRef = useRef(0);
+  /// Timestamp mutation ĐẦU TIÊN sau lần sync gần nhất. Dùng MAX_WAIT_MS cap.
+  /// 0 = chưa có mutation pending.
+  const firstMutationAtRef = useRef(0);
   const statusRef = useRef<SyncStatus>(status);
   useEffect(() => {
     statusRef.current = status;
@@ -207,8 +216,11 @@ export function useCloudSync({
     syncInFlightRef.current = true;
     clearDebounce();
     clearRetry();
-    // Reset mutation timestamp — sync vừa fire xong, next mutation start fresh.
+    // Reset mutation counters — sync vừa fire xong, next mutation start fresh.
+    // COUNT_THRESHOLD + MAX_WAIT_MS trigger bắt đầu đếm lại từ 0.
     lastMutationAtRef.current = 0;
+    pendingCountRef.current = 0;
+    firstMutationAtRef.current = 0;
     // Clear remote-pending flag — sync đang consume tín hiệu RTDB.
     setHasRemoteChangePending(false);
     setStatus("syncing");
@@ -357,6 +369,14 @@ export function useCloudSync({
     debounceRef.current = timerId;
   }, [doSync]);
 
+  /// Flush ngay không chờ debounce. Dùng cho COUNT_THRESHOLD + MAX_WAIT_MS
+  /// trigger — không phải idle quiet nên vẫn push-only (B5).
+  const flushNow = useCallback(() => {
+    clearDebounce();
+    needPullRef.current = false;
+    void doSync();
+  }, [doSync]);
+
   /// Startup check: trong v9 chỉ cần gọi doSync — sync_v9_sync_all cheap khi
   /// không có gì đổi (fetch manifest + empty diff → no-op). Manifest etag +
   /// cursor state ở Rust tự xác định cần fetch/apply gì. Không cần fingerprint
@@ -462,11 +482,12 @@ export function useCloudSync({
     })();
   }, [enabled, authUid, doStartupCheck]);
 
-  // Mutation → debounce sync. Reset timer mỗi mutation (user đề xuất: giây
-  // thứ 7 có mutation mới → adaptive debounce đếm lại + ladder tăng delay).
-  // pausedByForm: user đang mở form → không lên lịch sync (tránh apply event
-  // đè lên state form đang edit). Mutation vẫn mark status=dirty, debounce
-  // sẽ schedule khi resume.
+  // Mutation → hybrid trigger (count / max-wait / debounce). Gom nhiều
+  // mutations vào 1 bundle, tiết kiệm R2 Class A ops + fix bug user edit
+  // liên tục debounce reset vĩnh viễn không push.
+  //
+  // pausedByForm: user đang mở form → không flush (tránh apply event đè
+  // state form đang edit). Counter vẫn đếm, trigger khi resume.
   useEffect(() => {
     if (!enabled) return;
     if (
@@ -480,18 +501,39 @@ export function useCloudSync({
     if (mutationVersion === 0) return;
 
     setStatus("dirty");
-    lastMutationAtRef.current = Date.now();
-    if (!pausedByForm) {
-      // clearDebounce + setTimeout fresh → user edit lần 2 trong window
-      // cũ sẽ throw away timer cũ, bắt đầu 45s mới tính từ mutation này.
-      scheduleDebounce();
+    const now = Date.now();
+    lastMutationAtRef.current = now;
+    pendingCountRef.current += 1;
+    if (firstMutationAtRef.current === 0) {
+      firstMutationAtRef.current = now;
     }
+
+    if (pausedByForm) {
+      return () => {
+        clearDebounce();
+      };
+    }
+
+    // Trigger 1: count đủ 100 mutations → flush ngay (cost-efficient bundle).
+    if (pendingCountRef.current >= COUNT_THRESHOLD) {
+      flushNow();
+      return;
+    }
+
+    // Trigger 2: mutation đầu tiên đã quá 5 phút → flush (cap data-loss window).
+    if (now - firstMutationAtRef.current >= MAX_WAIT_MS) {
+      flushNow();
+      return;
+    }
+
+    // Trigger 3 (default): reset 45s debounce — user ngừng → flush.
+    scheduleDebounce();
 
     return () => {
       clearDebounce();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mutationVersion, enabled, pausedByForm, scheduleDebounce]);
+  }, [mutationVersion, enabled, pausedByForm, scheduleDebounce, flushNow]);
 
   // Idle flush: user idle IDLE_MS + status dirty → sync sớm (bỏ qua debounce).
   useEffect(() => {
