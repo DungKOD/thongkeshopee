@@ -4,8 +4,6 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { ProfitFees, Settings } from "../hooks/useSettings";
 import { ImportHistorySection } from "./ImportHistorySection";
 import { invoke } from "../lib/tauri";
-import { getAuthToken } from "../lib/firebase";
-import { syncV9NuclearReset } from "../lib/sync_v9";
 
 interface AppDataPaths {
   appDataDir: string;
@@ -220,9 +218,6 @@ export function SettingsDialog({
             onReverted={onImportReverted}
           />
 
-          {/* Reset sync state — recovery khi R2 có delta cũ không tương thích. */}
-          <ResetSyncSection />
-
           {/* Đường dẫn data app — hữu ích cho support/debug/backup thủ công. */}
           <section>
             <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
@@ -280,134 +275,6 @@ export function SettingsDialog({
       </div>
     </div>,
     document.body,
-  );
-}
-
-/// Section reset sync state — fix case R2 có delta cũ mismatch FK sau
-/// migration schema. Không xóa data local, chỉ reset metadata sync.
-function ResetSyncSection() {
-  const [busy, setBusy] = useState(false);
-  const [nuclearBusy, setNuclearBusy] = useState(false);
-  const [done, setDone] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const onReset = async () => {
-    const ok = confirm(
-      "Reset sync state?\n\n" +
-        "• DATA LOCAL GIỮ NGUYÊN (an toàn).\n" +
-        "• Chỉ reset cursor + manifest metadata.\n" +
-        "• LẦN SYNC TIẾP THEO sẽ re-push toàn bộ data từ đầu.\n\n" +
-        "LƯU Ý: sau reset, cần xóa dữ liệu cũ trên R2 (Cloudflare dashboard) " +
-        "hoặc click 'Xóa R2 + Reset (1-click)' để tự động.",
-    );
-    if (!ok) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await invoke<void>("sync_v9_reset_local_state");
-      setDone("Đã reset local. Cần wipe R2 thủ công rồi sync lại.");
-      setTimeout(() => setDone(null), 5000);
-    } catch (e) {
-      setError((e as Error).message ?? String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onNuclear = async () => {
-    const ok = confirm(
-      "⚠️ XÓA R2 + Reset local state (1-click)?\n\n" +
-        "• Data R2 của BẠN sẽ bị archive (giữ 30 ngày rồi xóa).\n" +
-        "• Data local GIỮ NGUYÊN — không mất gì.\n" +
-        "• Local sync state reset — lần sync tiếp sẽ re-push toàn bộ.\n\n" +
-        "Dùng khi: lỗi 'FOREIGN KEY constraint failed' do delta R2 cũ.\n\n" +
-        "Tiếp tục?",
-    );
-    if (!ok) return;
-    setNuclearBusy(true);
-    setError(null);
-    try {
-      const idToken = await getAuthToken();
-      await syncV9NuclearReset(idToken);
-      setDone(
-        "Đã xóa R2 + reset local. Click 'Đồng bộ R2 ngay' để push data fresh.",
-      );
-      setTimeout(() => setDone(null), 8000);
-    } catch (e) {
-      setError((e as Error).message ?? String(e));
-    } finally {
-      setNuclearBusy(false);
-    }
-  };
-
-  return (
-    <section>
-      <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
-        <span className="material-symbols-rounded text-base">
-          restart_alt
-        </span>
-        Reset sync state (debug)
-      </h3>
-      <p className="mb-3 text-xs text-white/50">
-        Chỉ dùng khi gặp lỗi sync "FK constraint failed" do delta cũ trên R2
-        không còn khớp schema mới. Reset không xóa data local, chỉ reset
-        metadata để lần sync tiếp re-push toàn bộ từ đầu.
-      </p>
-      <div className="rounded-xl border border-red-500/40 bg-red-950/20 p-3">
-        <div className="flex items-start gap-2">
-          <span className="material-symbols-rounded mt-0.5 text-base text-red-400">
-            priority_high
-          </span>
-          <div className="flex-1 text-xs text-red-100/90">
-            <b>Khuyến nghị: dùng "Xóa R2 + Reset (1-click)"</b> để fix nhanh.
-            Data local sẽ giữ nguyên, chỉ xóa R2 + reset metadata. Sau đó
-            click "Đồng bộ R2" để push fresh lên R2.
-          </div>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void onNuclear()}
-            disabled={nuclearBusy || busy}
-            className="btn-ripple flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <span
-              className={`material-symbols-rounded text-sm ${nuclearBusy ? "animate-spin" : ""}`}
-            >
-              {nuclearBusy ? "sync" : "delete_sweep"}
-            </span>
-            {nuclearBusy ? "Đang xóa R2..." : "Xóa R2 + Reset (1-click)"}
-          </button>
-          <button
-            type="button"
-            onClick={() => void onReset()}
-            disabled={busy || nuclearBusy}
-            className="btn-ripple flex items-center gap-1.5 rounded-md border border-amber-500/60 bg-amber-900/30 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-900/50 disabled:cursor-not-allowed disabled:opacity-50"
-            title="Chỉ reset local state, không xóa R2. Phải vào Cloudflare dashboard xóa thủ công sau."
-          >
-            <span
-              className={`material-symbols-rounded text-sm ${busy ? "animate-spin" : ""}`}
-            >
-              {busy ? "sync" : "restart_alt"}
-            </span>
-            Chỉ reset local
-          </button>
-          {done && (
-            <span className="flex items-center gap-1 text-xs text-green-300">
-              <span className="material-symbols-rounded text-sm">
-                check_circle
-              </span>
-              {done}
-            </span>
-          )}
-          {error && (
-            <span className="text-xs text-red-300" title={error}>
-              Lỗi: {error}
-            </span>
-          )}
-        </div>
-      </div>
-    </section>
   );
 }
 

@@ -95,8 +95,6 @@ pub fn run() {
             commands::screenshot::save_png,
             // Sync v9 commands — per-table incremental delta sync.
             commands::sync_v9_cmds::sync_v9_get_state,
-            commands::sync_v9_cmds::sync_v9_reset_local_state,
-            commands::sync_v9_cmds::sync_v9_nuclear_reset,
             commands::sync_v9_cmds::sync_v9_push_all,
             commands::sync_v9_cmds::sync_v9_pull_all,
             commands::sync_v9_cmds::sync_v9_sync_all,

@@ -259,31 +259,6 @@ pub async fn push_sync_log(
 }
 
 // =============================================================
-// ADMIN — cleanup (archive + delete)
-// =============================================================
-
-/// POST /v9/admin/cleanup?uid=X — archive users/{uid}/* → delete.
-/// Worker archive trước delete (rule giữ data G4) vào archive/deleted_{uid}_{ts}/
-/// giữ 30 ngày. User là admin của chính account mình nên được phép.
-pub async fn admin_cleanup_user(
-    base_url: &str,
-    id_token: &str,
-    target_uid: &str,
-) -> Result<()> {
-    let path = format!("/v9/admin/cleanup?uid={}", urlencoding_encode(target_uid));
-    let res = build_client(HTTP_TIMEOUT)?
-        .post(url(base_url, &path))
-        .bearer_auth(id_token)
-        .header("Content-Type", "application/json")
-        .body("{}")
-        .send()
-        .await
-        .context("admin_cleanup_user send")?;
-    let _ = parse_envelope(res, &path).await?;
-    Ok(())
-}
-
-// =============================================================
 // ADMIN — sync log viewer
 // =============================================================
 
