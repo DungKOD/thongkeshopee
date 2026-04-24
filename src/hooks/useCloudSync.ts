@@ -7,6 +7,7 @@ import {
   syncMetadata,
   syncPullMergePush,
   syncUploadDb,
+  type SyncMetadataResult,
 } from "../lib/sync";
 
 export type SyncStatus =
@@ -166,7 +167,17 @@ export function useCloudSync({
   /// Sync strategy thông minh:
   /// - Fetch metadata trước. Nếu remote mới + khác máy → pull-merge-push (merge data).
   /// - Ngược lại → upload thẳng (rẻ hơn, bỏ qua merge khi không cần).
-  const doSync = useCallback(async (): Promise<void> => {
+  ///
+  /// `prefetched` optional — khi caller vừa fetch metadata + syncState (vd
+  /// `doStartupCheck` ngay trước đó), pass xuống để skip Promise.all ở đầu
+  /// function. Tiết kiệm 1 Worker `/metadata` req + 1 local invoke. Values
+  /// vẫn valid vì giữa 2 await không có mutation (sequential trong startup).
+  const doSync = useCallback(
+    async (prefetched?: {
+      metadata: SyncMetadataResult;
+      localFp: string;
+      syncState: SyncStateDto;
+    }): Promise<void> => {
     const current = auth.currentUser;
     if (!current) return;
     if (!navigator.onLine) {
@@ -182,11 +193,20 @@ export function useCloudSync({
     setError(null);
     try {
       const idToken = await getAuthToken();
-      const [metadata, localFp, beforeSync] = await Promise.all([
-        syncMetadata(idToken),
-        machineFingerprint(),
-        refreshSyncState(),
-      ]);
+      const { metadata, localFp, beforeSync } = prefetched
+        ? {
+            metadata: prefetched.metadata,
+            localFp: prefetched.localFp,
+            beforeSync: prefetched.syncState,
+          }
+        : await (async () => {
+            const [m, fp, s] = await Promise.all([
+              syncMetadata(idToken),
+              machineFingerprint(),
+              refreshSyncState(),
+            ]);
+            return { metadata: m, localFp: fp, beforeSync: s };
+          })();
 
       const remoteMtime = metadata.last_modified_ms ?? 0;
       const remoteFp = metadata.fingerprint ?? null;
@@ -312,9 +332,10 @@ export function useCloudSync({
       const syncState = await refreshSyncState();
 
       // Case 1: remote chưa tồn tại → doSync sẽ skip pull + upload lần đầu.
+      // Pass prefetched để doSync reuse metadata + syncState thay vì refetch.
       if (!remote.exists) {
         console.log("[sync] startupCheck: remote không tồn tại → doSync (upload init)");
-        await doSync();
+        await doSync({ metadata: remote, localFp, syncState });
         return;
       }
 
@@ -355,7 +376,7 @@ export function useCloudSync({
         localFresh ||
         (remoteChanged && differentMachine)
       ) {
-        await doSync();
+        await doSync({ metadata: remote, localFp, syncState });
         return;
       }
 
