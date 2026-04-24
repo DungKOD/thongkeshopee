@@ -126,6 +126,19 @@ export function syncV9CompactIfNeeded(idToken: string): Promise<CompactionReport
   });
 }
 
+/// Nuclear reset — wipe R2 của user hiện tại (archive 30 ngày) + reset
+/// local cursor/manifest state. Data LOCAL GIỮ NGUYÊN. Next sync sẽ
+/// re-push toàn bộ data local với schema mới. Dùng khi delta R2 cũ không
+/// tương thích (vd post-v13 FK mismatch).
+export function syncV9NuclearReset(idToken: string): Promise<void> {
+  return timed("tauri_admin", "sync_v9_nuclear_reset", async () => {
+    await invoke<void>("sync_v9_nuclear_reset", {
+      baseUrl: syncApiUrl(),
+      idToken,
+    });
+  });
+}
+
 // ==========================================================================
 // LOCAL sync log (user viewer — đọc DB local, không HTTP)
 // ==========================================================================

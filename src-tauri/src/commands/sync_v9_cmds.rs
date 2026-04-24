@@ -20,6 +20,70 @@ use crate::sync_v9::{
 use super::{CmdError, CmdResult};
 
 // =============================================================
+// NUCLEAR reset — wipe R2 + reset local (1-click recovery)
+// =============================================================
+
+/// Wipe R2 của user hiện tại (archive 30 ngày qua admin cleanup endpoint)
+/// + reset local sync state. Dùng khi R2 delta cũ không tương thích schema
+/// mới (vd post-v13 FK mismatch). Cần admin claim (user = admin của chính
+/// account mình nên OK).
+///
+/// **KHÔNG xóa data local**. Flow:
+/// 1. POST /v9/admin/cleanup?uid=self → archive users/{uid}/* vào
+///    archive/deleted_{uid}_{ts}/* rồi delete source
+/// 2. Reset local sync_cursor_state + sync_manifest_state
+/// 3. User click sync → push toàn bộ data local fresh với content_id mới
+///
+/// Next sync cross-machine: máy khác pull → không còn delta cũ, chỉ thấy
+/// delta mới hợp lệ.
+#[tauri::command]
+pub async fn sync_v9_nuclear_reset(
+    db: State<'_, DbState>,
+    base_url: String,
+    id_token: String,
+) -> CmdResult<()> {
+    // 1. Lấy uid của user hiện tại (từ DB).
+    let uid = {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        conn.query_row(
+            "SELECT owner_uid FROM sync_state WHERE id = 1",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .ok_or_else(|| CmdError::msg("owner_uid trống — chưa login?"))?
+    };
+
+    // 2. Wipe R2 — archive + delete. Worker verify admin claim.
+    client::admin_cleanup_user(&base_url, &id_token, &uid)
+        .await
+        .map_err(|e| CmdError::msg(format!("admin cleanup: {e}")))?;
+
+    // 3. Reset local state.
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    conn.execute(
+        "UPDATE sync_cursor_state
+         SET last_uploaded_cursor = '0',
+             last_pulled_cursor = '0',
+             last_uploaded_hash = NULL,
+             updated_at = ?",
+        [chrono::Utc::now().to_rfc3339()],
+    )?;
+    conn.execute(
+        "UPDATE sync_manifest_state
+         SET last_remote_etag = NULL,
+             last_pulled_manifest_clock_ms = 0,
+             last_snapshot_key = NULL,
+             last_snapshot_clock_ms = 0,
+             fresh_install_pending = 0
+         WHERE id = 1",
+        [],
+    )?;
+    Ok(())
+}
+
+// =============================================================
 // RESET sync state (recovery)
 // =============================================================
 
