@@ -218,6 +218,9 @@ export function SettingsDialog({
             onReverted={onImportReverted}
           />
 
+          {/* Reset sync state — recovery khi R2 có delta cũ không tương thích. */}
+          <ResetSyncSection />
+
           {/* Đường dẫn data app — hữu ích cho support/debug/backup thủ công. */}
           <section>
             <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
@@ -275,6 +278,97 @@ export function SettingsDialog({
       </div>
     </div>,
     document.body,
+  );
+}
+
+/// Section reset sync state — fix case R2 có delta cũ mismatch FK sau
+/// migration schema. Không xóa data local, chỉ reset metadata sync.
+function ResetSyncSection() {
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const onReset = async () => {
+    const ok = confirm(
+      "Reset sync state?\n\n" +
+        "• DATA LOCAL GIỮ NGUYÊN (an toàn).\n" +
+        "• Chỉ reset cursor + manifest metadata.\n" +
+        "• LẦN SYNC TIẾP THEO sẽ re-push toàn bộ data từ đầu.\n\n" +
+        "Dùng khi: gặp lỗi 'apply event insert ... FOREIGN KEY constraint failed' " +
+        "(do delta cũ trên R2 không khớp schema mới sau migration).\n\n" +
+        "LƯU Ý: sau reset, cần xóa dữ liệu cũ trên R2 (Cloudflare dashboard " +
+        "hoặc admin cleanup) để tránh pull lại delta cũ.",
+    );
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke<void>("sync_v9_reset_local_state");
+      setDone(true);
+      setTimeout(() => setDone(false), 3000);
+    } catch (e) {
+      setError((e as Error).message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+        <span className="material-symbols-rounded text-base">
+          restart_alt
+        </span>
+        Reset sync state (debug)
+      </h3>
+      <p className="mb-3 text-xs text-white/50">
+        Chỉ dùng khi gặp lỗi sync "FK constraint failed" do delta cũ trên R2
+        không còn khớp schema mới. Reset không xóa data local, chỉ reset
+        metadata để lần sync tiếp re-push toàn bộ từ đầu.
+      </p>
+      <div className="rounded-xl border border-amber-500/30 bg-amber-950/20 p-3">
+        <div className="flex items-start gap-2">
+          <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
+            warning
+          </span>
+          <div className="flex-1 text-xs text-amber-200/90">
+            Sau reset, vào Cloudflare R2 dashboard xóa folder{" "}
+            <code className="rounded bg-black/30 px-1 font-mono">
+              users/&lt;uid&gt;/
+            </code>{" "}
+            (hoặc dùng admin cleanup) để data cũ không bị pull lại.
+          </div>
+        </div>
+        <div className="mt-3 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void onReset()}
+            disabled={busy}
+            className="btn-ripple flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <span
+              className={`material-symbols-rounded text-sm ${busy ? "animate-spin" : ""}`}
+            >
+              {busy ? "sync" : "restart_alt"}
+            </span>
+            {busy ? "Đang reset..." : "Reset sync state"}
+          </button>
+          {done && (
+            <span className="flex items-center gap-1 text-xs text-green-300">
+              <span className="material-symbols-rounded text-sm">
+                check_circle
+              </span>
+              Đã reset. Click "Đồng bộ R2" để re-push data.
+            </span>
+          )}
+          {error && (
+            <span className="text-xs text-red-300" title={error}>
+              Lỗi: {error}
+            </span>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 

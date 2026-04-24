@@ -124,7 +124,20 @@ fn exec_insert_or_ignore(
 
     let affected = tx
         .execute(&sql, params_from_iter(vals.iter()))
-        .with_context(|| format!("INSERT OR IGNORE {table}"))?;
+        .with_context(|| {
+            // Include row context để debug FK / NOT NULL failures. Giới hạn
+            // 200 chars tránh log flood với row lớn.
+            let row_summary = serde_json::to_string(row_obj)
+                .map(|s| {
+                    if s.len() > 200 {
+                        format!("{}...", &s[..200])
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_else(|_| "<unserializable>".to_string());
+            format!("INSERT OR IGNORE {table} (row={row_summary})")
+        })?;
     Ok(if affected > 0 {
         ApplyOutcome::Applied
     } else {

@@ -20,6 +20,52 @@ use crate::sync_v9::{
 use super::{CmdError, CmdResult};
 
 // =============================================================
+// RESET sync state (recovery)
+// =============================================================
+
+/// Reset local sync cursor state + manifest state về trạng thái fresh. Dùng
+/// khi R2 có delta files cũ không tương thích (vd old autoincrement id
+/// trước v13, FK fail khi apply).
+///
+/// Effect:
+/// - `sync_cursor_state`: tất cả cursors về '0', hash clear → next push
+///   re-capture toàn bộ data từ đầu
+/// - `sync_manifest_state`: etag clear, snapshot pointer clear, clock = 0
+///   → next pull sẽ refetch manifest mới
+///
+/// **KHÔNG xóa data local** (raw tables, manual_entries, tombstones vẫn
+/// nguyên). Chỉ reset metadata sync. Local data là source of truth cho
+/// re-push.
+///
+/// User flow khuyến nghị:
+/// 1. Gọi cmd này → reset local state
+/// 2. Admin wipe R2 users/{uid}/ (via admin cleanup) hoặc Cloudflare dashboard
+/// 3. Click sync → push toàn bộ data local lên R2 với state mới
+#[tauri::command]
+pub fn sync_v9_reset_local_state(db: State<'_, DbState>) -> CmdResult<()> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    conn.execute(
+        "UPDATE sync_cursor_state
+         SET last_uploaded_cursor = '0',
+             last_pulled_cursor = '0',
+             last_uploaded_hash = NULL,
+             updated_at = ?",
+        [chrono::Utc::now().to_rfc3339()],
+    )?;
+    conn.execute(
+        "UPDATE sync_manifest_state
+         SET last_remote_etag = NULL,
+             last_pulled_manifest_clock_ms = 0,
+             last_snapshot_key = NULL,
+             last_snapshot_clock_ms = 0,
+             fresh_install_pending = 0
+         WHERE id = 1",
+        [],
+    )?;
+    Ok(())
+}
+
+// =============================================================
 // State read (UI)
 // =============================================================
 
