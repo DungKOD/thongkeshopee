@@ -59,6 +59,37 @@ Mọi implementation phase phải tuân thủ 3 nguyên tắc này. Xung đột 
 
 **Target cost (100 user × 30 sync/ngày):** dưới $2/tháng (chủ yếu là R2 storage). Operations đều phải nằm trong free tier.
 
+### 4. 🧹 XÓA CODE CŨ KHI V9 THAY XONG (user yêu cầu 2026-04-24)
+
+**Nguyên văn user:** *"code cũ không dùng nữa nhớ phải loại bỏ đi nhé"*
+
+**Nguyên tắc:**
+- Không giữ dead code v8 sau khi phase v9 tương ứng deploy.
+- Không giữ "fallback về v8" vì app chưa có user thật — không cần backward-compat.
+- Mỗi phase replace xong module → phase tiếp hoặc phase chuyên-cleanup delete code cũ.
+- Cleanup là **work item bắt buộc**, không phải tùy chọn. Tracked trong commit message + Phần 6.1 schedule.
+
+**Cụ thể — những gì sẽ xóa:**
+
+| v8 code | Xóa ở phase | Thay bằng |
+|---|---|---|
+| `src-tauri/src/commands/sync.rs` (1,611 LOC) | P8 (commands wiring) | `src-tauri/src/sync_v9/*` + `commands/sync_v9_cmds.rs` |
+| `src-tauri/src/commands/sync_client.rs` (378 LOC) | P8 | `sync_v9/client.rs` |
+| `sync_state` columns v8: `dirty`, `change_id`, `last_uploaded_change_id`, `last_remote_etag`, `last_uploaded_hash` | P8 (migration v12) | `sync_cursor_state` + `sync_manifest_state` (đã có v11) |
+| Triggers bump change_id trên raw/manual/tombstone tables | P8 (migration v12) | Cursor-based capture (no triggers) |
+| `worker/src/index.ts` v8 endpoints (`/upload`, `/download`, `/metadata`) | P6 | `/v9/manifest/*`, `/v9/delta/*`, `/v9/snapshot/*`, `/v9/sync-log/*` |
+| `worker/src/admin.ts` v8 endpoints | P8 | `/v9/admin/*` |
+| `src/lib/sync.ts` (183 LOC) | P7 | `src/lib/sync_v9.ts` |
+| `src/hooks/useCloudSync.ts` (596 LOC) | P7 | rewrite |
+| `src-tauri/src/commands/sync.rs::next_hlc_ms` / `next_hlc_rfc3339` / `absorb_remote_clock` | P8 | Move sang `sync_v9/hlc.rs` (KHÔNG delete, chỉ relocate — v9 reuse) |
+| FE `SyncBadge` v8-specific logic | P7 | Adapt cho v9 state model |
+
+**Exception (KHÔNG xóa):**
+- HLC helpers (`next_hlc_ms`, `next_hlc_rfc3339`, `absorb_remote_clock`) — v9 dùng nguyên vẹn. Relocate sang `sync_v9/hlc.rs`, giữ tests.
+- `switch_db_to_user` + `apply_pending_sync` — multi-tenant isolation, không thuộc sync engine.
+- `machine_fingerprint` — dùng cho log + admin, không thuộc sync.
+- Admin view state + admin_list_users logic business — keep, chỉ endpoint HTTP path đổi.
+
 ---
 
 ## TL;DR
@@ -668,18 +699,46 @@ Vì chưa có user thật → **không cần dual-write / feature flag / migrati
 7. Deploy Worker v9 production, release app binary
 8. Monitor 1 tuần trước khi đóng endpoints v8 (có thể xóa code v8 luôn nếu không có user)
 
+### 6.1. Cleanup schedule v8 (nguyên tắc #4)
+
+Mỗi phase dưới đây có **2 phần**: implement v9 + **delete v8 tương ứng**. Cleanup là work item bắt buộc trong cùng PR, không defer.
+
+| Phase | Implement v9 | Delete v8 (cùng PR) |
+|---|---|---|
+| P1 ✅ | schema v11 (additive) + types + event_log | (không xóa — v8 sync.rs vẫn cần build compile) |
+| P2 ✅ | capture + push payload builder | (chưa — cần sync.rs cho Tauri commands hiện tại) |
+| P3 | manifest CAS flow | (chưa) |
+| P4 | pull flow (apply deltas) | (chưa) |
+| P5 | bootstrap + fresh-install guard | (chưa) |
+| **P6** | **Worker v9 endpoints (`/v9/*`)** | **Delete `worker/src/index.ts` v8 handlers (`/upload`, `/download`, `/metadata`)**, giữ admin dành P8 |
+| **P7** | **FE `useCloudSync_v9` + `sync_v9.ts` + Sync log UI** | **Delete `src/lib/sync.ts` + `src/hooks/useCloudSync.ts` v8**, rewrite `SyncBadge` cho v9 state |
+| **P8** | **Tauri commands v9 wired up (sync_v9_cmds.rs) + migration v12 drop sync_state v8 columns + drop triggers** | **Delete `src/commands/sync.rs` (1611 LOC) + `sync_client.rs` (378 LOC) + commands registration ở lib.rs. Move HLC helpers sang `sync_v9/hlc.rs`.** Delete `worker/src/admin.ts` v8 routes |
+| P9 | Integration tests full matrix | Grep cuối: `v8`, `dirty=1`, `change_id` → phải không còn reference |
+| P10 | Compaction (defer v9.1 OK) | - |
+
+**Gate cho mỗi PR:**
+- `cargo build` + `cargo test` pass
+- `grep -r "v8\|dirty=1\|last_uploaded_change_id\|change_id" src-tauri/src/ worker/src/ src/` → chỉ còn references trong migration history comments hoặc đã được wrap trong `#[deprecated]` removal path
+- Clippy không warn dead_code (nếu có → hoặc dùng, hoặc xóa)
+
+**Post-merge final sweep (sau P9):**
+- Delete `docs/SETUP_CLOUD.md` nếu chứa v8-only instructions
+- Review memory entries: `project_sync_v8_cas_hlc.md` → archive hoặc rewrite cho v9
+- `_schema_version` table: giữ hàng v1-v11 cho history, không delete
+
 ---
 
 ## Phần 7: Reference — code files sẽ touch
 
 | File | Hiện tại (LOC) | Sau v9 |
 |---|---|---|
-| `src-tauri/src/commands/sync.rs` | 1,611 | Rewrite ~1,200 |
-| `src-tauri/src/commands/sync_client.rs` | 378 | Rewrite ~400 (8 endpoints) |
-| `src-tauri/src/db/schema.sql` | ~+2 tables (cursor_state, manifest_state) |
-| `src-tauri/src/db/migrations/` | +1 migration v9 |
-| `worker/src/index.ts` | 288 | Rewrite ~450 |
-| `worker/src/admin.ts` | 146 | Update ~180 |
+| `src-tauri/src/commands/sync.rs` | 1,611 | **DELETE** ở P8 (replaced bởi `sync_v9/*` + `commands/sync_v9_cmds.rs`) |
+| `src-tauri/src/commands/sync_client.rs` | 378 | **DELETE** ở P8 (replaced bởi `sync_v9/client.rs`) |
+| `src-tauri/src/sync_v9/` (mới) | — | ~1,500 LOC: types, descriptors, capture, compress, push, pull, snapshot, hlc, client, event_log, commands |
+| `src-tauri/src/db/mod.rs::migrate_v11_sync_infra` | — | ✅ Phase 1 done (additive) |
+| `src-tauri/src/db/mod.rs::migrate_v12_drop_v8_sync` | — | Phase 8: drop sync_state v8 columns + triggers |
+| `worker/src/index.ts` | 288 | **DELETE v8 handlers** ở P6, thay bằng `/v9/*` routes ~450 LOC |
+| `worker/src/admin.ts` | 146 | **DELETE v8 routes** ở P8, thay bằng `/v9/admin/*` ~180 LOC |
 | `src/lib/sync.ts` | 183 | Rewrite ~250 |
 | `src/hooks/useCloudSync.ts` | 596 | Rewrite ~500 |
 | `src/components/SyncBadge.tsx` | 171 | Minor updates |
