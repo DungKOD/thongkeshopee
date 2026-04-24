@@ -34,6 +34,11 @@ import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
 import { useSelfPresence } from "./hooks/usePresence";
 import { SyncBadge } from "./components/SyncBadge";
+import { DayScreenshotDialog } from "./components/DayScreenshotDialog";
+import {
+  captureElementToBlob,
+  prefetchFontEmbedCSS,
+} from "./lib/screenshot";
 import { BootstrapSplash } from "./components/BootstrapSplash";
 import { UpdatesDropdown } from "./components/UpdatesDropdown";
 import { CloseWarningDialog } from "./components/CloseWarningDialog";
@@ -337,6 +342,31 @@ function AppInner() {
   }, [calcOpen]);
   const [subIdFocused, setSubIdFocused] = useState(false);
   const subIdInputRef = useRef<HTMLInputElement>(null);
+
+  // Screenshot tab Overview — capture toàn bộ content tab + preview dialog.
+  const overviewCaptureRef = useRef<HTMLDivElement | null>(null);
+  const [overviewCapturing, setOverviewCapturing] = useState(false);
+  const [overviewScreenshotBlob, setOverviewScreenshotBlob] =
+    useState<Blob | null>(null);
+  const handleOverviewScreenshot = async () => {
+    if (!overviewCaptureRef.current || overviewCapturing) return;
+    setOverviewCapturing(true);
+    try {
+      const blob = await captureElementToBlob(overviewCaptureRef.current, {
+        pixelRatio: 2,
+        backgroundColor: "#121212",
+      });
+      setOverviewScreenshotBlob(blob);
+    } catch (e) {
+      console.error("overview screenshot failed", e);
+      showToast({
+        message: `Chụp ảnh thất bại: ${(e as Error).message ?? e}`,
+        duration: 5000,
+      });
+    } finally {
+      setOverviewCapturing(false);
+    }
+  };
   const [entryDialog, setEntryDialog] = useState<{
     date: string;
     row?: UiRow | null;
@@ -962,8 +992,27 @@ function AppInner() {
 
                </div>
 
-                {/* Right anchor: badge counter, luôn bám phải */}
+                {/* Right anchor: badge counter + screenshot button (overview tab) */}
                 <div className="flex shrink-0 items-center gap-2 pt-1">
+                  {activeTab === "overview" && (
+                    <button
+                      type="button"
+                      onClick={() => void handleOverviewScreenshot()}
+                      onMouseEnter={() => prefetchFontEmbedCSS()}
+                      disabled={overviewCapturing}
+                      title="Chụp ảnh tab Tổng quan"
+                      className="btn-ripple flex items-center gap-1 rounded-lg border border-surface-8 bg-surface-2 px-2.5 py-1 text-xs font-medium text-white/80 hover:bg-surface-4 hover:text-white disabled:opacity-50"
+                    >
+                      <span
+                        className={`material-symbols-rounded text-base text-shopee-400 ${overviewCapturing ? "animate-spin" : ""}`}
+                      >
+                        {overviewCapturing ? "sync" : "photo_camera"}
+                      </span>
+                      <span className="hidden sm:inline">
+                        {overviewCapturing ? "Đang chụp..." : "Chụp ảnh"}
+                      </span>
+                    </button>
+                  )}
                   <span className="whitespace-nowrap rounded-full bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-300">
                     {days.length} / {totalDaysInDb} ngày
                     {canLoadMore && " · scroll để xem thêm"}
@@ -983,14 +1032,16 @@ function AppInner() {
                 </p>
               </div>
             ) : activeTab === "overview" ? (
-              <OverviewTab
-                days={days}
-                dateFrom={dateFrom}
-                dateTo={dateTo}
-                totalDaysInDb={totalDaysInDb}
-                currentFilter={effectiveFilter}
-                accountFilter={accountFilter}
-              />
+              <div ref={overviewCaptureRef}>
+                <OverviewTab
+                  days={days}
+                  dateFrom={dateFrom}
+                  dateTo={dateTo}
+                  totalDaysInDb={totalDaysInDb}
+                  currentFilter={effectiveFilter}
+                  accountFilter={accountFilter}
+                />
+              </div>
             ) : (
               <>
                 {selectedSubId ? (
@@ -1098,6 +1149,22 @@ function AppInner() {
           markMutation();
           void refetch();
         }}
+      />
+
+      <DayScreenshotDialog
+        isOpen={!!overviewScreenshotBlob}
+        blob={overviewScreenshotBlob}
+        date={dateFrom || ""}
+        dateLabel={
+          dateFrom && dateTo
+            ? dateFrom === dateTo
+              ? fmtDate(dateFrom)
+              : `${fmtDate(dateFrom)} → ${fmtDate(dateTo)}`
+            : ""
+        }
+        title="Ảnh tab Tổng quan"
+        defaultFileName={`thongkee-tongquan-${dateFrom || "all"}${dateTo && dateTo !== dateFrom ? `-${dateTo}` : ""}.png`}
+        onClose={() => setOverviewScreenshotBlob(null)}
       />
 
       {/* FAB — hiện khi scroll sâu, click về đầu page */}
