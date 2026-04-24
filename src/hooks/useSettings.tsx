@@ -153,12 +153,3 @@ export function sumFiltered(
   return total;
 }
 
-/**
- * @deprecated Hàm này áp reserve uniform cho MỌI commission, sai với logic
- * mới (chỉ đơn "Đang chờ xử lý" bị trừ reserve). Dùng `computeNetCommission`
- * trong `formulas.ts` thay thế — nhận (commission, commissionPending, fees).
- */
-export function netCommissionRatio(fees: ProfitFees): number {
-  const deduct = (fees.taxAndPlatformRate + fees.returnReserveRate) / 100;
-  return Math.max(0, 1 - deduct);
-}

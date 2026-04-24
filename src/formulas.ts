@@ -190,8 +190,17 @@ export function computeOverviewTotals(
       t.commissionPending,
       fees,
     );
+    // 1 pass qua shopeeClicksByReferrer: vừa accumulate total filtered clicks,
+    // vừa merge vào breakdown. Trước đây 2 pass (sumFiltered + loop) — kết quả
+    // giống hệt, loop này nhanh hơn micro.
+    let shopeeClicksFiltered = 0;
+    for (const [ref, n] of Object.entries(t.shopeeClicksByReferrer)) {
+      if (clickSources[ref] === false) continue;
+      shopeeClicksFiltered += n;
+      acc.clicksByReferrer[ref] = (acc.clicksByReferrer[ref] ?? 0) + n;
+    }
     acc.clicks += adsClicks;
-    acc.shopeeClicks += sumFiltered(t.shopeeClicksByReferrer, clickSources);
+    acc.shopeeClicks += shopeeClicksFiltered;
     acc.totalSpend += spend;
     acc.impressions += impr;
     acc.orders += t.ordersCount;
@@ -201,11 +210,6 @@ export function computeOverviewTotals(
     acc.orderValueTotal += t.orderValueTotal;
     acc.mcnFeeTotal += t.mcnFeeTotal;
     acc.commissionPending += t.commissionPending;
-    // Merge clicks by referrer (chỉ referrer enabled qua settings).
-    for (const [ref, n] of Object.entries(t.shopeeClicksByReferrer)) {
-      if (clickSources[ref] === false) continue;
-      acc.clicksByReferrer[ref] = (acc.clicksByReferrer[ref] ?? 0) + n;
-    }
 
     // daysCount/rowsCount vẫn dựa vào row-level vì là metrics hiển thị UI.
     let dayContributed = false;
@@ -320,7 +324,7 @@ export function computeDailyTrend(
     const net = computeNetCommission(t.commissionTotal, t.commissionPending, fees);
     const profit = net - spend;
     const roi = spend > 0 ? (profit / spend) * 100 : null;
-    const [y, m, d] = day.date.split("-");
+    const [, m, d] = day.date.split("-");
     points.push({
       date: day.date,
       dateShort: `${d}/${m}`,
@@ -332,8 +336,6 @@ export function computeDailyTrend(
       shopeeClicks: sumFiltered(t.shopeeClicksByReferrer, clickSources),
       dayCount: 1,
     });
-    // Suppress unused var warning for `y`.
-    void y;
   }
   // Sort ASC by date (days đầu vào thường DESC theo UI).
   points.sort((a, b) => a.date.localeCompare(b.date));
