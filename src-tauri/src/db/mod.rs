@@ -208,9 +208,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     // 3 bảng mapping từ source_file_id hiện có.
     migrate_import_history_v10(conn).context("import history v10 migration failed")?;
     // v11 = Sync v9 infrastructure (additive only ở Phase 1): thêm 3 table mới
-    // (sync_cursor_state, sync_manifest_state, sync_event_log). Không động
-    // sync_state cũ — đợi Phase 2 thay sync logic mới drop cột v8 thừa.
+    // (sync_cursor_state, sync_manifest_state, sync_event_log).
     migrate_v11_sync_infra(conn).context("v11 sync v9 infra migration failed")?;
+    // v12 (P8b) = drop v8 sync_state columns + v8 triggers. v9 tracking giờ
+    // hoàn toàn qua sync_cursor_state + sync_manifest_state.
+    migrate_v12_drop_v8_sync(conn).context("v12 drop v8 sync migration failed")?;
+    // v13 = content-based ids cho FK-referenced tables. Fix data-loss bug
+    // khi 2 máy fresh-install cùng autoincrement id collision. Rewrite existing
+    // rows sang content_id + add ON UPDATE CASCADE cho FK tới imported_files.id.
+    migrate_v13_content_ids(conn).context("v13 content-id migration failed")?;
+    // v13 rebuild raw_* tables → triggers attach on old table dropped.
+    // Recreate mapping cleanup triggers để day delete cascade vẫn clean
+    // orphan mapping rows.
+    create_mapping_cleanup_triggers(conn)
+        .context("recreate mapping cleanup triggers after v13 failed")?;
     // Dọn orphan imported_files mỗi startup — idempotent. Xử lý legacy DB
     // của user đã xóa ngày trước khi batch_commit_deletes biết cleanup
     // (kẻo re-import cùng file bị chặn bởi hash dedup).
@@ -675,124 +686,51 @@ fn build_coalesce(opts: &[Option<&str>]) -> String {
     }
 }
 
-/// Đảm bảo sync_state có đủ cột mới + triggers luôn up-to-date.
-/// Idempotent: ALTER TABLE ADD COLUMN chỉ chạy nếu cột chưa có;
-/// DROP + CREATE triggers chạy mỗi lần (rẻ, đảm bảo body match code).
+/// Đảm bảo sync_state có cột v9-essential + mapping cleanup triggers.
+///
+/// P8b: đã gỡ v8 column additions (dirty/change_id/last_*) + v8 triggers
+/// (trg_sync_*). Cột v8 thừa sẽ được `migrate_v12_drop_v8_sync` drop khỏi
+/// DB legacy. v9 sync tracking qua `sync_cursor_state` + `sync_manifest_state`.
 fn migrate_sync_state(conn: &Connection) -> Result<()> {
-    // Check cột tồn tại chưa (sync_state cũ chỉ có 5 cột).
     let cols: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(sync_state)")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
 
-    if !cols.iter().any(|c| c == "change_id") {
-        conn.execute(
-            "ALTER TABLE sync_state ADD COLUMN change_id INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    if !cols.iter().any(|c| c == "last_uploaded_change_id") {
-        conn.execute(
-            "ALTER TABLE sync_state ADD COLUMN last_uploaded_change_id INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    // owner_uid: Firebase UID của user cuối cùng sync/sở hữu DB này. Dùng detect
-    // multi-tenant khi nhiều user login cùng máy → FE check owner != current
-    // user sẽ wipe local DB trước khi sync (tránh B thấy data của A).
+    // owner_uid: Firebase UID của user sở hữu DB này. Dùng detect multi-tenant
+    // khi nhiều user login cùng máy → FE check owner != current user sẽ wipe
+    // local DB trước khi sync.
     if !cols.iter().any(|c| c == "owner_uid") {
-        conn.execute(
-            "ALTER TABLE sync_state ADD COLUMN owner_uid TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE sync_state ADD COLUMN owner_uid TEXT", [])?;
     }
-    // v8: HLC-lite clock (chống clock drift giữa 2 máy). Mỗi mutation lấy
-    // `max(now_ms, last_known_clock_ms + 1)` → timestamp monotonic kể cả khi
-    // local wall clock chậm hơn remote. Sau merge, absorb max remote timestamp
-    // → edit sau merge luôn > mọi edit remote đã thấy.
+    // HLC-lite clock (giữ từ v8, v9 reuse): timestamp monotonic counter chống
+    // clock drift giữa 2 máy. Mỗi mutation lấy max(now_ms, last_known_clock_ms+1).
     if !cols.iter().any(|c| c == "last_known_clock_ms") {
         conn.execute(
             "ALTER TABLE sync_state ADD COLUMN last_known_clock_ms INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
-    // v8: CAS upload guard. Store etag từ R2 lần cuối pull/upload thành công.
-    // Next upload attach expected_etag → Worker reject 412 nếu R2 đã thay đổi
-    // (máy khác upload trong lúc này) → FE force pull-merge-push + retry.
-    if !cols.iter().any(|c| c == "last_remote_etag") {
-        conn.execute(
-            "ALTER TABLE sync_state ADD COLUMN last_remote_etag TEXT",
-            [],
-        )?;
-    }
-    // v8.1: skip-identical hash. MD5 của compressed bytes lần upload gần nhất.
-    // Next upload compute hash trước → match → skip (no-op sync), save bandwidth
-    // cho case user edit-revert-edit-revert tạo identical snapshots.
-    if !cols.iter().any(|c| c == "last_uploaded_hash") {
-        conn.execute(
-            "ALTER TABLE sync_state ADD COLUMN last_uploaded_hash TEXT",
-            [],
-        )?;
-    }
 
-    // Drop + re-create sync triggers để đảm bảo body match code hiện tại.
-    // Triggers increment cả dirty lẫn change_id (cho CAS pattern).
-    let trigger_specs: &[(&str, &str, &str)] = &[
-        ("trg_sync_clicks_ins",   "INSERT", "raw_shopee_clicks"),
-        ("trg_sync_clicks_upd",   "UPDATE", "raw_shopee_clicks"),
-        ("trg_sync_clicks_del",   "DELETE", "raw_shopee_clicks"),
-        ("trg_sync_orders_ins",   "INSERT", "raw_shopee_order_items"),
-        ("trg_sync_orders_upd",   "UPDATE", "raw_shopee_order_items"),
-        ("trg_sync_orders_del",   "DELETE", "raw_shopee_order_items"),
-        ("trg_sync_fb_ads_ins",   "INSERT", "raw_fb_ads"),
-        ("trg_sync_fb_ads_upd",   "UPDATE", "raw_fb_ads"),
-        ("trg_sync_fb_ads_del",   "DELETE", "raw_fb_ads"),
-        ("trg_sync_manual_ins",   "INSERT", "manual_entries"),
-        ("trg_sync_manual_upd",   "UPDATE", "manual_entries"),
-        ("trg_sync_manual_del",   "DELETE", "manual_entries"),
-        // Tombstones: INSERT khi user xóa → cần sync qua Drive. DELETE khi user
-        // restore (tương lai) hoặc compact — cũng mark dirty.
-        ("trg_sync_tombstones_ins", "INSERT", "tombstones"),
-        ("trg_sync_tombstones_del", "DELETE", "tombstones"),
-        // Shopee accounts: CRUD account cần đồng bộ cross-device (2 máy tạo
-        // cùng TK → sync merge theo UNIQUE name).
-        ("trg_sync_accounts_ins", "INSERT", "shopee_accounts"),
-        ("trg_sync_accounts_upd", "UPDATE", "shopee_accounts"),
-        ("trg_sync_accounts_del", "DELETE", "shopee_accounts"),
-    ];
+    create_mapping_cleanup_triggers(conn)?;
 
-    // Drop legacy triggers trên bảng FB cũ (đã gộp vào raw_fb_ads ở v3).
-    for name in [
-        "trg_sync_fb_ad_ins",
-        "trg_sync_fb_ad_upd",
-        "trg_sync_fb_ad_del",
-        "trg_sync_fb_camp_ins",
-        "trg_sync_fb_camp_upd",
-        "trg_sync_fb_camp_del",
-    ] {
-        conn.execute(&format!("DROP TRIGGER IF EXISTS {name}"), [])?;
-    }
+    Ok(())
+}
 
-    for (name, event, table) in trigger_specs {
-        conn.execute(&format!("DROP TRIGGER IF EXISTS {name}"), [])?;
-        conn.execute(
-            &format!(
-                "CREATE TRIGGER {name} AFTER {event} ON {table}
-                 BEGIN UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1; END"
-            ),
-            [],
-        )?;
-    }
-
-    // v10 correctness: mapping tables phải drop khi raw row bị xóa (direct hoặc
-    // CASCADE từ days.date). Nếu không: mapping rỗng chỉ tới row đã xóa →
-    // revert orphan query miss + re-import (orders/fb_ads có AUTOINCREMENT id)
-    // tạo row mới id không khớp mapping cũ.
-    //
-    // Lưu ý: SQLite trigger FIRE cả với CASCADE delete (khác MySQL). Vậy nên
-    // day delete → raw CASCADE → trigger fire → mapping cleanup. Atomic.
-    let mapping_cleanup_specs: &[(&str, &str, &str, &str)] = &[
+/// Tạo (hoặc DROP+recreate) triggers dọn mapping tables khi raw row bị
+/// xóa. Gọi từ migrate_sync_state HOẶC sau migrate_v13 (v13 rebuild raw
+/// tables → triggers cũ mất → phải recreate).
+///
+/// v10 correctness: mapping tables phải drop khi raw row bị xóa (direct hoặc
+/// CASCADE từ days.date). Nếu không: mapping rỗng chỉ tới row đã xóa →
+/// revert orphan query miss + re-import (orders/fb_ads có AUTOINCREMENT id)
+/// tạo row mới id không khớp mapping cũ.
+///
+/// Lưu ý: SQLite trigger FIRE cả với CASCADE delete (khác MySQL). Vậy nên
+/// day delete → raw CASCADE → trigger fire → mapping cleanup. Atomic.
+fn create_mapping_cleanup_triggers(conn: &Connection) -> Result<()> {
+    let specs: &[(&str, &str, &str, &str)] = &[
         (
             "trg_cleanup_click_mapping",
             "raw_shopee_clicks",
@@ -812,7 +750,7 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
             "fb_ad_id",
         ),
     ];
-    for (trg, src_tbl, map_tbl, map_key) in mapping_cleanup_specs {
+    for (trg, src_tbl, map_tbl, map_key) in specs {
         let old_col = if *map_key == "click_id" { "click_id" } else { "id" };
         conn.execute(&format!("DROP TRIGGER IF EXISTS {trg}"), [])?;
         conn.execute(
@@ -823,8 +761,472 @@ fn migrate_sync_state(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    Ok(())
+}
+
+/// v12 (P8b) — drop v8 sync artifacts sau khi v9 thay sync layer xong.
+///
+/// Idempotent: DROP TRIGGER IF EXISTS + check column existence trước DROP.
+/// Safe chạy nhiều lần (startup sau migration đầu sẽ no-op).
+///
+/// Drop:
+/// - 17 triggers `trg_sync_*` trên raw_*, manual_entries, tombstones,
+///   shopee_accounts (bump dirty/change_id — v9 không dùng).
+/// - 8 cột v8 trong `sync_state` (dirty, change_id, last_uploaded_change_id,
+///   last_uploaded_hash, last_remote_etag, last_synced_at_ms,
+///   last_synced_remote_mtime_ms, last_error).
+///
+/// Giữ: id, owner_uid, last_known_clock_ms.
+fn migrate_v12_drop_v8_sync(conn: &Connection) -> Result<()> {
+    let v8_triggers = [
+        "trg_sync_clicks_ins",
+        "trg_sync_clicks_upd",
+        "trg_sync_clicks_del",
+        "trg_sync_orders_ins",
+        "trg_sync_orders_upd",
+        "trg_sync_orders_del",
+        "trg_sync_fb_ads_ins",
+        "trg_sync_fb_ads_upd",
+        "trg_sync_fb_ads_del",
+        "trg_sync_manual_ins",
+        "trg_sync_manual_upd",
+        "trg_sync_manual_del",
+        "trg_sync_tombstones_ins",
+        "trg_sync_tombstones_del",
+        "trg_sync_accounts_ins",
+        "trg_sync_accounts_upd",
+        "trg_sync_accounts_del",
+    ];
+    for name in v8_triggers {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {name}"), [])?;
+    }
+
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sync_state)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    let v8_cols = [
+        "dirty",
+        "change_id",
+        "last_uploaded_change_id",
+        "last_uploaded_hash",
+        "last_remote_etag",
+        "last_synced_at_ms",
+        "last_synced_remote_mtime_ms",
+        "last_error",
+    ];
+    for col in v8_cols {
+        if cols.iter().any(|c| c == col) {
+            // SQLite 3.35+ support DROP COLUMN (rusqlite bundled v3.46+ OK).
+            conn.execute(&format!("ALTER TABLE sync_state DROP COLUMN {col}"), [])?;
+        }
+    }
 
     Ok(())
+}
+
+/// v13 = content-based deterministic ids cho 4 tables có autoincrement id
+/// + được reference qua FK / informal cross-table pointer.
+///
+/// **Fix bug data-loss cross-machine:** 2 máy fresh-install cùng
+/// autoincrement = 1 → apply-side INSERT OR IGNORE silently drop. Sau
+/// migration: id = hash(natural_key), cùng content → cùng id mọi máy.
+///
+/// **Scope:**
+/// - `imported_files` id = `content_id.imported_file_id(file_hash)`
+/// - `shopee_accounts` id = `content_id.shopee_account_id(name)`
+/// - `raw_shopee_order_items` id = `content_id.order_item_id(...)`
+/// - `raw_fb_ads` id = `content_id.fb_ad_id(...)`
+///
+/// **FK cascade:**
+/// - 6 tables FK tới `imported_files.id` → rebuild với `ON UPDATE CASCADE`
+///   để UPDATE parent.id tự propagate children.
+/// - `orders_to_file.order_item_id`, `fb_ads_to_file.fb_ad_id`,
+///   `raw_*.shopee_account_id`, `imported_files.shopee_account_id` là
+///   informal pointer (không declared FK) → migration update thủ công.
+///
+/// Idempotent: check FK `on_update` = CASCADE trước → đã migrate → skip.
+fn migrate_v13_content_ids(conn: &Connection) -> Result<()> {
+    // ---------- Idempotency: đã chạy chưa? ----------
+    let already_migrated = raw_shopee_clicks_fk_has_cascade(conn)?;
+    if already_migrated {
+        return Ok(());
+    }
+
+    // ---------- Wrap TX + disable FK cho schema rebuild ----------
+    // PRAGMA foreign_keys OFF bắt buộc — schema rebuild (DROP + RENAME) sẽ
+    // vi phạm FK tạm thời. Phải re-enable sau commit kể cả khi Err.
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        // PART A: Rebuild 6 tables thêm ON UPDATE CASCADE FK tới imported_files.id.
+        rebuild_raw_shopee_clicks_with_cascade(&tx)?;
+        rebuild_raw_shopee_order_items_with_cascade(&tx)?;
+        rebuild_raw_fb_ads_with_cascade(&tx)?;
+        rebuild_clicks_to_file_with_cascade(&tx)?;
+        rebuild_orders_to_file_with_cascade(&tx)?;
+        rebuild_fb_ads_to_file_with_cascade(&tx)?;
+
+        // PART B: Rewrite ids. Order: leaf tables trước, imported_files cuối vì
+        // ON UPDATE CASCADE chỉ có sau PART A.
+        rewrite_shopee_accounts_ids(&tx)?;
+        rewrite_order_items_ids(&tx)?;
+        rewrite_fb_ads_ids(&tx)?;
+        rewrite_imported_files_ids(&tx)?;
+
+        tx.commit()?;
+        Ok(())
+    })();
+
+    // Always re-enable FK — init_db_at ALSO apply `PRAGMA foreign_keys=ON`
+    // nhưng explicit re-enable ở đây để test helper (migrate_for_tests) cũng
+    // restore đúng state.
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
+/// Check FK của raw_shopee_clicks.source_file_id — nếu on_update = CASCADE
+/// nghĩa là v13 đã chạy (rebuild schema).
+fn raw_shopee_clicks_fk_has_cascade(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_list(raw_shopee_clicks)")?;
+    let found = stmt
+        .query_map([], |r| {
+            let from: String = r.get(3)?;
+            let on_update: String = r.get(5)?;
+            Ok((from, on_update))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(found
+        .iter()
+        .any(|(from, upd)| from == "source_file_id" && upd == "CASCADE"))
+}
+
+// =============================================================
+// PART A — Table rebuild cho ON UPDATE CASCADE
+// =============================================================
+
+fn rebuild_raw_shopee_clicks_with_cascade(tx: &rusqlite::Transaction) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE raw_shopee_clicks_v13 (
+             click_id         TEXT PRIMARY KEY,
+             click_time       TEXT NOT NULL,
+             region           TEXT,
+             sub_id_raw       TEXT,
+             sub_id1          TEXT NOT NULL DEFAULT '',
+             sub_id2          TEXT NOT NULL DEFAULT '',
+             sub_id3          TEXT NOT NULL DEFAULT '',
+             sub_id4          TEXT NOT NULL DEFAULT '',
+             sub_id5          TEXT NOT NULL DEFAULT '',
+             referrer         TEXT,
+             day_date         TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
+             source_file_id   INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
+             shopee_account_id INTEGER
+         );
+         INSERT INTO raw_shopee_clicks_v13 SELECT
+             click_id, click_time, region, sub_id_raw,
+             sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+             referrer, day_date, source_file_id,
+             NULL AS shopee_account_id
+         FROM raw_shopee_clicks;",
+    )?;
+    // Note: shopee_account_id column có thể chưa tồn tại trong legacy schema.
+    // Nếu tồn tại, overwrite dòng SELECT. Kiểm tra trước.
+    let has_account_col: bool = {
+        let cols: Vec<String> = tx
+            .prepare("PRAGMA table_info(raw_shopee_clicks)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        cols.iter().any(|c| c == "shopee_account_id")
+    };
+    if has_account_col {
+        tx.execute_batch(
+            "DELETE FROM raw_shopee_clicks_v13;
+             INSERT INTO raw_shopee_clicks_v13 SELECT
+                 click_id, click_time, region, sub_id_raw,
+                 sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                 referrer, day_date, source_file_id, shopee_account_id
+             FROM raw_shopee_clicks;",
+        )?;
+    }
+    tx.execute_batch(
+        "DROP TABLE raw_shopee_clicks;
+         ALTER TABLE raw_shopee_clicks_v13 RENAME TO raw_shopee_clicks;
+         CREATE INDEX IF NOT EXISTS idx_clicks_day ON raw_shopee_clicks(day_date);
+         CREATE INDEX IF NOT EXISTS idx_clicks_subid ON raw_shopee_clicks(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
+         CREATE INDEX IF NOT EXISTS idx_clicks_day_subid ON raw_shopee_clicks(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);",
+    )?;
+    Ok(())
+}
+
+fn rebuild_raw_shopee_order_items_with_cascade(tx: &rusqlite::Transaction) -> Result<()> {
+    // Dynamically pull column list + drop/recreate giữ nguyên cols để forward
+    // compat với v7 MCN + v8/v9 ADD COLUMN. Dùng SELECT * và same order.
+    let cols = collect_column_names(tx, "raw_shopee_order_items")?;
+    let cols_csv = cols.join(", ");
+
+    // Rebuild với FK update CASCADE.
+    let mut ddl = String::from("CREATE TABLE raw_shopee_order_items_v13 (\n");
+    for col in &cols {
+        ddl.push_str(&format!("    {col} "));
+        match col.as_str() {
+            "id" => ddl.push_str("INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "source_file_id" => ddl.push_str(
+                "INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE",
+            ),
+            "day_date" => {
+                ddl.push_str("TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE")
+            }
+            "order_id" | "checkout_id" | "item_id" => ddl.push_str("TEXT NOT NULL"),
+            "model_id" => ddl.push_str("TEXT NOT NULL DEFAULT ''"),
+            c if c.starts_with("mcn_") => ddl.push_str("REAL"),
+            _ => {
+                // Các col còn lại giữ shape cũ — pull type từ pragma.
+                let dtype = column_type(tx, "raw_shopee_order_items", col)?;
+                ddl.push_str(&dtype);
+            }
+        }
+        ddl.push_str(",\n");
+    }
+    // UNIQUE giữ nguyên từ schema.
+    ddl.push_str("    UNIQUE(checkout_id, item_id, model_id)\n);");
+    tx.execute_batch(&ddl)?;
+
+    tx.execute_batch(&format!(
+        "INSERT INTO raw_shopee_order_items_v13 ({cols_csv}) SELECT {cols_csv} FROM raw_shopee_order_items;
+         DROP TABLE raw_shopee_order_items;
+         ALTER TABLE raw_shopee_order_items_v13 RENAME TO raw_shopee_order_items;
+         CREATE INDEX IF NOT EXISTS idx_orders_checkout_item ON raw_shopee_order_items(checkout_id, item_id, model_id);
+         CREATE INDEX IF NOT EXISTS idx_orders_day ON raw_shopee_order_items(day_date);
+         CREATE INDEX IF NOT EXISTS idx_orders_subid ON raw_shopee_order_items(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
+         CREATE INDEX IF NOT EXISTS idx_orders_day_subid ON raw_shopee_order_items(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);"
+    ))?;
+    Ok(())
+}
+
+fn rebuild_raw_fb_ads_with_cascade(tx: &rusqlite::Transaction) -> Result<()> {
+    let cols = collect_column_names(tx, "raw_fb_ads")?;
+    let cols_csv = cols.join(", ");
+
+    let mut ddl = String::from("CREATE TABLE raw_fb_ads_v13 (\n");
+    for col in &cols {
+        ddl.push_str(&format!("    {col} "));
+        match col.as_str() {
+            "id" => ddl.push_str("INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "source_file_id" => ddl.push_str(
+                "INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE",
+            ),
+            "day_date" => ddl.push_str("TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE"),
+            "level" | "name" => ddl.push_str("TEXT NOT NULL"),
+            _ => {
+                let dtype = column_type(tx, "raw_fb_ads", col)?;
+                ddl.push_str(&dtype);
+            }
+        }
+        ddl.push_str(",\n");
+    }
+    ddl.push_str("    UNIQUE(day_date, level, name)\n);");
+    tx.execute_batch(&ddl)?;
+
+    tx.execute_batch(&format!(
+        "INSERT INTO raw_fb_ads_v13 ({cols_csv}) SELECT {cols_csv} FROM raw_fb_ads;
+         DROP TABLE raw_fb_ads;
+         ALTER TABLE raw_fb_ads_v13 RENAME TO raw_fb_ads;
+         CREATE INDEX IF NOT EXISTS idx_fb_ads_day ON raw_fb_ads(day_date);
+         CREATE INDEX IF NOT EXISTS idx_fb_ads_level ON raw_fb_ads(day_date, level);
+         CREATE INDEX IF NOT EXISTS idx_fb_ads_subid ON raw_fb_ads(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
+         CREATE INDEX IF NOT EXISTS idx_fb_ads_day_subid ON raw_fb_ads(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);"
+    ))?;
+    Ok(())
+}
+
+fn rebuild_clicks_to_file_with_cascade(tx: &rusqlite::Transaction) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE clicks_to_file_v13 (
+             click_id   TEXT    NOT NULL,
+             file_id    INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
+             PRIMARY KEY(click_id, file_id)
+         );
+         INSERT INTO clicks_to_file_v13 SELECT click_id, file_id FROM clicks_to_file;
+         DROP TABLE clicks_to_file;
+         ALTER TABLE clicks_to_file_v13 RENAME TO clicks_to_file;
+         CREATE INDEX IF NOT EXISTS idx_clicks_to_file_file ON clicks_to_file(file_id);",
+    )?;
+    Ok(())
+}
+
+fn rebuild_orders_to_file_with_cascade(tx: &rusqlite::Transaction) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE orders_to_file_v13 (
+             order_item_id INTEGER NOT NULL,
+             file_id       INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
+             PRIMARY KEY(order_item_id, file_id)
+         );
+         INSERT INTO orders_to_file_v13 SELECT order_item_id, file_id FROM orders_to_file;
+         DROP TABLE orders_to_file;
+         ALTER TABLE orders_to_file_v13 RENAME TO orders_to_file;
+         CREATE INDEX IF NOT EXISTS idx_orders_to_file_file ON orders_to_file(file_id);",
+    )?;
+    Ok(())
+}
+
+fn rebuild_fb_ads_to_file_with_cascade(tx: &rusqlite::Transaction) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE fb_ads_to_file_v13 (
+             fb_ad_id INTEGER NOT NULL,
+             file_id  INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
+             PRIMARY KEY(fb_ad_id, file_id)
+         );
+         INSERT INTO fb_ads_to_file_v13 SELECT fb_ad_id, file_id FROM fb_ads_to_file;
+         DROP TABLE fb_ads_to_file;
+         ALTER TABLE fb_ads_to_file_v13 RENAME TO fb_ads_to_file;
+         CREATE INDEX IF NOT EXISTS idx_fb_ads_to_file_file ON fb_ads_to_file(file_id);",
+    )?;
+    Ok(())
+}
+
+// =============================================================
+// PART B — Rewrite ids → content_id
+// =============================================================
+
+fn rewrite_shopee_accounts_ids(tx: &rusqlite::Transaction) -> Result<()> {
+    let rows: Vec<(i64, String)> = tx
+        .prepare("SELECT id, name FROM shopee_accounts")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (old_id, name) in rows {
+        let new_id = crate::sync_v9::content_id::shopee_account_id(&name);
+        if new_id == old_id {
+            continue;
+        }
+        tx.execute(
+            "UPDATE shopee_accounts SET id = ? WHERE id = ?",
+            rusqlite::params![new_id, old_id],
+        )?;
+        // Informal refs: raw_shopee_clicks.shopee_account_id,
+        //                raw_shopee_order_items.shopee_account_id,
+        //                raw_fb_ads.shopee_account_id (nếu có),
+        //                imported_files.shopee_account_id.
+        for table in [
+            "raw_shopee_clicks",
+            "raw_shopee_order_items",
+            "raw_fb_ads",
+            "imported_files",
+        ] {
+            let has_col = tx_table_has_column(tx, table, "shopee_account_id")?;
+            if has_col {
+                tx.execute(
+                    &format!("UPDATE {table} SET shopee_account_id = ? WHERE shopee_account_id = ?"),
+                    rusqlite::params![new_id, old_id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_order_items_ids(tx: &rusqlite::Transaction) -> Result<()> {
+    let rows: Vec<(i64, String, String, String)> = tx
+        .prepare(
+            "SELECT id, checkout_id, item_id, COALESCE(model_id, '') FROM raw_shopee_order_items",
+        )?
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    for (old_id, checkout, item, model) in rows {
+        let new_id = crate::sync_v9::content_id::order_item_id(&checkout, &item, &model);
+        if new_id == old_id {
+            continue;
+        }
+        tx.execute(
+            "UPDATE raw_shopee_order_items SET id = ? WHERE id = ?",
+            rusqlite::params![new_id, old_id],
+        )?;
+        // Informal ref: orders_to_file.order_item_id.
+        tx.execute(
+            "UPDATE orders_to_file SET order_item_id = ? WHERE order_item_id = ?",
+            rusqlite::params![new_id, old_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn rewrite_fb_ads_ids(tx: &rusqlite::Transaction) -> Result<()> {
+    let rows: Vec<(i64, String, String, String)> = tx
+        .prepare("SELECT id, day_date, level, name FROM raw_fb_ads")?
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    for (old_id, day_date, level, name) in rows {
+        let new_id = crate::sync_v9::content_id::fb_ad_id(&day_date, &level, &name);
+        if new_id == old_id {
+            continue;
+        }
+        tx.execute(
+            "UPDATE raw_fb_ads SET id = ? WHERE id = ?",
+            rusqlite::params![new_id, old_id],
+        )?;
+        tx.execute(
+            "UPDATE fb_ads_to_file SET fb_ad_id = ? WHERE fb_ad_id = ?",
+            rusqlite::params![new_id, old_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn rewrite_imported_files_ids(tx: &rusqlite::Transaction) -> Result<()> {
+    let rows: Vec<(i64, String)> = tx
+        .prepare("SELECT id, file_hash FROM imported_files")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (old_id, file_hash) in rows {
+        let new_id = crate::sync_v9::content_id::imported_file_id(&file_hash);
+        if new_id == old_id {
+            continue;
+        }
+        // ON UPDATE CASCADE (vừa add ở Part A) propagate children tự động:
+        // raw_shopee_clicks.source_file_id, raw_shopee_order_items.source_file_id,
+        // raw_fb_ads.source_file_id, clicks_to_file.file_id,
+        // orders_to_file.file_id, fb_ads_to_file.file_id.
+        tx.execute(
+            "UPDATE imported_files SET id = ? WHERE id = ?",
+            rusqlite::params![new_id, old_id],
+        )?;
+    }
+    Ok(())
+}
+
+// =============================================================
+// Helpers
+// =============================================================
+
+fn collect_column_names(tx: &rusqlite::Transaction, table: &str) -> Result<Vec<String>> {
+    let cols: Vec<String> = tx
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(cols)
+}
+
+fn column_type(tx: &rusqlite::Transaction, table: &str, col: &str) -> Result<String> {
+    let t: Option<String> = tx
+        .query_row(
+            &format!("SELECT type FROM pragma_table_info('{table}') WHERE name = ?"),
+            [col],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(t.unwrap_or_else(|| "TEXT".to_string()))
+}
+
+fn tx_table_has_column(tx: &rusqlite::Transaction, table: &str, col: &str) -> Result<bool> {
+    let cols = collect_column_names(tx, table)?;
+    Ok(cols.iter().any(|c| c == col))
 }
 
 fn has_legacy_fb_unique(conn: &Connection, table: &str, legacy: &str) -> Result<bool> {

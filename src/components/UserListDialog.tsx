@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth } from "../lib/firebase";
 import {
-  adminCleanupOrphans,
   adminListUsers,
   type UserListEntry,
 } from "../lib/sync";
@@ -10,6 +9,7 @@ import { useAllPresence } from "../hooks/usePresence";
 import { isOnline, lastSeenAt, type Presence } from "../lib/presence";
 import { fmtTimeAgo } from "../formulas";
 import { ScrollToTopButton } from "./ScrollToTopButton";
+import { SyncLogViewerDialog } from "./SyncLogViewerDialog";
 
 interface UserListDialogProps {
   isOpen: boolean;
@@ -26,6 +26,9 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
   const [sortKey, setSortKey] = useState<SortKey>("createdAt");
   const [sortDesc, setSortDesc] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
+  /// User đang được mở Sync Log viewer — null = viewer đóng. Lift lên đây
+  /// để 1 viewer instance dùng chung, state giữ qua re-render.
+  const [syncLogTarget, setSyncLogTarget] = useState<UserListEntry | null>(null);
   // Realtime map {uid → Presence} từ Firebase RTDB `/status`. Chỉ subscribe
   // khi dialog mở (isOpen=true) để tiết kiệm bandwidth — admin để app mở 24/7
   // nhưng không xem dialog → không consume heartbeat events.
@@ -83,32 +86,10 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
     const total = users.length;
     const premium = users.filter((u) => u.premium).length;
     const admin = users.filter((u) => u.admin).length;
-    const withFile = users.filter((u) => u.file !== null).length;
-    // Orphan = có file R2 nhưng không có Firestore doc (email null).
-    const orphans = users.filter((u) => u.email === null && u.file !== null).length;
-    return { total, premium, admin, withFile, orphans };
+    const withManifest = users.filter((u) => u.sync !== null).length;
+    const withSnapshot = users.filter((u) => u.sync?.hasSnapshot).length;
+    return { total, premium, admin, withManifest, withSnapshot };
   }, [users]);
-
-  const [cleaning, setCleaning] = useState(false);
-  const handleCleanupOrphans = useCallback(async () => {
-    const currentUser = auth.currentUser;
-    if (!currentUser) return;
-    const count = summary?.orphans ?? 0;
-    if (count === 0) return;
-    if (!confirm(`Xóa ${count} file orphan khỏi R2? Không hoàn tác được.`))
-      return;
-    setCleaning(true);
-    try {
-      const idToken = await currentUser.getIdToken(false);
-      const deleted = await adminCleanupOrphans(idToken);
-      alert(`Đã xóa ${deleted.length} file orphan.`);
-      await load();
-    } catch (e) {
-      alert(`Xóa thất bại: ${(e as Error).message}`);
-    } finally {
-      setCleaning(false);
-    }
-  }, [summary?.orphans, load]);
 
   if (!isOpen) return null;
 
@@ -134,7 +115,8 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
               {summary && (
                 <p className="text-xs text-white/50">
                   {summary.total} user · {summary.premium} premium ·{" "}
-                  {summary.admin} admin · {summary.withFile} có DB
+                  {summary.admin} admin · {summary.withManifest} đã sync ·{" "}
+                  {summary.withSnapshot} có snapshot
                 </p>
               )}
             </div>
@@ -173,21 +155,6 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
             </span>
             Tải lại
           </button>
-          {summary && summary.orphans > 0 && (
-            <button
-              onClick={() => void handleCleanupOrphans()}
-              disabled={cleaning}
-              className="btn-ripple flex items-center gap-1 rounded-lg border border-amber-700 bg-amber-900/40 px-3 py-2 text-sm text-amber-200 hover:bg-amber-800/50 disabled:opacity-50"
-              title={`Xóa ${summary.orphans} file R2 không có Firestore doc (orphan từ project Firebase cũ)`}
-            >
-              <span
-                className={`material-symbols-rounded text-base ${cleaning ? "animate-spin" : ""}`}
-              >
-                {cleaning ? "autorenew" : "delete_sweep"}
-              </span>
-              Xóa {summary.orphans} orphan
-            </button>
-          )}
         </div>
 
         <div ref={scrollRef} className="flex-1 overflow-auto">
@@ -238,6 +205,7 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
                     user={u}
                     presence={presence[u.uid]}
                     onClose={onClose}
+                    onOpenSyncLog={() => setSyncLogTarget(u)}
                   />
                 ))}
               </tbody>
@@ -250,6 +218,14 @@ export function UserListDialog({ isOpen, onClose }: UserListDialogProps) {
           className="absolute bottom-4 right-4"
         />
       </div>
+      {syncLogTarget && (
+        <SyncLogViewerDialog
+          isOpen={true}
+          onClose={() => setSyncLogTarget(null)}
+          targetUid={syncLogTarget.uid}
+          targetEmail={syncLogTarget.email}
+        />
+      )}
     </div>
   );
 
@@ -294,16 +270,20 @@ interface UserRowProps {
   user: UserListEntry;
   presence: Presence | undefined;
   onClose: () => void;
+  onOpenSyncLog: () => void;
 }
 
-function UserRow({ user, presence, onClose }: UserRowProps) {
+function UserRow({ user, presence, onClose, onOpenSyncLog }: UserRowProps) {
   const expiredAt = parseTs(user.expiredAt);
   const createdAt = parseTs(user.createdAt);
   const isExpired =
     user.premium && expiredAt && expiredAt.getTime() < Date.now();
-  const hasFile = user.file !== null;
+  // v9: chỉ user có snapshot mới view được (admin fetch qua
+  // /v9/admin/snapshot — 404 nếu chưa compact).
+  const hasSnapshot = user.sync?.hasSnapshot ?? false;
+  const hasManifest = user.sync !== null;
   const isSelf = auth.currentUser?.uid === user.uid;
-  const canView = hasFile && !!user.localPart && !isSelf;
+  const canView = hasSnapshot && !!user.localPart && !isSelf;
 
   const { enter, busy, view } = useAdminView();
   const isCurrent = view?.uid === user.uid;
@@ -328,13 +308,15 @@ function UserRow({ user, presence, onClose }: UserRowProps) {
     ? "Đang xem user này"
     : isSelf
       ? "Đây là tài khoản của bạn — đang xem DB của chính mình rồi"
-      : !hasFile
-        ? "User chưa backup DB"
-        : !user.localPart
-          ? "Thiếu local-part (email không hợp lệ)"
-          : busy
-            ? "Đang tải..."
-            : "Xem DB user này (read-only)";
+      : !hasManifest
+        ? "User chưa sync lần nào"
+        : !hasSnapshot
+          ? "User chưa có snapshot (cần compact P10) — chưa xem được"
+          : !user.localPart
+            ? "Thiếu local-part (email không hợp lệ)"
+            : busy
+              ? "Đang tải..."
+              : "Xem DB user này (read-only)";
 
   return (
     <tr
@@ -381,20 +363,31 @@ function UserRow({ user, presence, onClose }: UserRowProps) {
         <PresenceCell presence={presence} />
       </td>
       <td className="px-6 py-3 text-right">
-        <button
-          type="button"
-          onClick={handleView}
-          disabled={!canView || busy || isCurrent}
-          className={`btn-ripple inline-flex items-center gap-1 rounded-lg border px-3 py-1 text-xs ${
-            canView && !busy && !isCurrent
-              ? "border-shopee-500/60 bg-shopee-900/30 text-shopee-200 hover:bg-shopee-800/40"
-              : "border-surface-8 bg-surface-2 text-white/40"
-          }`}
-          title={title}
-        >
-          <span className="material-symbols-rounded text-sm">visibility</span>
-          {isCurrent ? "Đang xem" : isSelf ? "Chính bạn" : "Xem"}
-        </button>
+        <div className="inline-flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onOpenSyncLog}
+            className="btn-ripple inline-flex items-center gap-1 rounded-lg border border-surface-8 bg-surface-2 px-2.5 py-1 text-xs text-white/70 hover:bg-surface-4 hover:text-white"
+            title="Xem sync log v9 của user (admin)"
+          >
+            <span className="material-symbols-rounded text-sm">history</span>
+            Sync log
+          </button>
+          <button
+            type="button"
+            onClick={handleView}
+            disabled={!canView || busy || isCurrent}
+            className={`btn-ripple inline-flex items-center gap-1 rounded-lg border px-3 py-1 text-xs ${
+              canView && !busy && !isCurrent
+                ? "border-shopee-500/60 bg-shopee-900/30 text-shopee-200 hover:bg-shopee-800/40"
+                : "border-surface-8 bg-surface-2 text-white/40"
+            }`}
+            title={title}
+          >
+            <span className="material-symbols-rounded text-sm">visibility</span>
+            {isCurrent ? "Đang xem" : isSelf ? "Chính bạn" : "Xem"}
+          </button>
+        </div>
       </td>
     </tr>
   );

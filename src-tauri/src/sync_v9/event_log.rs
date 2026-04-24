@@ -109,6 +109,68 @@ pub fn fetch_pending(conn: &Connection, limit: u32) -> Result<Vec<SyncEvent>> {
         .context("collect fetch_pending rows failed")
 }
 
+/// Fetch tất cả events theo `event_id DESC` (mới → cũ), limit để không load
+/// hết ring buffer. Optional filter theo `kind` (exact match).
+///
+/// Dùng cho user log viewer — hiển thị hoạt động sync gần đây.
+pub fn fetch_recent(
+    conn: &Connection,
+    limit: u32,
+    kind_filter: Option<&str>,
+) -> Result<Vec<SyncEvent>> {
+    let (sql, has_kind): (&str, bool) = match kind_filter {
+        Some(_) => (
+            "SELECT event_id, ts, fingerprint, kind, ctx_json, uploaded_at
+             FROM sync_event_log
+             WHERE kind = ?
+             ORDER BY event_id DESC
+             LIMIT ?",
+            true,
+        ),
+        None => (
+            "SELECT event_id, ts, fingerprint, kind, ctx_json, uploaded_at
+             FROM sync_event_log
+             ORDER BY event_id DESC
+             LIMIT ?",
+            false,
+        ),
+    };
+
+    let mut stmt = conn.prepare(sql).context("prepare fetch_recent failed")?;
+
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<SyncEvent> {
+        let ctx_json: String = r.get(4)?;
+        let ctx: SyncEventCtx = serde_json::from_str(&ctx_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?;
+        Ok(SyncEvent {
+            event_id: r.get(0)?,
+            ts: r.get(1)?,
+            fingerprint: r.get(2)?,
+            kind: ctx.kind(),
+            ctx,
+            uploaded_at: r.get(5)?,
+        })
+    };
+
+    let rows: Vec<SyncEvent> = if has_kind {
+        stmt.query_map(params![kind_filter.unwrap(), limit], map_row)
+            .context("query fetch_recent(kind) failed")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("collect fetch_recent rows failed")?
+    } else {
+        stmt.query_map(params![limit], map_row)
+            .context("query fetch_recent failed")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("collect fetch_recent rows failed")?
+    };
+    Ok(rows)
+}
+
 /// Mark list event_ids đã upload lên R2, set uploaded_at = `now`.
 ///
 /// Caller dùng sau khi upload `/v9/sync-log/push` OK. Idempotent (nếu event

@@ -81,12 +81,26 @@ fn exec_insert_or_ignore(
     row_obj: &Map<String, Value>,
 ) -> Result<ApplyOutcome> {
     let table_cols = local_table_columns(tx, table)?;
-    // Dùng intersection columns row∩table. Forward-compat (K1): event sinh từ
-    // schema cũ hơn (thiếu col mới) → col mới = DEFAULT. Event từ schema mới
-    // hơn (có col chưa biết) → skip col đó.
+
+    // Strip `id` từ row nếu descriptor's pk_columns không có "id". Lý do: các
+    // table có `INTEGER PRIMARY KEY AUTOINCREMENT id` NHƯNG pk_columns logical
+    // khác (vd manual_entries pk = (sub_id1..5, day_date)) — id chỉ là surrogate
+    // local, không nên sync cross-machine. Nếu đẩy id từ remote, có thể clash
+    // với id autoincrement local (khác row) → INSERT OR IGNORE silently drop
+    // → data loss.
+    //
+    // Content-id tables (imported_files, shopee_accounts, raw_shopee_order_items,
+    // raw_fb_ads) có pk_columns bao gồm id hoặc natural keys hash→content_id ở
+    // INSERT site, nên id deterministic cross-machine — KHÔNG strip ở đây.
+    let desc = find_descriptor(table);
+    let strip_id = desc
+        .map(|d| !d.pk_columns.iter().any(|c| *c == "id"))
+        .unwrap_or(false);
+
     let cols_to_insert: Vec<&str> = table_cols
         .iter()
         .filter(|c| row_obj.contains_key(c.as_str()))
+        .filter(|c| !(strip_id && c.as_str() == "id"))
         .map(|s| s.as_str())
         .collect();
 

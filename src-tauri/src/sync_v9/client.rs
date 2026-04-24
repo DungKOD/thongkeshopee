@@ -259,6 +259,88 @@ pub async fn push_sync_log(
 }
 
 // =============================================================
+// ADMIN — sync log viewer
+// =============================================================
+
+/// File metadata entry từ `/v9/admin/sync-log` — đủ cho admin UI list view.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSyncLogFile {
+    pub key: String,
+    pub date: String,
+    pub size_bytes: u64,
+    pub uploaded_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AdminSyncLogListResp {
+    events: Vec<AdminSyncLogFile>,
+    truncated: bool,
+}
+
+/// Response shape cho FE — list file + truncated flag.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSyncLogList {
+    pub files: Vec<AdminSyncLogFile>,
+    pub truncated: bool,
+}
+
+/// GET /v9/admin/sync-log?uid=X&from=Y&to=Z
+pub async fn admin_get_sync_log_list(
+    base_url: &str,
+    id_token: &str,
+    target_uid: &str,
+    from_date: &str,
+    to_date: &str,
+) -> Result<AdminSyncLogList> {
+    let path = format!(
+        "/v9/admin/sync-log?uid={}&from={}&to={}",
+        urlencoding_encode(target_uid),
+        urlencoding_encode(from_date),
+        urlencoding_encode(to_date),
+    );
+    let res = build_client(HTTP_TIMEOUT)?
+        .get(url(base_url, &path))
+        .bearer_auth(id_token)
+        .send()
+        .await
+        .context("admin_get_sync_log_list send")?;
+    let extra = parse_envelope(res, &path).await?;
+    let body: AdminSyncLogListResp =
+        serde_json::from_value(extra).context("parse AdminSyncLogListResp")?;
+    Ok(AdminSyncLogList {
+        files: body.events,
+        truncated: body.truncated,
+    })
+}
+
+/// GET /v9/admin/sync-log-file?key=... → raw zstd bytes (caller decompress).
+pub async fn admin_fetch_sync_log_file(
+    base_url: &str,
+    id_token: &str,
+    key: &str,
+) -> Result<Vec<u8>> {
+    let path = format!("/v9/admin/sync-log-file?key={}", urlencoding_encode(key));
+    let res = build_client(HTTP_TIMEOUT)?
+        .get(url(base_url, &path))
+        .bearer_auth(id_token)
+        .send()
+        .await
+        .context("admin_fetch_sync_log_file send")?;
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "HTTP {} admin_fetch_sync_log_file {key}: {body}",
+            status.as_u16()
+        ));
+    }
+    let bytes = res.bytes().await.context("read admin log bytes")?;
+    Ok(bytes.to_vec())
+}
+
+// =============================================================
 // Utility
 // =============================================================
 

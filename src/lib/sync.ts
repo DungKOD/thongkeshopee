@@ -1,33 +1,13 @@
 import { invoke } from "./tauri";
+import { timed } from "./net_log";
 
 // ==========================================================================
-// DB sync wrappers — gọi Cloudflare Worker (`/metadata`, `/upload`,
-// `/download`) qua Rust client `commands::sync_client`.
+// Admin wrappers — user list + admin-view của user khác.
 //
-// Video log Google Sheet vẫn dùng `lib/video.ts` (Apps Script) — 2 world tách
-// bạch để rollback independent.
+// Sync DB chính đã chuyển sang v9 (`lib/sync_v9.ts`). File này giữ admin
+// helpers gọi Tauri commands ở `commands::app_util` (moved from v8 sync.rs
+// trong P8b) và `commands::admin_view`.
 // ==========================================================================
-
-export interface SyncMetadataResult {
-  exists: boolean;
-  file_id?: string | null;
-  size_bytes?: number | null;
-  last_modified_ms?: number | null;
-  fingerprint?: string | null;
-}
-
-export interface SyncUploadResult {
-  file_id: string;
-  size_bytes: number;
-  last_modified_ms: number;
-  fingerprint: string;
-}
-
-export interface SyncDownloadResult {
-  target_path: string;
-  size_bytes: number;
-  last_modified_ms: number;
-}
 
 function syncApiUrl(): string {
   const u = import.meta.env.VITE_SYNC_API_URL;
@@ -35,59 +15,12 @@ function syncApiUrl(): string {
   return u;
 }
 
-export function machineFingerprint(): Promise<string> {
-  return invoke<string>("machine_fingerprint");
-}
-
-export function syncMetadata(idToken: string): Promise<SyncMetadataResult> {
-  return invoke<SyncMetadataResult>("sync_metadata", {
-    syncApiUrl: syncApiUrl(),
-    idToken,
-  });
-}
-
-/** Upload local DB lên R2. `remoteExists` (từ syncMetadata) dùng cho guard
- *  server-side: reject nếu local fresh (change_id=0) + remote đã có data →
- *  tránh đè mất backup cũ khi reinstall. */
-export function syncUploadDb(
-  idToken: string,
-  remoteExists: boolean,
-): Promise<SyncUploadResult> {
-  return invoke<SyncUploadResult>("sync_upload_db", {
-    syncApiUrl: syncApiUrl(),
-    idToken,
-    remoteExists,
-  });
-}
-
-/** Pull remote DB → merge local-win + apply tombstones → push snapshot lên R2.
- *  Cross-device safe — thay cho syncUploadDb khi remote có mutation từ máy khác. */
-export function syncPullMergePush(idToken: string): Promise<SyncUploadResult> {
-  return invoke<SyncUploadResult>("sync_pull_merge_push", {
-    syncApiUrl: syncApiUrl(),
-    idToken,
-  });
-}
-
-export function syncDownloadDb(idToken: string): Promise<SyncDownloadResult> {
-  return invoke<SyncDownloadResult>("sync_download_db", {
-    syncApiUrl: syncApiUrl(),
-    idToken,
-  });
-}
-
-export function syncApplyPending(): Promise<boolean> {
-  return invoke<boolean>("sync_apply_pending");
-}
-
-// ==========================================================================
-// Admin — user list + view DB user khác.
-// ==========================================================================
-
-export interface UserListFileMeta {
-  fileId: string;
-  sizeBytes: number;
-  lastModified: number;
+/// Sync metadata cho 1 user trên R2, derive từ manifest.json + snapshots/.
+/// null khi user chưa sync lần nào.
+export interface UserListSyncMeta {
+  hasManifest: boolean;
+  hasSnapshot: boolean;
+  lastModifiedMs: number | null;
 }
 
 export interface UserListEntry {
@@ -98,24 +31,17 @@ export interface UserListEntry {
   admin: boolean;
   expiredAt: string | null;
   createdAt: string | null;
-  file: UserListFileMeta | null;
+  sync: UserListSyncMeta | null;
 }
 
-/** Direct one-shot call — admin list users from Worker `/admin/users`. */
+/** Admin list users (v9) — Worker `/v9/admin/users`. */
 export function adminListUsers(idToken: string): Promise<UserListEntry[]> {
-  return invoke<UserListEntry[]>("admin_list_users", {
-    syncApiUrl: syncApiUrl(),
-    idToken,
-  });
-}
-
-/// Worker xóa R2 orphan files (UIDs không có Firestore doc). Return list UIDs
-/// đã xóa. Use case: đổi Firebase project → dọn file cũ khỏi bucket.
-export function adminCleanupOrphans(idToken: string): Promise<string[]> {
-  return invoke<string[]>("admin_cleanup_orphans", {
-    syncApiUrl: syncApiUrl(),
-    idToken,
-  });
+  return timed("tauri_admin", "admin_list_users", () =>
+    invoke<UserListEntry[]>("admin_list_users", {
+      syncApiUrl: syncApiUrl(),
+      idToken,
+    }),
+  );
 }
 
 /// Cache singleton — user list JSON blob. FE tự parse qua `JSON.parse(users_json)`.

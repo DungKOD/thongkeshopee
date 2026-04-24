@@ -1,11 +1,24 @@
 import { useState } from "react";
-import type { SyncStatus } from "../hooks/useCloudSync";
+import type { LastSyncStats, SyncStatus } from "../hooks/useCloudSync";
+import { MySyncLogDialog } from "./MySyncLogDialog";
 
 interface SyncBadgeProps {
   status: SyncStatus;
   lastSyncAt: Date | null;
+  lastSyncStats: LastSyncStats | null;
+  /// True = máy khác vừa push (RTDB event chưa apply). Enable nút sync ở
+  /// status=idle để user chủ động pull nếu muốn, dù auto đã fire.
+  hasRemoteChangePending: boolean;
   error: string | null;
   onForce: () => Promise<void>;
+}
+
+function fmtBytes(n: number): string {
+  if (n === 0) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 interface Display {
@@ -23,21 +36,28 @@ function getDisplay(
     case "checking":
       return {
         icon: "cloud_sync",
-        label: "Kiểm tra R2...",
+        label: "Kiểm tra manifest...",
         color: "text-white/70",
+        spin: true,
+      };
+    case "bootstrap":
+      return {
+        icon: "cloud_download",
+        label: "Đang khởi tạo từ R2...",
+        color: "text-blue-300",
         spin: true,
       };
     case "syncing":
       return {
         icon: "cloud_sync",
-        label: "Đang đồng bộ lên R2...",
+        label: "Đang đồng bộ R2...",
         color: "text-blue-300",
         spin: true,
       };
     case "dirty":
       return {
         icon: "pending",
-        label: "Chờ đồng bộ lên R2",
+        label: "Chờ đồng bộ R2",
         color: "text-amber-300",
       };
     case "error":
@@ -75,12 +95,23 @@ function formatTime(d: Date): string {
 export function SyncBadge({
   status,
   lastSyncAt,
+  lastSyncStats,
+  hasRemoteChangePending,
   error,
   onForce,
 }: SyncBadgeProps) {
   const [showMenu, setShowMenu] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
   const display = getDisplay(status, lastSyncAt);
-  const canForce = status === "idle" || status === "dirty" || status === "error";
+  // Nút force enable khi:
+  // - dirty: local có mutation chưa push
+  // - error: retry cần thiết
+  // - idle + hasRemoteChangePending: máy khác vừa push, user muốn pull
+  // Disable khi idle sạch hai phía — không có gì để đồng bộ, tiết kiệm request.
+  const canForce =
+    status === "dirty" ||
+    status === "error" ||
+    (status === "idle" && hasRemoteChangePending);
 
   // Dirty/error → highlight container (ring + subtle pulse) để user thấy
   // rõ DB chưa sync, khuyến khích click "Sync ngay" hoặc đợi auto.
@@ -138,6 +169,49 @@ export function SyncBadge({
                   Lần cuối: {lastSyncAt.toLocaleString("vi-VN")}
                 </div>
               )}
+              {lastSyncStats && (
+                <div className="mt-2 grid grid-cols-2 gap-2 rounded border border-surface-8 bg-surface-1 p-2 text-[11px]">
+                  <div
+                    className="flex items-center gap-1"
+                    title={`Downloaded ${lastSyncStats.pulledDeltas} delta file(s)`}
+                  >
+                    <span className="material-symbols-rounded text-xs text-blue-300">
+                      arrow_downward
+                    </span>
+                    <span className="text-white/50">Tải về</span>
+                    <span className="ml-auto font-mono tabular-nums text-blue-200">
+                      {fmtBytes(lastSyncStats.downloadBytes)}
+                    </span>
+                  </div>
+                  <div
+                    className="flex items-center gap-1"
+                    title={`Uploaded ${lastSyncStats.pushedDeltas} delta file(s), skipped ${lastSyncStats.skippedIdentical} identical`}
+                  >
+                    <span className="material-symbols-rounded text-xs text-green-300">
+                      arrow_upward
+                    </span>
+                    <span className="text-white/50">Tải lên</span>
+                    <span className="ml-auto font-mono tabular-nums text-green-200">
+                      {fmtBytes(lastSyncStats.uploadBytes)}
+                    </span>
+                  </div>
+                  {(lastSyncStats.pulledDeltas > 0 ||
+                    lastSyncStats.pushedDeltas > 0 ||
+                    lastSyncStats.skippedIdentical > 0) && (
+                    <div className="col-span-2 flex items-center gap-2 text-[10px] text-white/40">
+                      <span>
+                        {lastSyncStats.pulledDeltas} pull /{" "}
+                        {lastSyncStats.pushedDeltas} push
+                      </span>
+                      {lastSyncStats.skippedIdentical > 0 && (
+                        <span title="Table không đổi nội dung so với upload trước → skip">
+                          · {lastSyncStats.skippedIdentical} skip
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
               {error && (
                 <div
                   className="mt-2 rounded border border-red-500/40 bg-red-900/20 p-2 text-red-200"
@@ -147,7 +221,7 @@ export function SyncBadge({
                 </div>
               )}
             </div>
-            <div className="border-t border-surface-8 p-2">
+            <div className="flex flex-col gap-1 border-t border-surface-8 p-2">
               <button
                 type="button"
                 onClick={async () => {
@@ -155,17 +229,37 @@ export function SyncBadge({
                   await onForce();
                 }}
                 disabled={!canForce}
-                className="btn-ripple flex w-full items-center justify-center gap-1.5 rounded bg-shopee-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-shopee-600 disabled:opacity-50"
+                title={
+                  canForce
+                    ? "Đồng bộ thay đổi giữa máy này và R2"
+                    : "Không có thay đổi để đồng bộ (cả local và remote đều sạch)"
+                }
+                className="btn-ripple flex w-full items-center justify-center gap-1.5 rounded bg-shopee-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-shopee-600 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <span className="material-symbols-rounded text-sm">
                   cloud_upload
                 </span>
-                Đồng bộ lên R2 ngay
+                {canForce ? "Đồng bộ lên R2 ngay" : "Không có thay đổi"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowMenu(false);
+                  setLogOpen(true);
+                }}
+                className="btn-ripple flex w-full items-center justify-center gap-1.5 rounded border border-surface-8 bg-surface-4 px-3 py-1.5 text-xs font-medium text-white/85 hover:bg-surface-6"
+                title="Xem lịch sử event sync v9 lưu trên máy"
+              >
+                <span className="material-symbols-rounded text-sm">
+                  history
+                </span>
+                Xem sync log
               </button>
             </div>
           </div>
         </>
       )}
+      <MySyncLogDialog isOpen={logOpen} onClose={() => setLogOpen(false)} />
     </div>
   );
 }

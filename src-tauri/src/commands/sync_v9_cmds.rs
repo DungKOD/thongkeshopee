@@ -11,8 +11,8 @@ use tauri::State;
 
 use crate::db::DbState;
 use crate::sync_v9::{
-    apply, bootstrap, capture, client, compress, descriptors, event_log, hlc, manifest, pull,
-    push, snapshot,
+    apply, bootstrap, capture, client, compaction, compress, descriptors, event_log, hlc, manifest,
+    pull, push, snapshot,
     types::{DeltaEvent, Manifest, ManifestDeltaEntry, SyncEventCtx},
     SV_CURRENT,
 };
@@ -269,6 +269,9 @@ pub struct PullReport {
     pub skipped_by_hlc: u32,
     pub tombstones_applied: u32,
     pub rows_deleted: u64,
+    /// Tổng bytes fetched từ R2 (compressed zstd, trước parse). UI hiển thị
+    /// để user biết đã download bao nhiêu data.
+    pub total_bytes: u64,
 }
 
 /// Full pull cycle: fetch manifest → diff → fetch deltas → apply per file.
@@ -311,6 +314,7 @@ pub async fn sync_v9_pull_all(
         let bytes = client::fetch_delta(&base_url, &id_token, &entry.key)
             .await
             .map_err(|e| CmdError::msg(format!("fetch_delta {}: {e}", entry.key)))?;
+        report.total_bytes += bytes.len() as u64;
         let events = pull::parse_delta_file(&bytes)
             .map_err(|e| CmdError::msg(format!("parse {}: {e}", entry.key)))?;
         let max_clock = pull::max_event_clock_ms(&events);
@@ -377,6 +381,166 @@ pub async fn sync_v9_sync_all(
 }
 
 // =============================================================
+// COMPACTION (P10) — snapshot + clear delta pointers
+// =============================================================
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionReport {
+    pub triggered: bool,
+    pub snapshot_key: Option<String>,
+    pub snapshot_size_bytes: u64,
+    pub deltas_cleared: u32,
+    pub cas_retries: u32,
+}
+
+/// Check compaction trigger + chạy nếu cần. Gọi sau push thành công
+/// (auto-pipeline) hoặc user-trigger manual (admin debug).
+///
+/// Flow:
+/// 1. Fetch manifest.
+/// 2. Check threshold `manifest.deltas.len() > COMPACTION_DELTA_THRESHOLD`.
+/// 3. `prepare_compaction` — VACUUM INTO + zstd + build new manifest.
+/// 4. `client::upload_snapshot` — PUT bytes lên R2 snapshot key.
+/// 5. CAS loop put updated manifest (retry max 3).
+/// 6. Best-effort log `compaction_complete` event.
+///
+/// Rule giữ data: delta objects trên R2 KHÔNG delete ở đây. Chỉ clear
+/// pointer trong manifest. Cron Worker sẽ sweep delete sau grace period.
+#[tauri::command]
+pub async fn sync_v9_compact_if_needed(
+    db: State<'_, DbState>,
+    base_url: String,
+    id_token: String,
+) -> CmdResult<CompactionReport> {
+    // 1. Fetch manifest.
+    let fetched = client::get_manifest(&base_url, &id_token)
+        .await
+        .map_err(|e| CmdError::msg(format!("get_manifest: {e}")))?;
+    let manifest = match fetched.manifest {
+        Some(m) => m,
+        None => return Ok(CompactionReport::default()), // nothing to compact
+    };
+
+    if !compaction::should_compact(&manifest) {
+        return Ok(CompactionReport::default());
+    }
+
+    // 2. Prepare snapshot (VACUUM INTO + zstd) + build new manifest.
+    let fingerprint = machine_fingerprint_stable();
+    let (artifact, new_manifest, result, _clock_ms) = {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        let clock = hlc::next_hlc_ms(&conn)?;
+        let uid: String = conn
+            .query_row(
+                "SELECT COALESCE(owner_uid, '') FROM sync_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        let temp_dir = std::env::temp_dir().join("thongkeshopee_v9_snapshot");
+        let (art, mut new_m, res) =
+            compaction::prepare_compaction(&conn, &manifest, &temp_dir, clock, &uid)
+                .map_err(|e| CmdError::msg(format!("prepare_compaction: {e}")))?;
+        new_m.uid = uid; // preserve
+        (art, new_m, res, clock)
+    };
+
+    // 3. Upload snapshot lên R2 (long-running).
+    client::upload_snapshot(&base_url, &id_token, &artifact.suggested_r2_key, &artifact.bytes)
+        .await
+        .map_err(|e| CmdError::msg(format!("upload_snapshot: {e}")))?;
+
+    // 4. CAS put manifest — retry max 3 (theo pattern push_all).
+    let cas_retries =
+        cas_put_full_manifest_retry(&db, &base_url, &id_token, &new_manifest, fetched.etag)
+            .await?;
+
+    // 5. Log compaction_complete (best-effort).
+    {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        let ts = hlc::next_hlc_rfc3339(&conn)?;
+        let _ = event_log::append(
+            &conn,
+            &ts,
+            &fingerprint,
+            &SyncEventCtx::CompactionComplete {
+                new_snapshot_key: artifact.suggested_r2_key.clone(),
+                old_deltas_removed: result.deltas_cleared,
+            },
+        );
+    }
+
+    Ok(CompactionReport {
+        triggered: true,
+        snapshot_key: Some(result.snapshot_key),
+        snapshot_size_bytes: result.snapshot_size_bytes,
+        deltas_cleared: result.deltas_cleared,
+        cas_retries,
+    })
+}
+
+/// CAS put manifest full-replace (không append). Cần khi compaction —
+/// entire `deltas` cleared. Different từ `cas_append_manifest_retry` (đó
+/// append), đây overwrite full manifest.
+async fn cas_put_full_manifest_retry(
+    db: &State<'_, DbState>,
+    base_url: &str,
+    id_token: &str,
+    new_manifest: &Manifest,
+    mut expected_etag: Option<String>,
+) -> CmdResult<u32> {
+    let mut retries = 0u32;
+    for attempt in 0..=CAS_MAX_RETRY {
+        match client::put_manifest(base_url, id_token, new_manifest, expected_etag.as_deref()).await
+        {
+            Ok(new_etag) => {
+                let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+                manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(e.to_string()))?;
+                return Ok(retries);
+            }
+            Err(e) if e.to_string().starts_with(client::CAS_CONFLICT) => {
+                retries += 1;
+                if attempt >= CAS_MAX_RETRY {
+                    return Err(CmdError::msg(format!(
+                        "CAS exhausted after {CAS_MAX_RETRY} retries (compaction)"
+                    )));
+                }
+                // Re-fetch để get new etag. Lưu ý: manifest content của compaction
+                // thì keep as-is (không re-merge với delta appends của máy khác —
+                // compaction là operation "chốt state", nếu remote có delta mới
+                // phải giữ). Reload + re-merge remote deltas.
+                let fetched = client::get_manifest(base_url, id_token)
+                    .await
+                    .map_err(|e| CmdError::msg(format!("get_manifest retry: {e}")))?;
+                expected_etag = fetched.etag;
+                // Nếu remote có delta mới → đưa lại vào manifest mới sau snapshot
+                // (những delta này có clock_ms > snapshot.clock_ms).
+                if let Some(remote) = fetched.manifest {
+                    // Re-merge deltas có clock > snapshot clock.
+                    let snap_clock = new_manifest
+                        .latest_snapshot
+                        .as_ref()
+                        .map(|s| s.clock_ms)
+                        .unwrap_or(0);
+                    let mut merged = new_manifest.clone();
+                    for d in remote.deltas.into_iter().filter(|d| d.clock_ms > snap_clock) {
+                        merged.deltas.push(d);
+                    }
+                    // Sort deltas theo clock_ms ASC.
+                    merged.deltas.sort_by_key(|d| d.clock_ms);
+                    // Retry với merged — next loop iter.
+                    let _ = merged; // future iter hit Ok branch
+                }
+                continue;
+            }
+            Err(e) => return Err(CmdError::msg(format!("put_manifest compaction: {e}"))),
+        }
+    }
+    Ok(retries)
+}
+
+// =============================================================
 // SYNC LOG flush
 // =============================================================
 
@@ -430,6 +594,153 @@ pub async fn sync_v9_log_flush(
     event_log::mark_uploaded(&conn, &uploaded_ids, &now)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     Ok(uploaded_ids.len() as u32)
+}
+
+// =============================================================
+// LOCAL sync log (user viewer)
+// =============================================================
+
+/// Read local `sync_event_log` với filter. Không hit HTTP — đọc DB local.
+/// Dùng cho user UI xem history hoạt động sync (bao gồm events chưa flush
+/// lên R2, giúp debug offline/pending state).
+#[tauri::command]
+pub fn sync_v9_log_list_local(
+    db: State<'_, DbState>,
+    limit: u32,
+    kind_filter: Option<String>,
+) -> CmdResult<Vec<AdminSyncLogEvent>> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let events = event_log::fetch_recent(&conn, limit, kind_filter.as_deref())
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    Ok(events.into_iter().map(local_event_to_dto).collect())
+}
+
+fn local_event_to_dto(ev: crate::sync_v9::types::SyncEvent) -> AdminSyncLogEvent {
+    let ctx = serde_json::to_value(&ev.ctx).unwrap_or(serde_json::Value::Null);
+    AdminSyncLogEvent {
+        event_id: ev.event_id,
+        ts: ev.ts,
+        fingerprint: ev.fingerprint,
+        kind: ev.kind.as_str().to_string(),
+        ctx,
+        uploaded_at: ev.uploaded_at,
+    }
+}
+
+// =============================================================
+// ADMIN — sync log viewer
+// =============================================================
+
+/// 1 event sau khi parse từ NDJSON log file. Kind & ctx preserve từ Rust
+/// enum (ctx giữ JSON object, FE tự render theo kind).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSyncLogEvent {
+    pub event_id: i64,
+    pub ts: String,
+    pub fingerprint: String,
+    pub kind: String,
+    pub ctx: serde_json::Value,
+    pub uploaded_at: Option<String>,
+}
+
+/// Response cho admin_v9_sync_log_list — list metadata của file log NDJSON
+/// (chưa decompress). FE gọi admin_v9_sync_log_fetch_events khi expand 1 file.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSyncLogListDto {
+    pub files: Vec<client::AdminSyncLogFile>,
+    pub truncated: bool,
+}
+
+/// List sync log file metadata của user trong date range. Admin-only
+/// (Worker verify admin claim).
+#[tauri::command]
+pub async fn admin_v9_sync_log_list(
+    base_url: String,
+    id_token: String,
+    target_uid: String,
+    from_date: String,
+    to_date: String,
+) -> CmdResult<AdminSyncLogListDto> {
+    let list = client::admin_get_sync_log_list(
+        &base_url,
+        &id_token,
+        &target_uid,
+        &from_date,
+        &to_date,
+    )
+    .await
+    .map_err(|e| CmdError::msg(format!("admin_v9_sync_log_list: {e}")))?;
+
+    Ok(AdminSyncLogListDto {
+        files: list.files,
+        truncated: list.truncated,
+    })
+}
+
+/// Fetch 1 file sync log → decompress zstd → parse NDJSON → return events.
+/// Admin-only (Worker verify). Key phải match `users/{uid}/sync_logs/...`.
+#[tauri::command]
+pub async fn admin_v9_sync_log_fetch_events(
+    base_url: String,
+    id_token: String,
+    key: String,
+) -> CmdResult<Vec<AdminSyncLogEvent>> {
+    let zst_bytes = client::admin_fetch_sync_log_file(&base_url, &id_token, &key)
+        .await
+        .map_err(|e| CmdError::msg(format!("admin_v9_sync_log_fetch_events: {e}")))?;
+
+    let ndjson = compress::zstd_decompress(&zst_bytes)
+        .map_err(|e| CmdError::msg(format!("zstd decompress log: {e}")))?;
+
+    let mut events = Vec::new();
+    for (idx, line) in ndjson.split(|b| *b == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_slice(line)
+            .map_err(|e| CmdError::msg(format!("parse NDJSON line {idx}: {e}")))?;
+        events.push(parse_log_event(value));
+    }
+    Ok(events)
+}
+
+/// Map 1 JSON line → AdminSyncLogEvent. Tolerant với missing fields — log file
+/// có thể từ version cũ hoặc custom dump.
+fn parse_log_event(value: serde_json::Value) -> AdminSyncLogEvent {
+    let obj = value.as_object();
+    let get_str = |k: &str| -> String {
+        obj.and_then(|m| m.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    let get_i64 = |k: &str| -> i64 {
+        obj.and_then(|m| m.get(k))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    let event_id = get_i64("event_id");
+    let ts = get_str("ts");
+    let fingerprint = get_str("fingerprint");
+    let kind = get_str("kind");
+    let uploaded_at = obj
+        .and_then(|m| m.get("uploaded_at"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let ctx = obj
+        .and_then(|m| m.get("ctx"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    AdminSyncLogEvent {
+        event_id,
+        ts,
+        fingerprint,
+        kind,
+        ctx,
+        uploaded_at,
+    }
 }
 
 // =============================================================

@@ -209,33 +209,24 @@ CREATE INDEX IF NOT EXISTS idx_manual_day        ON manual_entries(day_date);
 -- Xem `db/video_db.rs`. Primary audit = Google Sheet qua Apps Script.
 
 -- =============================================================
--- sync_state — singleton row theo dõi trạng thái sync Drive.
--- dirty=1 → DB có thay đổi chưa upload. dirty=0 → đã sync.
--- change_id tăng monotone mỗi mutation → CAS pattern chống race
--- khi mutation xảy ra ĐANG upload (snapshot cũ, mutation sau không kịp).
--- Triggers khởi tạo trong `migrate()` để update body khi code đổi.
+-- sync_state — singleton row giữ HLC clock + owner UID.
+--
+-- v9 (P8b): đã drop các cột v8 (dirty, change_id, last_uploaded_change_id,
+-- last_synced_at_ms, last_synced_remote_mtime_ms, last_error,
+-- last_remote_etag, last_uploaded_hash). Cursor state + manifest etag giờ
+-- sống ở `sync_cursor_state` + `sync_manifest_state` (v9 infra, table
+-- riêng). Triggers bump dirty/change_id cũng đã drop — v9 tracking qua
+-- rowid/autoincrement/updated_at cursor.
 -- =============================================================
 CREATE TABLE IF NOT EXISTS sync_state (
     id                            INTEGER PRIMARY KEY CHECK (id = 1),
-    dirty                         INTEGER NOT NULL DEFAULT 1,
-    last_synced_at_ms             INTEGER,
-    last_synced_remote_mtime_ms   INTEGER,
-    last_error                    TEXT,
-    change_id                     INTEGER NOT NULL DEFAULT 0,
-    last_uploaded_change_id       INTEGER NOT NULL DEFAULT 0,
     owner_uid                     TEXT,
-    -- v8 HLC-lite: timestamp monotonic counter chống clock drift giữa 2 máy.
-    last_known_clock_ms           INTEGER NOT NULL DEFAULT 0,
-    -- v8 CAS upload: etag R2 lần cuối sync thành công. Next upload attach
-    -- expected etag → Worker reject 412 nếu stale.
-    last_remote_etag              TEXT,
-    -- v8.1 skip-identical: MD5 của compressed bytes lần upload gần nhất.
-    -- Next upload compute hash → match → skip (save bandwidth).
-    last_uploaded_hash            TEXT
+    -- HLC-lite (giữ từ v8): timestamp monotonic counter chống clock drift
+    -- giữa 2 máy. Mỗi mutation lấy max(now_ms, last_known_clock_ms + 1).
+    last_known_clock_ms           INTEGER NOT NULL DEFAULT 0
 );
 
--- Seed singleton. Lần đầu: dirty=1 để force upload local data (nếu có).
-INSERT OR IGNORE INTO sync_state (id, dirty) VALUES (1, 1);
+INSERT OR IGNORE INTO sync_state (id) VALUES (1);
 
 -- =============================================================
 -- tombstones — track deletion để merge cross-device không "hồi sinh" row

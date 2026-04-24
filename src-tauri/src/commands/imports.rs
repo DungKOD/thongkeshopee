@@ -167,13 +167,15 @@ fn register_imported_file(
         return Ok(id);
     }
 
+    // v13: id = content_id(file_hash) — deterministic cross-machine.
+    let id = crate::sync_v9::content_id::imported_file_id(hash);
     tx.execute(
         "INSERT INTO imported_files
-         (filename, kind, imported_at, row_count, file_hash, stored_path, day_date, shopee_account_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        params![filename, kind, now, row_count, hash, stored_path, day_date, shopee_account_id],
+         (id, filename, kind, imported_at, row_count, file_hash, stored_path, day_date, shopee_account_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![id, filename, kind, now, row_count, hash, stored_path, day_date, shopee_account_id],
     )?;
-    Ok(tx.last_insert_rowid())
+    Ok(id)
 }
 
 // ============================================================
@@ -450,9 +452,11 @@ pub fn import_shopee_orders(
     let mut updated: i64 = 0;
     let mut skipped: i64 = 0;
     {
+        // v13: id = content_id(checkout_id, item_id, model_id). Cross-machine
+        // deterministic — cùng order line trên A và B → cùng id → FK ổn định.
         let mut stmt = tx.prepare(
             "INSERT INTO raw_shopee_order_items
-             (order_id, checkout_id, item_id, model_id, order_status,
+             (id, order_id, checkout_id, item_id, model_id, order_status,
               order_time, completed_time, click_time,
               shop_id, shop_name, shop_type, item_name,
               category_l1, category_l2, category_l3,
@@ -460,7 +464,7 @@ pub fn import_shopee_orders(
               net_commission, commission_total, order_commission_total, mcn_fee,
               sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
               channel, day_date, source_file_id, shopee_account_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(checkout_id, item_id, model_id) DO UPDATE SET
                 order_status   = excluded.order_status,
                 order_time     = excluded.order_time,
@@ -502,8 +506,14 @@ pub fn import_shopee_orders(
                 )
                 .unwrap_or(0);
 
+            let content_id = crate::sync_v9::content_id::order_item_id(
+                &r.checkout_id,
+                &r.item_id,
+                &r.model_id,
+            );
             let order_item_id: i64 = stmt.query_row(
                 params![
+                    content_id,
                     r.order_id,
                     r.checkout_id,
                     r.item_id,
@@ -729,8 +739,11 @@ pub fn import_fb_ad_groups(
                 .unwrap_or(0);
             let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
             let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
+            let content_id =
+                crate::sync_v9::content_id::fb_ad_id(&day_date, "ad_group", &r.ad_group_name);
             let fb_ad_id: i64 = stmt.query_row(
                 params![
+                    content_id,
                     "ad_group",
                     r.ad_group_name,
                     r.sub_ids[0],
@@ -777,14 +790,16 @@ pub fn import_fb_ad_groups(
 /// UPSERT template shared giữa `import_fb_ad_groups` và `import_fb_campaigns`.
 /// ON CONFLICT theo `(day_date, level, name)` — 2 level cùng name không đụng nhau.
 /// v10: RETURNING id để mapping fb_ads_to_file (SQLite 3.35+).
+/// v13: id = content_id(day_date, level, name) — first param, cross-machine
+/// deterministic. Caller compute qua `content_id::fb_ad_id`.
 const FB_ADS_UPSERT_SQL: &str = "
     INSERT INTO raw_fb_ads
-    (level, name,
+    (id, level, name,
      sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
      report_start, report_end, status,
      spend, clicks, cpc, impressions, reach,
      day_date, source_file_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(day_date, level, name) DO UPDATE SET
        sub_id1 = excluded.sub_id1, sub_id2 = excluded.sub_id2,
        sub_id3 = excluded.sub_id3, sub_id4 = excluded.sub_id4,
@@ -884,8 +899,11 @@ pub fn import_fb_campaigns(
                 .unwrap_or(0);
             let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
             let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
+            let content_id =
+                crate::sync_v9::content_id::fb_ad_id(&day_date, "campaign", &r.campaign_name);
             let fb_ad_id: i64 = stmt.query_row(
                 params![
+                    content_id,
                     "campaign",
                     r.campaign_name,
                     r.sub_ids[0],

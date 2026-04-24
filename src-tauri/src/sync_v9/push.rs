@@ -106,11 +106,32 @@ pub fn mark_uploaded(
     hash: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
+    // Monotonic guard: cursor chỉ advance hoặc giữ bằng, không tụt. Ngừa
+    // accident retry với cursor cũ (vd rollback nửa chừng, caller re-capture
+    // với since_cursor < trước). Giữ hash update để skip-identical vẫn fresh.
+    //
+    // Numeric compare cho RowId/PrimaryKey (int cursor). Lex compare cho
+    // UpdatedAt/DeletedAt (ISO timestamp). SQLite comparison operator `<`
+    // xử lý 2 case này tự nhiên — string 'YYYY-MM-DD...' và int literal
+    // khác type nên cần CAST để unify.
+    //
+    // Strategy: nếu cả 2 parse thành INTEGER > 0 → numeric compare; ngược
+    // lại → text compare. Implement qua 2 branches.
+    let is_numeric = new_cursor.chars().all(|c| c.is_ascii_digit()) && !new_cursor.is_empty();
+    let sql = if is_numeric {
         "UPDATE sync_cursor_state
          SET last_uploaded_cursor = ?, last_uploaded_hash = ?, updated_at = ?
-         WHERE table_name = ?",
-        params![new_cursor, hash, now, table],
+         WHERE table_name = ?
+           AND CAST(? AS INTEGER) >= CAST(last_uploaded_cursor AS INTEGER)"
+    } else {
+        "UPDATE sync_cursor_state
+         SET last_uploaded_cursor = ?, last_uploaded_hash = ?, updated_at = ?
+         WHERE table_name = ?
+           AND ? >= last_uploaded_cursor"
+    };
+    conn.execute(
+        sql,
+        params![new_cursor, hash, now, table, new_cursor],
     )
     .with_context(|| format!("mark_uploaded failed for {table}"))?;
     Ok(())

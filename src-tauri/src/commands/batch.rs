@@ -115,14 +115,6 @@ pub fn batch_commit_deletes(
         tx.execute("DELETE FROM imported_files WHERE id = ?", params![id])?;
     }
 
-    // Explicit bump sync_state — FK CASCADE DELETE trên raw tables có thể
-    // không fire user triggers tùy SQLite config. Đảm bảo mọi thao tác xóa
-    // của `batch_commit_deletes` đều mark dirty để sync flow upload.
-    tx.execute(
-        "UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1",
-        [],
-    )?;
-
     tx.commit()?;
 
     // Best-effort: xóa physical CSV file của orphan imported_files khỏi disk.
@@ -303,12 +295,6 @@ pub fn revert_import(
          SET reverted_at = ?, stored_path = NULL
          WHERE id = ?",
         params![now, file_id],
-    )?;
-
-    // 5. Bump sync_state → sync flow upload DB state mới (có reverted_at).
-    tx.execute(
-        "UPDATE sync_state SET dirty = 1, change_id = change_id + 1 WHERE id = 1",
-        [],
     )?;
 
     tx.commit()?;

@@ -19,7 +19,9 @@ pub mod apply;
 pub mod bootstrap;
 pub mod capture;
 pub mod client;
+pub mod compaction;
 pub mod compress;
+pub mod content_id;
 pub mod descriptors;
 pub mod event_log;
 pub mod hlc;
@@ -28,6 +30,9 @@ pub mod pull;
 pub mod push;
 pub mod snapshot;
 pub mod types;
+
+#[cfg(test)]
+mod integration_tests;
 
 /// Schema version của delta event format. Tương ứng với `_schema_version = 11`.
 /// Event reader check `event.sv` vs `SV_CURRENT` để biết có cần migrate row

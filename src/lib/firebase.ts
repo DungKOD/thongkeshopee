@@ -9,6 +9,7 @@ import {
 import { getFirestore, type Firestore } from "firebase/firestore";
 import { getDatabase, type Database } from "firebase/database";
 import { getFunctions, type Functions } from "firebase/functions";
+import { timed } from "./net_log";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -40,7 +41,15 @@ void setPersistence(auth, browserLocalPersistence);
 export async function getAuthToken(forceRefresh = false): Promise<string> {
   const current = auth.currentUser;
   if (!current) throw new Error("Chưa đăng nhập");
-  return current.getIdToken(forceRefresh);
+  // Log qua net_log để user xem được trong tab Requests. Firebase SDK
+  // cache token 1h, nên hầu hết call không hit network — `cached=true`
+  // hint sẽ show trong meta (hint only, không authoritative).
+  return timed(
+    "firebase_token",
+    forceRefresh ? "getIdToken(force)" : "getIdToken()",
+    () => current.getIdToken(forceRefresh),
+    { forceRefresh: forceRefresh ? "1" : "0" },
+  );
 }
 
 // Dev-only: expose `auth` lên window cho DevTools debug. Remove sau khi xong.
