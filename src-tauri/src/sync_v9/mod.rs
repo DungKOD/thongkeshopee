@@ -15,7 +15,11 @@
 // dead_code cho module này cho đến khi wire up xong.
 #![allow(dead_code)]
 
+pub mod capture;
+pub mod compress;
+pub mod descriptors;
 pub mod event_log;
+pub mod push;
 pub mod types;
 
 /// Schema version của delta event format. Tương ứng với `_schema_version = 11`.
