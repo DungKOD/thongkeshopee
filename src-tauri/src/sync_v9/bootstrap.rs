@@ -22,8 +22,7 @@ use super::manifest;
 /// Check local DB có "empty" theo semantic bootstrap: không có raw data, không
 /// có manual entries, không có tombstones, không có cursor advance.
 ///
-/// `shopee_accounts` được migration seed 1 row default — bỏ qua khỏi check.
-/// `_schema_version` luôn có row từ migration — bỏ qua.
+/// `shopee_accounts` được schema seed 1 row "Mặc định" — bỏ qua khỏi check.
 pub fn is_local_empty(conn: &Connection) -> Result<bool> {
     // Check các tables có thể chứa user data (không phải seed).
     let user_tables = [

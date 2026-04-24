@@ -153,7 +153,7 @@ pub fn restore_snapshot_to_pending(
     // Verify qua separate connection — không touch live DB.
     let guard = RestoreErrorGuard::new(pending_path.to_path_buf());
     verify_integrity(pending_path)?;
-    verify_has_schema_version(pending_path)?;
+    verify_has_sync_state(pending_path)?;
     guard.dismiss();
 
     Ok(RestoreOutcome {
@@ -201,26 +201,26 @@ pub fn verify_integrity(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Verify DB có `_schema_version` table + ít nhất 1 version row.
+/// Verify DB có `sync_state` table + singleton row.
 /// Catch trường hợp snapshot bytes là random data nhưng happens to be valid SQLite.
-fn verify_has_schema_version(db_path: &Path) -> Result<()> {
+fn verify_has_sync_state(db_path: &Path) -> Result<()> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open for schema check: {}", db_path.display()))?;
     let has_table: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_schema_version'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_state'",
             [],
             |r| r.get(0),
         )
-        .context("check _schema_version table exists")?;
+        .context("check sync_state table exists")?;
     if has_table == 0 {
-        anyhow::bail!("snapshot missing _schema_version table");
+        anyhow::bail!("snapshot missing sync_state table");
     }
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _schema_version", [], |r| r.get(0))
-        .context("count _schema_version rows")?;
+        .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
+        .context("count sync_state rows")?;
     if count == 0 {
-        anyhow::bail!("snapshot _schema_version empty");
+        anyhow::bail!("snapshot sync_state empty");
     }
     Ok(())
 }
@@ -346,7 +346,7 @@ mod tests {
         // Integrity check hoặc schema_version check fail.
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("integrity") || msg.contains("_schema_version") || msg.contains("schema"),
+            msg.contains("integrity") || msg.contains("sync_state") || msg.contains("schema"),
             "error phải rõ ràng: {msg}"
         );
         assert!(!target.exists(), "rule giữ data: pending cleanup khi verify fail");

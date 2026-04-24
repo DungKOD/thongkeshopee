@@ -23,9 +23,11 @@ use super::{CmdError, CmdResult};
 #[tauri::command]
 pub fn db_ping(state: State<'_, DbState>) -> CmdResult<i64> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let version: i64 =
-        conn.query_row("SELECT MAX(version) FROM _schema_version", [], |r| r.get(0))?;
-    Ok(version)
+    // Ping = đếm sync_state singleton (luôn có từ schema seed). Return 1 nếu
+    // DB OK. Version không còn track (no-migration design).
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))?;
+    Ok(count)
 }
 
 #[tauri::command]
@@ -299,13 +301,16 @@ fn aggregate_rows_for_day(
     let raw_owner_pairs: Vec<(Canonical, i64)> = {
         let mut pairs: Vec<(Canonical, i64)> = Vec::new();
         let mut stmt = conn.prepare(
-            "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+            // COALESCE → 0 cho row không có shopee_account_id (post-schema
+            // nullable). Id=0 không match bất kỳ account thực nào → filter
+            // by_account vẫn hoạt động; filter All giữ tất cả rows.
+            "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, COALESCE(shopee_account_id, 0)
              FROM raw_shopee_clicks WHERE day_date = ?1
              UNION
-             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, COALESCE(shopee_account_id, 0)
              FROM raw_shopee_order_items WHERE day_date = ?1
              UNION
-             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, shopee_account_id
+             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, COALESCE(shopee_account_id, 0)
              FROM manual_entries WHERE day_date = ?1",
         )?;
         let iter = stmt.query_map(params![day_date], |r| {

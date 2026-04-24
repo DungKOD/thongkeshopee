@@ -34,7 +34,7 @@ pub mod types;
 #[cfg(test)]
 mod integration_tests;
 
-/// Schema version của delta event format. Tương ứng với `_schema_version = 11`.
+/// Schema version của delta event format. Tăng khi format JSON thay đổi.
 /// Event reader check `event.sv` vs `SV_CURRENT` để biết có cần migrate row
 /// không (K1-K3 trong plan).
 pub const SV_CURRENT: u32 = 11;
