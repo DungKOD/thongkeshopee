@@ -16,6 +16,7 @@ pub mod query;
 pub mod screenshot;
 pub mod sync;
 pub mod sync_client;
+pub mod sync_v9_cmds;
 pub mod video;
 
 /// Wrapper lỗi cho Tauri command: serialize thành string để UI nhận được.

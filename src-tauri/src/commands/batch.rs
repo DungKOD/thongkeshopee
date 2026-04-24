@@ -16,7 +16,7 @@ use crate::db::types::BatchDeletePayload;
 use crate::db::{resolve_active_imports_dir, tombstone_key_sub, DbState};
 
 use super::query::{is_prefix, to_canonical, Canonical};
-use super::sync::next_hlc_rfc3339;
+use crate::sync_v9::hlc::next_hlc_rfc3339;
 use super::{CmdError, CmdResult};
 
 #[tauri::command]

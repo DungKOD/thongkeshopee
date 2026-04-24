@@ -18,9 +18,11 @@
 pub mod apply;
 pub mod bootstrap;
 pub mod capture;
+pub mod client;
 pub mod compress;
 pub mod descriptors;
 pub mod event_log;
+pub mod hlc;
 pub mod manifest;
 pub mod pull;
 pub mod push;

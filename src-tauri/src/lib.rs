@@ -99,6 +99,13 @@ pub fn run() {
             commands::admin_view::admin_exit_view_user_db,
             commands::admin_view::admin_view_state_get,
             commands::screenshot::save_png,
+            // Sync v9 commands — per-table incremental delta sync.
+            // Coexist tạm thời với v8 sync::* cho đến P8b (delete v8).
+            commands::sync_v9_cmds::sync_v9_get_state,
+            commands::sync_v9_cmds::sync_v9_push_all,
+            commands::sync_v9_cmds::sync_v9_pull_all,
+            commands::sync_v9_cmds::sync_v9_sync_all,
+            commands::sync_v9_cmds::sync_v9_log_flush,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
