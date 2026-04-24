@@ -34,6 +34,7 @@ import { usePremium, useIsAdmin } from "./hooks/usePremium";
 import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
 import { useSelfPresence } from "./hooks/usePresence";
 import { SyncBadge } from "./components/SyncBadge";
+import { UpdatesDropdown } from "./components/UpdatesDropdown";
 import { CloseWarningDialog } from "./components/CloseWarningDialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LoginScreen } from "./components/LoginScreen";
@@ -298,28 +299,6 @@ function AppInner() {
     if (referrers.length > 0) registerSources(referrers);
   }, [referrers, registerSources]);
 
-  // Silent auto-check cập nhật 1 lần sau login. Nếu có bản mới → toast
-  // nhắc user mở Settings để cài. Fail im lặng (offline / endpoint trả 404
-  // khi chưa có Release) — không spam error toast.
-  const updateCheckedRef = useRef(false);
-  useEffect(() => {
-    if (updateCheckedRef.current) return;
-    updateCheckedRef.current = true;
-    void (async () => {
-      try {
-        const { checkForUpdate } = await import("./lib/updater");
-        const info = await checkForUpdate();
-        if (info) {
-          showToast({
-            message: `Có bản mới v${info.version} — mở Cài đặt để cập nhật.`,
-            duration: 8000,
-          });
-        }
-      } catch {
-        // offline / no release yet — silent
-      }
-    })();
-  }, [showToast]);
 
   const isAdmin = useIsAdmin();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -575,15 +554,27 @@ function AppInner() {
               analytics
             </span>
             <div>
-              <h1 className="text-xl font-semibold tracking-tight text-white">
-                Shopee Affiliate Tracker
-              </h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-xl font-semibold tracking-tight text-white">
+                  Shopee Affiliate Tracker
+                </h1>
+                <span className="rounded-md bg-white/15 px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums text-white/90">
+                  v{__APP_VERSION__}
+                </span>
+              </div>
               <p className="text-xs text-white/70">
                 Data từ database — manual override luôn ưu tiên raw CSV
               </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {!inAdminView && (
+              <UpdatesDropdown
+                currentVersion={__APP_VERSION__}
+                repo="DungKOD/thongkeshopee"
+                limit={10}
+              />
+            )}
             {!inAdminView && (
               <SyncBadge
                 status={syncStatus}

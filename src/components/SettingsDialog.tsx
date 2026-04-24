@@ -2,7 +2,6 @@ import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import type { ProfitFees, Settings } from "../hooks/useSettings";
 import { ImportHistorySection } from "./ImportHistorySection";
-import { UpdateSection } from "./UpdateSection";
 
 interface SettingsDialogProps {
   isOpen: boolean;
@@ -191,8 +190,6 @@ export function SettingsDialog({
             reloadKey={importHistoryReloadKey}
             onReverted={onImportReverted}
           />
-
-          <UpdateSection currentVersion={__APP_VERSION__} />
 
           {/* App info — version + build metadata. Cuối Settings làm footer info. */}
           <section className="rounded-xl border border-surface-8 bg-surface-1 px-4 py-3">
