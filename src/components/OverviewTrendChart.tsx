@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -13,8 +13,21 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { CumulativePoint, DailyTrendPoint } from "../formulas";
-import { fmtDate, fmtMoneyShort, fmtPct, fmtVnd } from "../formulas";
+import type {
+  CumulativePoint,
+  DailyTrendPoint,
+  TrendGranularity,
+} from "../formulas";
+import {
+  aggregateTrend,
+  availableGranularities,
+  computeCumulativeTrend,
+  defaultTrendGranularity,
+  fmtDate,
+  fmtMoneyShort,
+  fmtPct,
+  fmtVnd,
+} from "../formulas";
 
 interface Props {
   /// Data points ASC theo ngày (compute bởi `computeDailyTrend`).
@@ -27,6 +40,12 @@ interface Props {
 
 type ChartMode = "finance" | "roi" | "cumulative";
 
+const GRANULARITY_LABEL: Record<TrendGranularity, string> = {
+  day: "Ngày",
+  week: "Tuần",
+  month: "Tháng",
+};
+
 /**
  * Trend chart ngày theo ngày:
  * - Mode "finance": cột spend (đỏ cam) + cột netCommission (xanh dương) + đường profit (xanh lá / đỏ theo tone).
@@ -35,10 +54,41 @@ type ChartMode = "finance" | "roi" | "cumulative";
 export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
   const [mode, setMode] = useState<ChartMode>("finance");
 
+  // Granularity: data nhiều ngày (>31) → auto gom tuần/tháng. User vẫn có
+  // thể override qua toggle. Default re-compute khi data length đổi
+  // (ví dụ filter range thay đổi).
+  const granularityOptions = useMemo(
+    () => availableGranularities(data.length),
+    [data.length],
+  );
+  const defaultGran = useMemo(
+    () => defaultTrendGranularity(data.length),
+    [data.length],
+  );
+  const [granularityOverride, setGranularityOverride] =
+    useState<TrendGranularity | null>(null);
+  // Override invalid (vd user chọn "day" nhưng data 500 ngày) → fallback default.
+  const granularity: TrendGranularity =
+    granularityOverride && granularityOptions.includes(granularityOverride)
+      ? granularityOverride
+      : defaultGran;
+
+  // Aggregate data + recompute cumulative theo granularity.
+  // day → no-op (return clone); week/month → group + sum + weighted ROI.
+  const aggregated = useMemo(
+    () => aggregateTrend(data, granularity),
+    [data, granularity],
+  );
+  const aggregatedCumulative = useMemo(
+    () =>
+      granularity === "day" ? cumulative : computeCumulativeTrend(aggregated),
+    [granularity, cumulative, aggregated],
+  );
+
   // Shopee-only: không hiển thị mode ROI (không có spend → không có ROI nghĩa).
   const effectiveMode: ChartMode = showAds ? mode : "finance";
 
-  const empty = data.length === 0;
+  const empty = aggregated.length === 0;
 
   return (
     <section className="rounded-xl bg-surface-2 px-5 py-4 shadow-elev-2">
@@ -52,30 +102,49 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
           </h3>
           <span className="rounded-full bg-shopee-900/40 px-2 py-0.5 text-xs text-shopee-300">
             {data.length} ngày
+            {granularity !== "day"
+              ? ` → ${aggregated.length} ${GRANULARITY_LABEL[granularity].toLowerCase()}`
+              : ""}
           </span>
         </div>
-        {showAds && (
-          <div className="flex rounded-full bg-surface-4 p-0.5">
-            <ModeButton
-              active={effectiveMode === "finance"}
-              onClick={() => setMode("finance")}
-            >
-              Chi tiêu / Lợi nhuận
-            </ModeButton>
-            <ModeButton
-              active={effectiveMode === "roi"}
-              onClick={() => setMode("roi")}
-            >
-              ROI %
-            </ModeButton>
-            <ModeButton
-              active={effectiveMode === "cumulative"}
-              onClick={() => setMode("cumulative")}
-            >
-              Lãi tích luỹ
-            </ModeButton>
-          </div>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Granularity toggle — chỉ hiển thị khi có ≥ 2 option (vd > 31 ngày). */}
+          {granularityOptions.length > 1 && (
+            <div className="flex rounded-full bg-surface-4 p-0.5">
+              {granularityOptions.map((g) => (
+                <ModeButton
+                  key={g}
+                  active={granularity === g}
+                  onClick={() => setGranularityOverride(g)}
+                >
+                  {GRANULARITY_LABEL[g]}
+                </ModeButton>
+              ))}
+            </div>
+          )}
+          {showAds && (
+            <div className="flex rounded-full bg-surface-4 p-0.5">
+              <ModeButton
+                active={effectiveMode === "finance"}
+                onClick={() => setMode("finance")}
+              >
+                Chi tiêu / Lợi nhuận
+              </ModeButton>
+              <ModeButton
+                active={effectiveMode === "roi"}
+                onClick={() => setMode("roi")}
+              >
+                ROI %
+              </ModeButton>
+              <ModeButton
+                active={effectiveMode === "cumulative"}
+                onClick={() => setMode("cumulative")}
+              >
+                Lãi tích luỹ
+              </ModeButton>
+            </div>
+          )}
+        </div>
       </header>
 
       {empty ? (
@@ -87,7 +156,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
           <ResponsiveContainer width="100%" height="100%">
             {effectiveMode === "cumulative" ? (
               <AreaChart
-                data={cumulative}
+                data={aggregatedCumulative}
                 margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
               >
                 <defs>
@@ -150,7 +219,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
               </AreaChart>
             ) : effectiveMode === "finance" ? (
               <ComposedChart
-                data={data}
+                data={aggregated}
                 margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
               >
                 <CartesianGrid stroke="#ffffff10" vertical={false} />
@@ -213,7 +282,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
               </ComposedChart>
             ) : (
               <ComposedChart
-                data={data}
+                data={aggregated}
                 margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
               >
                 <CartesianGrid stroke="#ffffff10" vertical={false} />

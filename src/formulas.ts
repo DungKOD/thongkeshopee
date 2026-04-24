@@ -494,6 +494,103 @@ export function computeAdsEfficiency(
   };
 }
 
+// =========================================================
+// TREND AGGREGATION — gom daily points → weekly/monthly cho chart density
+// =========================================================
+
+/// Granularity time-bucket cho trend chart.
+export type TrendGranularity = "day" | "week" | "month";
+
+/// Default granularity dựa vào số ngày data có. Chart 100+ ngày bar/label
+/// XAxis chồng không đọc được → auto-aggregate.
+export function defaultTrendGranularity(dayCount: number): TrendGranularity {
+  if (dayCount <= 31) return "day";
+  if (dayCount <= 180) return "week";
+  return "month";
+}
+
+/// Granularity options hợp lệ với data range. Cho user toggle nhỏ hơn default
+/// (vd 200 ngày: tháng default, options Tuần/Tháng — không cho Ngày vì 200
+/// bar chồng không xem được). Lớn hơn default thì OK (zoom out).
+export function availableGranularities(dayCount: number): TrendGranularity[] {
+  if (dayCount <= 31) return ["day"];
+  if (dayCount <= 180) return ["day", "week"];
+  if (dayCount <= 365) return ["week", "month"];
+  return ["month"]; // > 1 năm: tuần cũng quá nhiều → chỉ tháng
+}
+
+/// Anchor date của tuần chứa date — Monday đầu tuần (ISO week, UTC).
+function weekAnchor(dateYmd: string): string {
+  const d = new Date(`${dateYmd}T00:00:00Z`);
+  const dow = d.getUTCDay(); // 0=Sun, 1=Mon … 6=Sat
+  const daysBack = (dow + 6) % 7; // about-face từ thứ hiện tại lùi về Mon
+  d.setUTCDate(d.getUTCDate() - daysBack);
+  return d.toISOString().slice(0, 10);
+}
+
+/// Anchor date của tháng chứa date — ngày 01 của tháng đó.
+function monthAnchor(dateYmd: string): string {
+  return `${dateYmd.slice(0, 7)}-01`;
+}
+
+/// Gom DailyTrendPoint theo granularity. Sum tất cả monetary fields, ROI
+/// recompute weighted = sum(profit)/sum(spend) (chính xác hơn avg ROI ngày).
+/// Date của point output = anchor date (Mon của tuần / mùng 1 của tháng).
+/// dateShort định dạng tuỳ granularity:
+/// - day: DD/MM (giữ nguyên)
+/// - week: T DD/MM (T = "Tuần", date = Mon)
+/// - month: MM/YY
+export function aggregateTrend(
+  points: readonly DailyTrendPoint[],
+  granularity: TrendGranularity,
+): DailyTrendPoint[] {
+  if (granularity === "day") return [...points];
+
+  const anchorFn = granularity === "week" ? weekAnchor : monthAnchor;
+  const groups = new Map<string, DailyTrendPoint[]>();
+  for (const p of points) {
+    const a = anchorFn(p.date);
+    let g = groups.get(a);
+    if (!g) {
+      g = [];
+      groups.set(a, g);
+    }
+    g.push(p);
+  }
+
+  const result: DailyTrendPoint[] = [];
+  for (const [anchor, group] of groups) {
+    const spend = group.reduce((s, p) => s + p.spend, 0);
+    const netCommission = group.reduce((s, p) => s + p.netCommission, 0);
+    const profit = group.reduce((s, p) => s + p.profit, 0);
+    const orders = group.reduce((s, p) => s + p.orders, 0);
+    const shopeeClicks = group.reduce((s, p) => s + p.shopeeClicks, 0);
+    const roi = spend > 0 ? (profit / spend) * 100 : null;
+
+    let dateShort: string;
+    if (granularity === "week") {
+      const [, m, d] = anchor.split("-");
+      dateShort = `T ${d}/${m}`;
+    } else {
+      const [y, m] = anchor.split("-");
+      dateShort = `${m}/${y.slice(2)}`;
+    }
+
+    result.push({
+      date: anchor,
+      dateShort,
+      spend,
+      netCommission,
+      profit,
+      roi,
+      orders,
+      shopeeClicks,
+    });
+  }
+  result.sort((a, b) => a.date.localeCompare(b.date));
+  return result;
+}
+
 /// Cumulative profit trend: mỗi ngày = profit累mulative từ ngày đầu đến đó.
 /// Thấy được đường tăng trưởng (line luôn tăng nếu profit dương mọi ngày,
 /// hoặc có đoạn giảm nếu ngày lỗ).
