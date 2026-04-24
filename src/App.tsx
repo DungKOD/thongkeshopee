@@ -298,6 +298,29 @@ function AppInner() {
     if (referrers.length > 0) registerSources(referrers);
   }, [referrers, registerSources]);
 
+  // Silent auto-check cập nhật 1 lần sau login. Nếu có bản mới → toast
+  // nhắc user mở Settings để cài. Fail im lặng (offline / endpoint trả 404
+  // khi chưa có Release) — không spam error toast.
+  const updateCheckedRef = useRef(false);
+  useEffect(() => {
+    if (updateCheckedRef.current) return;
+    updateCheckedRef.current = true;
+    void (async () => {
+      try {
+        const { checkForUpdate } = await import("./lib/updater");
+        const info = await checkForUpdate();
+        if (info) {
+          showToast({
+            message: `Có bản mới v${info.version} — mở Cài đặt để cập nhật.`,
+            duration: 8000,
+          });
+        }
+      } catch {
+        // offline / no release yet — silent
+      }
+    })();
+  }, [showToast]);
+
   const isAdmin = useIsAdmin();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);

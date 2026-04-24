@@ -111,12 +111,21 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing: tauri-action auto sinh `.sig` + `latest.json` khi
+          # có tag `v*`. Missing key → build vẫn OK nhưng không có artifact
+          # update → user dùng bản cũ không auto-update được.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: "Shopee Affiliate Tracker ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+          # tauri-action tự publish `latest.json` + bundle + `.sig` lên Release
+          # khi có tagName. updaterJsonPreferNsis: chọn NSIS `.exe` updater thay
+          # vì MSI (NSIS support silent update không cần UAC lại).
+          updaterJsonPreferNsis: true
 
       - name: Debug — list bundle output
         if: always()
