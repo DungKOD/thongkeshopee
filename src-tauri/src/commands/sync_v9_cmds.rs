@@ -7,7 +7,7 @@
 //! - Error serialize thành string qua CmdError (UI hiển thị).
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::db::DbState;
 use crate::sync_v9::{
@@ -309,15 +309,37 @@ async fn cas_append_manifest_retry(
 ///
 /// Caller: `sync_v9_pull_all` khi detect `local_clock < snapshot_clock`.
 async fn perform_snapshot_restore(
+    app: &AppHandle,
     db: &State<'_, DbState>,
     base_url: &str,
     id_token: &str,
     snap: &crate::sync_v9::types::ManifestSnapshot,
 ) -> anyhow::Result<()> {
-    // 1. Fetch snapshot bytes từ R2. Tách step này riêng → HTTP không giữ
-    //    DB lock. Step 2 (apply_snapshot_bytes) là pure — testable ngoài Tauri.
-    let bytes = client::fetch_snapshot(base_url, id_token, &snap.key).await?;
-    apply_snapshot_bytes(&db.0, &bytes, snap)
+    // Bug 1 fix: emit event TRƯỚC fetch HTTP để FE block UI mutations
+    // trong window restore (FE listen → setStatus("bootstrap") + overlay).
+    // Mutation invokes (save_manual_entry, etc.) sau emit này sẽ thấy
+    // fresh_install_pending=1 → reject early bằng helper check.
+    let _ = app.emit("sync:bootstrap:started", ());
+
+    // 1. Set bootstrap flag SỚM (trước HTTP) — mutation commands check flag
+    //    qua bootstrap::is_bootstrap_pending → reject early. Tránh INSERT
+    //    vào OLD DB trong window HTTP fetch + file swap.
+    {
+        let conn = db.0.lock().map_err(|_| anyhow::anyhow!("db lock poisoned"))?;
+        bootstrap::begin_bootstrap(&conn)?;
+    }
+
+    // 2. Fetch snapshot bytes từ R2. Tách step này riêng → HTTP không giữ
+    //    DB lock. apply_snapshot_bytes là pure — testable ngoài Tauri.
+    let result = (async {
+        let bytes = client::fetch_snapshot(base_url, id_token, &snap.key).await?;
+        apply_snapshot_bytes(&db.0, &bytes, snap)
+    })
+    .await;
+
+    // Always emit completed (success hoặc fail) → FE clear overlay.
+    let _ = app.emit("sync:bootstrap:completed", ());
+    result
 }
 
 /// Apply snapshot bytes đã fetch được vào local DB. Pure (không HTTP) để
@@ -434,6 +456,7 @@ pub struct PullReport {
 /// Full pull cycle: fetch manifest → diff → fetch deltas → apply per file.
 #[tauri::command]
 pub async fn sync_v9_pull_all(
+    app: AppHandle,
     db: State<'_, DbState>,
     base_url: String,
     id_token: String,
@@ -469,7 +492,7 @@ pub async fn sync_v9_pull_all(
     };
 
     if let Some(snap_ref) = restore_snapshot {
-        perform_snapshot_restore(&db, &base_url, &id_token, &snap_ref)
+        perform_snapshot_restore(&app, &db, &base_url, &id_token, &snap_ref)
             .await
             .map_err(|e| CmdError::msg(format!("snapshot restore: {e}")))?;
 
@@ -483,6 +506,10 @@ pub async fn sync_v9_pull_all(
             Some(m) => m,
             None => return Ok(PullReport::default()),
         };
+        // Cache refetched manifest — push tiếp theo skip GET CAS (Bug 3 fix).
+        if let Some(etag) = &refetched.etag {
+            crate::sync_v9::manifest_cache::cache_put(manifest.clone(), etag.clone());
+        }
     }
 
     // 3. Plan pending deltas (dùng local state).
@@ -583,11 +610,13 @@ pub struct SyncReport {
 /// changes). Order này tránh CAS conflict cao khi cả 2 máy cùng sync.
 #[tauri::command]
 pub async fn sync_v9_sync_all(
+    app: AppHandle,
     db: State<'_, DbState>,
     base_url: String,
     id_token: String,
 ) -> CmdResult<SyncReport> {
-    let pull_report = sync_v9_pull_all(db.clone(), base_url.clone(), id_token.clone()).await?;
+    let pull_report =
+        sync_v9_pull_all(app.clone(), db.clone(), base_url.clone(), id_token.clone()).await?;
     let push_report = sync_v9_push_all(db, base_url, id_token).await?;
     Ok(SyncReport {
         pull: pull_report,

@@ -17,7 +17,7 @@ use crate::db::{resolve_active_imports_dir, tombstone_key_sub, DbState};
 
 use super::query::{is_prefix, to_canonical, Canonical};
 use crate::sync_v9::hlc::next_hlc_rfc3339;
-use super::{CmdError, CmdResult};
+use super::{assert_not_bootstrapping, CmdError, CmdResult};
 
 #[tauri::command]
 pub fn batch_commit_deletes(
@@ -25,6 +25,7 @@ pub fn batch_commit_deletes(
     payload: BatchDeletePayload,
 ) -> CmdResult<BatchResult> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    assert_not_bootstrapping(&conn)?;
     let tx = conn.transaction()?;
     // HLC-lite: tombstone.deleted_at monotonic → apply_tombstones compare với
     // manual_entries.updated_at từ remote chính xác bất chấp clock drift.

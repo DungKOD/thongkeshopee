@@ -1392,6 +1392,12 @@ function splashTextFor(phase: SyncPhase): { title: string; subtitle?: string } {
         title: "Đang đẩy lên R2...",
         subtitle: "Upload thay đổi local + cập nhật manifest.",
       };
+    case "snapshot-restore":
+      return {
+        title: "Đang khôi phục dữ liệu từ cloud...",
+        subtitle:
+          "Local đi sau snapshot — tải snapshot mới + apply delta. KHÔNG đóng app.",
+      };
     default:
       return {
         title: "Đang đồng bộ R2...",

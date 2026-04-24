@@ -14,7 +14,7 @@ use crate::db::types::{ManualEntryInput, ManualRowKey};
 use crate::db::{tombstone_key_sub, DbState};
 
 use crate::sync_v9::hlc::next_hlc_rfc3339;
-use super::{CmdError, CmdResult};
+use super::{assert_not_bootstrapping, CmdError, CmdResult};
 
 #[tauri::command]
 pub fn save_manual_entry(
@@ -22,6 +22,7 @@ pub fn save_manual_entry(
     input: ManualEntryInput,
 ) -> CmdResult<()> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    assert_not_bootstrapping(&conn)?;
     let tx = conn.transaction()?;
     // HLC-lite: ensure updated_at monotonic across machines. Thay `Utc::now`
     // bằng `next_hlc_rfc3339` để clock drift của máy local không làm edit này
@@ -94,6 +95,7 @@ pub fn delete_manual_entry(
     key: ManualRowKey,
 ) -> CmdResult<()> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    assert_not_bootstrapping(&conn)?;
     let tx = conn.transaction()?;
     // HLC-lite: tombstone.deleted_at cũng phải monotonic để so sánh với
     // row.updated_at từ máy khác (xem apply_tombstones có check updated_at).

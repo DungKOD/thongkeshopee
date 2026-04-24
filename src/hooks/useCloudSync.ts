@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { auth, getAuthToken } from "../lib/firebase";
 import { invoke } from "../lib/tauri";
 import {
@@ -45,7 +46,11 @@ function wipeUserLocalStorage(): void {
 /// Phase đang chạy trong 1 sync cycle. Dùng SplashScreen + SyncBadge render
 /// text phù hợp. FE tự track theo command đang gọi — v9 commands không emit
 /// event như v8, nên state chuyển chỉ quanh 2 tên "pulling" → "pushing".
-export type SyncPhase = "pulling" | "pushing" | null;
+export type SyncPhase =
+  | "pulling"
+  | "pushing"
+  | "snapshot-restore"
+  | null;
 
 /// Thống kê của sync cycle gần nhất — bytes + counts để UI hiển thị.
 export interface LastSyncStats {
@@ -368,10 +373,22 @@ export function useCloudSync({
       // Reset về default pull=true cho next sync (safe default).
       // Callers gọi doSync vì mutation sẽ set false trước mỗi lần gọi.
       needPullRef.current = true;
+      // Bug 2 fix: nếu RTDB notify đến trong window doSync đang chạy,
+      // subscribeRemotePushes callback set hasRemoteChangePending=true
+      // nhưng reentry guard return early (sync in flight). Sau khi sync
+      // xong, check flag → schedule retry với needPull=true. Tránh miss
+      // remote change tới mutation tiếp theo / 2h tick.
+      if (hasRemoteChangePending) {
+        setTimeout(() => {
+          if (statusRef.current === "syncing" || statusRef.current === "checking") return;
+          needPullRef.current = true;
+          void doSync();
+        }, 100);
+      }
     }
     // scheduleDebounce khai báo bên dưới — forward ref qua closure.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [hasRemoteChangePending]);
 
   /// Flat debounce — mỗi call clear timer cũ, setTimeout mới DEBOUNCE_MS.
   /// Mutation liên tục reset về fresh 45s, không ladder-up.
@@ -620,6 +637,39 @@ export function useCloudSync({
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
   }, [enabled, doSync]);
+
+  // Bug 1 fix: Listen Tauri events từ Rust khi snapshot restore start/end.
+  // Rust emit 'sync:bootstrap:started' TRƯỚC fetch HTTP → FE switch
+  // status="bootstrap" → BootstrapSplash overlay block toàn bộ UI.
+  // 'completed' (kể cả error) → restore status idle/error normal.
+  // Tránh window mutation INSERT vào OLD DB sẽ bị overwrite sau swap.
+  useEffect(() => {
+    if (!enabled) return;
+    let unsubStart: (() => void) | null = null;
+    let unsubEnd: (() => void) | null = null;
+    void listen("sync:bootstrap:started", () => {
+      setStatus("bootstrap");
+      setSyncPhase("snapshot-restore");
+    }).then((u) => {
+      unsubStart = u;
+    });
+    void listen("sync:bootstrap:completed", () => {
+      // Status reset bởi doSync finally setSyncPhase(null); chỉ clear phase.
+      setSyncPhase(null);
+      // Nếu doSync đang chạy (Promise pending) → finally sẽ set status idle/error.
+      // Edge case sync_v9_sync_all chạy → bootstrap restore → completed event
+      // tới khi pull_all chưa return → status vẫn "bootstrap" → cần reset.
+      if (statusRef.current === "bootstrap") {
+        setStatus("syncing");
+      }
+    }).then((u) => {
+      unsubEnd = u;
+    });
+    return () => {
+      unsubStart?.();
+      unsubEnd?.();
+    };
+  }, [enabled]);
 
   // Auto-sync periodic tick — nhận remote changes passively mỗi
   // AUTO_SYNC_INTERVAL_MS khi status=idle (không dirty/syncing/offline/

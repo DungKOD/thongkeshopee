@@ -53,3 +53,27 @@ impl serde::Serialize for CmdError {
 }
 
 pub type CmdResult<T> = std::result::Result<T, CmdError>;
+
+/// Reject mutation commands trong window snapshot restore. Caller phải
+/// check NGAY sau khi acquire DB lock — nếu `fresh_install_pending=1` ở
+/// `sync_manifest_state`, restore đang xảy ra → file swap sẽ overwrite
+/// OLD DB → INSERT/UPDATE bây giờ sẽ MẤT sau swap.
+///
+/// Áp dụng cho high-risk mutations (save_manual_entry, batch_commit_deletes).
+/// Account CRUD + import rare action — skip để không thêm rejection UX
+/// trừ khi user thật sự gặp trong long-offline scenario.
+pub fn assert_not_bootstrapping(conn: &rusqlite::Connection) -> CmdResult<()> {
+    let pending: i64 = conn
+        .query_row(
+            "SELECT fresh_install_pending FROM sync_manifest_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if pending != 0 {
+        return Err(CmdError::msg(
+            "Đang khôi phục dữ liệu từ cloud, vui lòng đợi vài giây rồi thử lại",
+        ));
+    }
+    Ok(())
+}
