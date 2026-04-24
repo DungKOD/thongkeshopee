@@ -6,7 +6,12 @@ import {
   browserLocalPersistence,
   setPersistence,
 } from "firebase/auth";
-import { getFirestore, type Firestore } from "firebase/firestore";
+import {
+  initializeFirestore,
+  persistentLocalCache,
+  persistentSingleTabManager,
+  type Firestore,
+} from "firebase/firestore";
 import { getDatabase, type Database } from "firebase/database";
 import { getFunctions, type Functions } from "firebase/functions";
 import { timed } from "./net_log";
@@ -23,7 +28,14 @@ const firebaseConfig = {
 
 export const firebaseApp: FirebaseApp = initializeApp(firebaseConfig);
 export const auth: Auth = getAuth(firebaseApp);
-export const db: Firestore = getFirestore(firebaseApp);
+/// Firestore với persistent IndexedDB cache. `useUserProfile` onSnapshot
+/// sẽ emit data từ cache khi offline → paywall check không block user đã
+/// từng load profile online. Single-tab manager đủ cho app desktop (1 window).
+export const db: Firestore = initializeFirestore(firebaseApp, {
+  localCache: persistentLocalCache({
+    tabManager: persistentSingleTabManager({}),
+  }),
+});
 /// RTDB cho presence tracking (online/offline). Chỉ init nếu env có URL —
 /// feature optional, app vẫn work nếu chưa setup RTDB.
 export const rtdb: Database | null = import.meta.env.VITE_FIREBASE_DATABASE_URL

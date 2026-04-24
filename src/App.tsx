@@ -1322,6 +1322,22 @@ function TabButton({ active, onClick, icon, label }: TabButtonProps) {
 function AuthGate() {
   const { user, loading: authLoading } = useAuth();
   const { status, expiredAt } = usePremium();
+  // Track online/offline để bypass paywall khi offline. User đã login rồi
+  // (auth.currentUser còn nhờ browserLocalPersistence) → cho phép dùng local
+  // DB mà không cần check activation. Offline = không sync → không benefit
+  // premium → không tốn R2 → gate paywall chỉ ở online path hợp lý.
+  const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
+  useEffect(() => {
+    const onOnline = () => setIsOnline(true);
+    const onOffline = () => setIsOnline(false);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+
   // Presence tracking — mount 1 lần ở AuthGate, hook tự re-subscribe khi
   // uid đổi qua auth.onAuthStateChanged. Chạy bất kể status paywall vì
   // user vẫn "online" khi đang ở màn PaywallScreen.
@@ -1329,9 +1345,18 @@ function AuthGate() {
 
   if (authLoading) return <SplashScreen title="Đang tải..." />;
   if (!user) return <LoginScreen />;
-  if (status === "loading") return <SplashScreen title="Đang tải..." />;
-  if (status === "inactive" || status === "expired") {
-    return <PaywallScreen expiredAt={expiredAt} reason={status} />;
+
+  // Offline bypass: user đã auth (token cached qua browserLocalPersistence).
+  // Profile Firestore có thể chưa load (IndexedDB cache miss) → skip check,
+  // cho vào app với data local. Khi online trở lại, usePremium re-check +
+  // paywall sẽ kick nếu inactive.
+  if (!isOnline) {
+    // Fall through vào app inner — không paywall, không splash loading.
+  } else {
+    if (status === "loading") return <SplashScreen title="Đang tải..." />;
+    if (status === "inactive" || status === "expired") {
+      return <PaywallScreen expiredAt={expiredAt} reason={status} />;
+    }
   }
 
   // CRITICAL phân quyền: key={user.uid} force remount toàn bộ subtree khi uid
