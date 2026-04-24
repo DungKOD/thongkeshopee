@@ -2,8 +2,12 @@ import { invoke } from "./tauri";
 
 /// 1 account Shopee affiliate. Row count = total rows Shopee clicks + orders
 /// + manual_entries đang FK về account này.
+///
+/// **`id` là string** (không phải number) vì content_id hash sau v13 có thể
+/// > 2^53 (Number.MAX_SAFE_INTEGER), JS number bị round → DELETE/rename sai
+/// row. Rust serialize/deserialize as string ở Tauri boundary.
 export interface ShopeeAccount {
-  id: number;
+  id: string;
   name: string;
   color: string | null;
   createdAt: string;
@@ -17,23 +21,23 @@ export function listShopeeAccounts(): Promise<ShopeeAccount[]> {
 export function createShopeeAccount(
   name: string,
   color?: string | null,
-): Promise<number> {
-  return invoke<number>("create_shopee_account", { name, color: color ?? null });
+): Promise<string> {
+  return invoke<string>("create_shopee_account", { name, color: color ?? null });
 }
 
-export function renameShopeeAccount(id: number, newName: string): Promise<void> {
+export function renameShopeeAccount(id: string, newName: string): Promise<void> {
   return invoke<void>("rename_shopee_account", { id, newName });
 }
 
 export function updateShopeeAccountColor(
-  id: number,
+  id: string,
   color: string | null,
 ): Promise<void> {
   return invoke<void>("update_shopee_account_color", { id, color });
 }
 
 export function deleteShopeeAccount(
-  id: number,
+  id: string,
   alsoDeleteFb: boolean,
 ): Promise<void> {
   return invoke<void>("delete_shopee_account", { id, alsoDeleteFb });
@@ -42,14 +46,14 @@ export function deleteShopeeAccount(
 /// Đếm FB ads sẽ bị "cuốn theo" khi xóa account — khớp sub_id prefix-
 /// compatible với Shopee data của account, VÀ không dùng chung với account
 /// khác (safeguard). Dùng cho preview dialog.
-export function countFbLinkedToAccount(id: number): Promise<number> {
+export function countFbLinkedToAccount(id: string): Promise<number> {
   return invoke<number>("count_fb_linked_to_account", { id });
 }
 
 /// Chuyển toàn bộ data từ account `fromId` sang `toId`. Trả về số row đã chuyển.
 export function reassignShopeeAccountData(
-  fromId: number,
-  toId: number,
+  fromId: string,
+  toId: string,
 ): Promise<number> {
   return invoke<number>("reassign_shopee_account_data", { fromId, toId });
 }

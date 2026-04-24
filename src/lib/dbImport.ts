@@ -549,7 +549,7 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
  */
 export async function commitCsvBatch(
   batch: PreviewBatch,
-  shopeeAccountId: number,
+  shopeeAccountId: string,
 ): Promise<ImportResult[]> {
   const results: ImportResult[] = [];
   for (const { parsed, preview } of batch.files) {

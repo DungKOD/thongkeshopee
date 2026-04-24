@@ -9,7 +9,8 @@ interface ManualEntryDialogProps {
   initialRow?: UiRow | null;
   /// Account Shopee hiện đang active (AppInner pass từ useAccounts).
   /// Null = chưa có account nào — dialog sẽ hiện warning thay cho form.
-  shopeeAccountId: number | null;
+  /// String vì content_id hash có thể > 2^53 (JS Number precision loss).
+  shopeeAccountId: string | null;
   onSave: (input: ManualEntryInput) => Promise<void>;
   onClose: () => void;
 }

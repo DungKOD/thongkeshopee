@@ -202,8 +202,22 @@ pub struct ImportShopeeClicksPayload {
     /// ID của `shopee_accounts` mà toàn bộ rows trong file này thuộc về.
     /// Optional để preview command (dùng cùng struct) không fail — FE gửi
     /// missing field lúc preview. Import command bắt buộc có → None = reject.
-    #[serde(default)]
+    /// FE gửi string (content_id hash > 2^53).
+    #[serde(default, deserialize_with = "deser_opt_i64_flexible")]
     pub shopee_account_id: Option<i64>,
+}
+
+fn deser_opt_i64_flexible<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Any { Num(i64), Str(String) }
+    let opt: Option<Any> = Option::deserialize(d)?;
+    match opt {
+        None => Ok(None),
+        Some(Any::Num(n)) => Ok(Some(n)),
+        Some(Any::Str(s)) if s.is_empty() => Ok(None),
+        Some(Any::Str(s)) => s.parse::<i64>().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 /// Import Shopee WebsiteClickReport.csv — 1 row/click, PK = click_id.
@@ -377,7 +391,8 @@ pub struct ImportShopeeOrdersPayload {
     /// ID của `shopee_accounts`. Optional cho preview command share struct.
     /// Import bắt buộc có. Nếu row đã tồn tại (UPSERT theo checkout_id + item_id
     /// + model_id), account_id **cập nhật** theo file mới — ưu tiên intention mới.
-    #[serde(default)]
+    /// FE gửi string (content_id hash > 2^53).
+    #[serde(default, deserialize_with = "deser_opt_i64_flexible")]
     pub shopee_account_id: Option<i64>,
 }
 

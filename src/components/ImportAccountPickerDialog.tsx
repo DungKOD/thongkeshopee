@@ -9,7 +9,7 @@ import { createShopeeAccount } from "../lib/accounts";
 interface ImportAccountPickerDialogProps {
   isOpen: boolean;
   /// User pick account xong → gọi callback với id → parent trigger file picker.
-  onPick: (accountId: number) => void;
+  onPick: (accountId: string) => void;
   onClose: () => void;
 }
 
@@ -23,7 +23,7 @@ export function ImportAccountPickerDialog({
 }: ImportAccountPickerDialogProps) {
   const { accounts, activeAccountId, defaultAccountId, refresh } =
     useAccounts();
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [error, setError] = useState<string | null>(null);

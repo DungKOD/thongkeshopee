@@ -25,23 +25,25 @@ export function isDefaultAccount(a: { name: string }): boolean {
 /// Filter UI — "all" = tất cả, "account" = 1 TK cụ thể.
 /// Account "Mặc định" là catch-all bucket cho sub_id chưa gán explicit
 /// account (Shopee/manual gán FK Mặc định + FB không match account nào).
+///
+/// `id` là string — content_id hash có thể > 2^53 (không an toàn JS Number).
 export type AccountFilter =
   | { kind: "all" }
-  | { kind: "account"; id: number };
+  | { kind: "account"; id: string };
 
 interface AccountContextValue {
   /// List account từ DB. Null = đang load lần đầu.
   accounts: ShopeeAccount[] | null;
   /// ID động của account "Mặc định" — lookup từ list theo name. Null nếu
   /// list chưa load hoặc không có account nào tên "Mặc định".
-  defaultAccountId: number | null;
+  defaultAccountId: string | null;
   /// Active filter cho UI (Overview/DayBlock query sẽ filter theo).
   filter: AccountFilter;
   setFilter: (f: AccountFilter) => void;
   /// Active account cho import/manual entry (phải là account thật, không bucket ảo).
   /// Default = account đầu tiên non-Mặc định trong list.
-  activeAccountId: number | null;
-  setActiveAccountId: (id: number) => void;
+  activeAccountId: string | null;
+  setActiveAccountId: (id: string) => void;
   /// Re-fetch list từ DB (sau khi tạo/rename/delete).
   refresh: () => Promise<void>;
 }
@@ -57,7 +59,7 @@ export function AccountProvider({ children }: AccountProviderProps) {
   const uid = user?.uid ?? null;
   const [accounts, setAccounts] = useState<ShopeeAccount[] | null>(null);
   const [filter, setFilter] = useState<AccountFilter>({ kind: "all" });
-  const [activeAccountId, setActiveAccountId] = useState<number | null>(null);
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {

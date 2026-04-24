@@ -11,10 +11,12 @@ import { uiRowKey } from "../formulas";
 export const todayIso = () => new Date().toISOString().slice(0, 10);
 
 /** Tagged union — account filter theo mode. Trùng shape Rust
- *  `AccountFilterMode` (tag=kind, camelCase). */
+ *  `AccountFilterMode` (tag=kind, camelCase).
+ *  `id` là string vì content_id hash > 2^53 — Rust deser flexible accepts
+ *  cả string và number, nhưng FE gửi string để preserve precision. */
 export type AccountFilterMode =
   | { kind: "all" }
-  | { kind: "account"; id: number };
+  | { kind: "account"; id: string };
 
 /** Filter args gửi xuống Rust `list_days_with_rows`. Mọi field optional. */
 export interface DaysFilter {

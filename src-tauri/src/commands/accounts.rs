@@ -35,10 +35,34 @@ fn is_default_account(conn: &rusqlite::Connection, id: i64) -> CmdResult<bool> {
     Ok(name.as_deref() == Some(DEFAULT_ACCOUNT_NAME))
 }
 
+/// Serialize i64 → string ở JSON boundary. Lý do: content_id (v13) là hash
+/// 63-bit, có thể > 2^53 (JS Number.MAX_SAFE_INTEGER). Serialize as JSON
+/// number sẽ bị round → FE nhận sai id → DELETE fail vì id không match.
+/// Serialize as string → preserve precision.
+mod id_str {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<i64>().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse id string từ FE. Utility cho mọi Tauri cmd nhận `id: String`.
+fn parse_id(s: &str) -> CmdResult<i64> {
+    s.parse::<i64>()
+        .map_err(|e| CmdError::msg(format!("id invalid '{s}': {e}")))
+}
+
 /// 1 account Shopee affiliate trong DB.
+/// `id` serialize as string để preserve precision ở JS boundary (content_id
+/// hash có thể > 2^53).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShopeeAccount {
+    #[serde(with = "id_str")]
     pub id: i64,
     pub name: String,
     pub color: Option<String>,
@@ -80,13 +104,13 @@ pub fn list_shopee_accounts(state: State<'_, DbState>) -> CmdResult<Vec<ShopeeAc
         .map_err(CmdError::from)
 }
 
-/// Tạo account mới. Trả về id mới. Fail 400 nếu name trống hoặc trùng.
+/// Tạo account mới. Trả về id mới (string vì content_id có thể > 2^53).
 #[tauri::command]
 pub fn create_shopee_account(
     state: State<'_, DbState>,
     name: String,
     color: Option<String>,
-) -> CmdResult<i64> {
+) -> CmdResult<String> {
     let trimmed = name.trim().to_string();
     if trimmed.is_empty() {
         return Err(CmdError::msg("Tên account không được để trống"));
@@ -111,16 +135,17 @@ pub fn create_shopee_account(
             CmdError::from(e)
         }
     })?;
-    Ok(id)
+    Ok(id.to_string())
 }
 
 /// Rename account. Không đụng FK data. Fail nếu name trùng với account khác.
 #[tauri::command]
 pub fn rename_shopee_account(
     state: State<'_, DbState>,
-    id: i64,
+    id: String,
     new_name: String,
 ) -> CmdResult<()> {
+    let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     if is_default_account(&conn, id)? {
         return Err(CmdError::msg(
@@ -155,9 +180,10 @@ pub fn rename_shopee_account(
 #[tauri::command]
 pub fn update_shopee_account_color(
     state: State<'_, DbState>,
-    id: i64,
+    id: String,
     color: Option<String>,
 ) -> CmdResult<()> {
+    let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     conn.execute(
         "UPDATE shopee_accounts SET color = ?1 WHERE id = ?2",
@@ -209,8 +235,9 @@ fn load_shopee_canonicals_by_day(
 #[tauri::command]
 pub fn count_fb_linked_to_account(
     state: State<'_, DbState>,
-    id: i64,
+    id: String,
 ) -> CmdResult<i64> {
+    let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let shop_target = load_shopee_canonicals_by_day(&conn, |a| a == id)?;
     if shop_target.is_empty() {
@@ -264,9 +291,10 @@ pub fn count_fb_linked_to_account(
 #[tauri::command]
 pub fn delete_shopee_account(
     state: State<'_, DbState>,
-    id: i64,
+    id: String,
     also_delete_fb: Option<bool>,
 ) -> CmdResult<()> {
+    let id = parse_id(&id)?;
     let also_delete_fb = also_delete_fb.unwrap_or(false);
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
@@ -390,9 +418,11 @@ pub fn delete_shopee_account(
 #[tauri::command]
 pub fn reassign_shopee_account_data(
     state: State<'_, DbState>,
-    from_id: i64,
-    to_id: i64,
+    from_id: String,
+    to_id: String,
 ) -> CmdResult<i64> {
+    let from_id = parse_id(&from_id)?;
+    let to_id = parse_id(&to_id)?;
     if from_id == to_id {
         return Err(CmdError::msg("from_id và to_id phải khác nhau"));
     }

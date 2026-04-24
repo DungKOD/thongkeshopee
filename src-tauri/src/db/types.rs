@@ -95,7 +95,19 @@ pub struct ManualEntryInput {
     pub notes: Option<String>,
     /// Account Shopee mà manual entry thuộc về. FE luôn pass giá trị (dropdown
     /// chọn account khi tạo/edit). Phải là id hợp lệ trong `shopee_accounts`.
+    /// FE serialize as string (content_id hash > 2^53 không fit JS Number).
+    #[serde(deserialize_with = "deser_i64_flexible")]
     pub shopee_account_id: i64,
+}
+
+fn deser_i64_flexible<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Any { Num(i64), Str(String) }
+    match Any::deserialize(d)? {
+        Any::Num(n) => Ok(n),
+        Any::Str(s) => s.parse::<i64>().map_err(serde::de::Error::custom),
+    }
 }
 
 /// Payload batch delete: user bấm "Lưu thay đổi" sau khi đã gạch ngang.

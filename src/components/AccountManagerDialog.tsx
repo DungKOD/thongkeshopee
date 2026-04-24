@@ -39,7 +39,7 @@ export function AccountManagerDialog({
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   // Confirm dialog: khi user bấm xóa account (có/không data).
   const [confirmDelete, setConfirmDelete] = useState<ShopeeAccount | null>(null);
@@ -78,7 +78,7 @@ export function AccountManagerDialog({
   }, [newName, accounts, refresh, onDataChanged]);
 
   const handleRename = useCallback(
-    async (id: number) => {
+    async (id: string) => {
       const name = editName.trim();
       if (!name) return;
       setSaving(true);

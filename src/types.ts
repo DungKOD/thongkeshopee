@@ -71,8 +71,9 @@ export type ManualEntryInput = {
   overrideCpc: number | null;
   overrideOrders: number | null;
   overrideCommission: number | null;
-  /** Account Shopee manual entry thuộc về. FE phải set từ selector. */
-  shopeeAccountId: number;
+  /** Account Shopee manual entry thuộc về. FE phải set từ selector.
+   *  String vì content_id hash > 2^53 (JS Number precision loss). */
+  shopeeAccountId: string;
 };
 
 /** Derived values tính từ 1 UiRow. */

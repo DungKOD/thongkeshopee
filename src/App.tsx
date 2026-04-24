@@ -386,7 +386,7 @@ function AppInner() {
   }, [pausedNow]);
   // TK user pick trong ImportAccountPickerDialog — giữ xuyên suốt flow import.
   // null khi chưa pick (dialog đóng) hoặc không có batch pending.
-  const [importAccountId, setImportAccountId] = useState<number | null>(null);
+  const [importAccountId, setImportAccountId] = useState<string | null>(null);
   const [accountPickerOpen, setAccountPickerOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -394,7 +394,7 @@ function AppInner() {
   // → parse → preview (hiển thị TK đã pick) → confirm → commit.
   const handleImportClick = () => setAccountPickerOpen(true);
 
-  const handleAccountPicked = (accountId: number) => {
+  const handleAccountPicked = (accountId: string) => {
     setImportAccountId(accountId);
     setAccountPickerOpen(false);
     // Defer mở file picker 1 tick để dialog đóng animation xong.

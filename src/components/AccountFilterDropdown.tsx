@@ -7,8 +7,9 @@ export function AccountFilterDropdown() {
     const v = e.target.value;
     if (v === "all") setFilter({ kind: "all" });
     else {
-      const id = Number(v.replace(/^account:/, ""));
-      if (Number.isFinite(id)) setFilter({ kind: "account", id });
+      // id là string (content_id hash có thể > 2^53) — strip prefix thôi.
+      const id = v.replace(/^account:/, "");
+      if (id) setFilter({ kind: "account", id });
     }
   };
 

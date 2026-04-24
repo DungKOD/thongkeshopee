@@ -9,7 +9,7 @@ interface ImportPreviewDialogProps {
   batch: PreviewBatch | null;
   /// Account id mà toàn bộ Shopee file trong batch sẽ tag về. User chọn ở
   /// ImportAccountPickerDialog trước khi pick file → dialog này chỉ hiển thị.
-  shopeeAccountId: number | null;
+  shopeeAccountId: string | null;
   onConfirm: () => Promise<void>;
   onCancel: () => void;
 }
