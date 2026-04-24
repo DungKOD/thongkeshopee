@@ -42,6 +42,30 @@ pub struct UiRow {
     pub has_shopee_clicks: bool,
     pub has_shopee_orders: bool,
     pub has_manual: bool,
+
+    /// Account id của manual entry (nếu row có manual). None = row không có
+    /// manual → UI edit dùng activeAccountId. String serialize vì content_id
+    /// hash có thể > 2^53 (JS Number precision loss).
+    #[serde(with = "id_str_opt")]
+    pub shopee_account_id: Option<i64>,
+}
+
+mod id_str_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => s.serialize_str(&n.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            None => Ok(None),
+            Some(s) if s.is_empty() => Ok(None),
+            Some(s) => s.parse::<i64>().map(Some).map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 /// Day-level totals — KHÔNG áp row-0 filter (spend==0 && commission==0).

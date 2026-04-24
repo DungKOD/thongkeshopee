@@ -491,13 +491,14 @@ fn aggregate_rows_for_day(
         cpc: Option<f64>,
         orders: Option<i64>,
         commission: Option<f64>,
+        shopee_account_id: Option<i64>,
     }
     let mut manuals: Vec<Manual> = Vec::new();
     {
         let mut sql = String::from(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                     display_name, override_clicks, override_spend, override_cpc,
-                    override_orders, override_commission
+                    override_orders, override_commission, shopee_account_id
              FROM manual_entries
              WHERE day_date = ?",
         );
@@ -523,6 +524,7 @@ fn aggregate_rows_for_day(
                 cpc: r.get(8)?,
                 orders: r.get(9)?,
                 commission: r.get(10)?,
+                shopee_account_id: r.get(11)?,
             })
         })?;
         for row in iter {
@@ -621,6 +623,9 @@ fn aggregate_rows_for_day(
         has_shopee_clicks: bool,
         has_shopee_orders: bool,
         has_manual: bool,
+        /// Account id từ manual entry (nếu row có manual). None nếu không có
+        /// manual. FE dùng xác định save path khi edit dialog.
+        shopee_account_id: Option<i64>,
     }
 
     let mut map: HashMap<Canonical, Accumulator> = HashMap::new();
@@ -641,6 +646,7 @@ fn aggregate_rows_for_day(
         has_shopee_clicks: false,
         has_shopee_orders: false,
         has_manual: false,
+        shopee_account_id: None,
     };
 
     // FB ads (đã dedup ad_group ưu tiên trong SQL).
@@ -693,6 +699,7 @@ fn aggregate_rows_for_day(
         let rep = resolve(&r.canonical);
         let entry = map.entry(rep.clone()).or_insert_with(|| make_empty(&rep));
         entry.has_manual = true;
+        entry.shopee_account_id = r.shopee_account_id;
         // Display name rule: nếu canonical empty (no sub_id) + manual có name → dùng.
         if rep.is_empty() {
             if let Some(name) = r.display_name.as_ref() {
@@ -790,6 +797,7 @@ fn aggregate_rows_for_day(
             has_shopee_clicks: acc.has_shopee_clicks,
             has_shopee_orders: acc.has_shopee_orders,
             has_manual: acc.has_manual,
+            shopee_account_id: acc.shopee_account_id,
         });
     }
 

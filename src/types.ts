@@ -26,6 +26,10 @@ export type UiRow = {
   hasShopeeClicks: boolean;
   hasShopeeOrders: boolean;
   hasManual: boolean;
+  /** Account id của manual entry (nếu row có hasManual). Null = không có
+   *  manual → edit dialog dùng activeAccountId. String vì content_id hash
+   *  có thể > 2^53. */
+  shopeeAccountId: string | null;
 };
 
 /** Day-level totals — tính từ MỌI tuple trước row-0 filter. KPI dùng field

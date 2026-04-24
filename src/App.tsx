@@ -1127,7 +1127,13 @@ function AppInner() {
           isOpen={true}
           initialDate={entryDialog.date}
           initialRow={entryDialog.row}
-          shopeeAccountId={activeAccountId}
+          // Priority: row đang edit có manual → dùng account của row đó (không
+          // reassign sang active). Thêm mới + filter account → dùng filter id
+          // để gán vào đúng bucket user đang xem. Fallback cuối: activeAccountId.
+          shopeeAccountId={
+            entryDialog.row?.shopeeAccountId ??
+            (accountFilter.kind === "account" ? accountFilter.id : activeAccountId)
+          }
           onSave={handleSaveEntry}
           onClose={() => setEntryDialog(null)}
         />
