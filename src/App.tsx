@@ -1110,7 +1110,13 @@ function AppInner() {
         onToggleClickSource={setClickSource}
         onSetProfitFee={setProfitFee}
         onClose={() => setSettingsOpen(false)}
-        onImportReverted={() => void refetch()}
+        onImportReverted={() => {
+          // Revert = mutation (xóa raw rows, mark file reverted_at) → phải
+          // bump mutationVersion để debounce sync gom lên R2 chung batch,
+          // giống save manual/import/delete.
+          markMutation();
+          void refetch();
+        }}
       />
 
       <RulesDialog isOpen={rulesOpen} onClose={() => setRulesOpen(false)} />
