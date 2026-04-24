@@ -15,11 +15,13 @@
 // dead_code cho module này cho đến khi wire up xong.
 #![allow(dead_code)]
 
+pub mod apply;
 pub mod capture;
 pub mod compress;
 pub mod descriptors;
 pub mod event_log;
 pub mod manifest;
+pub mod pull;
 pub mod push;
 pub mod types;
 
