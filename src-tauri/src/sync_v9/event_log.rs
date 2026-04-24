@@ -67,6 +67,17 @@ pub fn prune_ring_buffer(conn: &Connection) -> Result<usize> {
     Ok(deleted)
 }
 
+/// Đếm số events chưa upload (uploaded_at IS NULL). Cheap cho UI status
+/// hoặc quyết định threshold flush.
+pub fn count_pending(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sync_event_log WHERE uploaded_at IS NULL",
+        [],
+        |r| r.get(0),
+    )
+    .context("count_pending sync_event_log failed")
+}
+
 /// Fetch events chưa upload lên R2 (uploaded_at IS NULL), theo thứ tự cũ → mới.
 ///
 /// Limit để tránh load cả ring buffer vào RAM 1 lần khi user offline lâu.

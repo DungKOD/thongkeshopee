@@ -105,8 +105,11 @@ export function MySyncLogDialog({ isOpen, onClose }: MySyncLogDialogProps) {
               Events: {events?.length ?? 0} · Cycles: {cycles.length} ·
               Requests: {netLog.length}
               {pendingCount > 0 && (
-                <span className="ml-2 rounded-full bg-amber-500/20 px-2 py-0.5 text-amber-300">
-                  {pendingCount} chưa flush R2
+                <span
+                  className="ml-2 rounded-full bg-white/10 px-2 py-0.5 text-white/60"
+                  title="Log observability metadata chưa upload lên R2. Data đã sync bình thường — log chỉ là debug trail, không ảnh hưởng DB."
+                >
+                  {pendingCount} log chưa backup
                 </span>
               )}
             </p>

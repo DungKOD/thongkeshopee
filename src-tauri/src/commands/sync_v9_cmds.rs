@@ -141,6 +141,10 @@ pub struct SyncV9State {
     pub last_snapshot_key: Option<String>,
     pub last_snapshot_clock_ms: i64,
     pub pending_push_tables: Vec<String>,
+    /// Số events trong `sync_event_log` chưa flush lên R2. UI dùng hiển thị
+    /// pending count + FE quyết định khi threshold > N → flush ngay thay vì
+    /// đợi date rollover.
+    pub pending_log_count: i64,
 }
 
 /// UI state snapshot — hiển thị trong SyncBadge + admin.
@@ -187,12 +191,16 @@ pub fn sync_v9_get_state(db: State<'_, DbState>) -> CmdResult<SyncV9State> {
         }
     }
 
+    let pending_log_count =
+        event_log::count_pending(&conn).map_err(|e| CmdError::msg(e.to_string()))?;
+
     Ok(SyncV9State {
         fresh_install_pending: m.fresh_install_pending,
         last_pulled_manifest_clock_ms: m.last_pulled_manifest_clock_ms,
         last_snapshot_key: m.last_snapshot_key,
         last_snapshot_clock_ms: m.last_snapshot_clock_ms,
         pending_push_tables: pending_tables,
+        pending_log_count,
     })
 }
 

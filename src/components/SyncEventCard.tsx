@@ -221,19 +221,19 @@ export function SyncEventCard({ event }: SyncEventCardProps) {
         <span className="ml-auto flex items-center gap-2 text-[15px]">
           {event.uploadedAt ? (
             <span
-              className="flex items-center gap-1 text-green-300"
-              title={`Đã flush lên R2: ${event.uploadedAt}`}
+              className="flex items-center gap-1 text-green-300/80"
+              title={`Log đã upload lên R2: ${event.uploadedAt}`}
             >
-              <span className="h-2 w-2 rounded-full bg-green-400" />
-              Trên R2
+              <span className="h-2 w-2 rounded-full bg-green-400/80" />
+              Log on R2
             </span>
           ) : (
             <span
-              className="flex items-center gap-1 text-amber-300"
-              title="Chưa flush lên R2 (chờ sync tiếp theo)"
+              className="flex items-center gap-1 text-white/40"
+              title="Log observability chưa upload lên R2 (flush lazy — upload theo batch/date rollover). Data đã sync bình thường, log chỉ là debug trail."
             >
-              <span className="h-2 w-2 rounded-full bg-amber-400" />
-              Chờ flush
+              <span className="h-2 w-2 rounded-full bg-white/30" />
+              Log pending
             </span>
           )}
           <button

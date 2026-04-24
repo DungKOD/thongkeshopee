@@ -280,18 +280,6 @@ export function useCloudSync({
         );
       }
 
-      // A3 optimization: flush log chỉ khi date rollover. Trước đây mỗi
-      // sync flush 1 PUT/date → 30 sync/ngày = 30 PUT cùng file. Giờ flush
-      // 1 lần/ngày + khi close app (qua beforeunload handler).
-      // Safety: events vẫn persist local, không mất. Chỉ delay upload.
-      const today = new Date().toISOString().slice(0, 10);
-      if (lastLogFlushDateRef.current !== today) {
-        lastLogFlushDateRef.current = today;
-        void syncV9LogFlush(idToken).catch((e) => {
-          console.warn("[sync v9] log flush failed:", e);
-        });
-      }
-
       // Check compaction trigger (P10, best-effort). Threshold > 100 deltas
       // → tạo snapshot + clear manifest.deltas. Long-running (upload 500MB)
       // nên detach — status UI không block.
@@ -315,6 +303,23 @@ export function useCloudSync({
         scheduleDebounce();
       } else {
         setStatus("idle");
+      }
+
+      // A3 optimization: flush log lazy. Trigger khi:
+      // - Date rollover (mới ngày mới) — default case, ~1 flush/ngày
+      // - OR queue > 50 events pending — avoid dồn quá nhiều trong 1 ngày
+      //   nếu user active cao (UX: user mở log dialog không thấy số lớn)
+      // Safety: events persist local, beforeunload flush backup khi close.
+      const today = new Date().toISOString().slice(0, 10);
+      const LOG_FLUSH_QUEUE_THRESHOLD = 50;
+      const shouldFlushLog =
+        lastLogFlushDateRef.current !== today ||
+        state.pendingLogCount >= LOG_FLUSH_QUEUE_THRESHOLD;
+      if (shouldFlushLog) {
+        lastLogFlushDateRef.current = today;
+        void syncV9LogFlush(idToken).catch((e) => {
+          console.warn("[sync v9] log flush failed:", e);
+        });
       }
     } catch (e) {
       const msg = (e as Error).message ?? String(e);

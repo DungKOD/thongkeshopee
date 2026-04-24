@@ -23,6 +23,9 @@ export interface SyncV9State {
   /// List table có row chưa push (rowid/cursor > last_uploaded_cursor).
   /// Empty = DB clean, không có gì để sync.
   pendingPushTables: string[];
+  /// Số sync_event_log entries chưa flush lên R2 (observability log, non-critical).
+  /// FE dùng quyết định trigger flush nếu > threshold.
+  pendingLogCount: number;
 }
 
 export interface PushReport {
