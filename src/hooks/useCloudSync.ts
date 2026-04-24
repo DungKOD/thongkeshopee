@@ -91,18 +91,16 @@ interface UseCloudSyncOptions {
   onRemoteApplied?: () => void | Promise<void>;
 }
 
-/// Adaptive debounce: mutation đầu tiên dùng DEBOUNCE_BASE_MS, mỗi mutation
-/// tiếp theo (reset trong window) tăng ladder lên. Cap ở DEBOUNCE_MAX_MS.
-/// Kết quả: user edit liên tục → gộp thành 1 sync cuối thay vì N syncs.
+/// Flat debounce — mỗi mutation reset timer về DEBOUNCE_MS fresh.
 ///
-/// v9 Q1 lock: auto-sync interval ≥ 5 phút. Nhưng adaptive debounce
-/// per-mutation vẫn giữ để tránh spam sync khi user edit liên tục — giá
-/// trị nhỏ hơn 5 phút vì đây là phản ứng với mutation cụ thể, không phải
-/// cron tick. Combined skip-identical hash (sync_v9/push.rs) → mutation
-/// không đổi content table KHÔNG tốn upload.
-const DEBOUNCE_BASE_MS = 45_000;
-const DEBOUNCE_MAX_MS = 120_000;
-const DEBOUNCE_STEP_MS = 15_000;
+/// User flow:
+/// - Edit CV1 → timer 45s
+/// - Edit CV2 sau 15s → throw away 30s còn lại, bắt đầu 45s mới
+/// - Không edit gì tiếp → sau 45s, sync fire
+///
+/// Combined skip-identical hash (sync_v9/push.rs) → mutation không đổi
+/// content table KHÔNG tốn upload dù debounce fire.
+const DEBOUNCE_MS = 45_000;
 const IDLE_MS = 30_000;
 const IDLE_CHECK_MS = 5_000;
 // Exponential backoff: 30s, 60s, 120s, 300s (cap 5min).
@@ -122,16 +120,6 @@ const FORCE_SYNC_MIN_GAP_MS = 2_000;
 function backoffFor(attempt: number): number {
   const idx = Math.min(attempt, RETRY_BACKOFF_MS.length - 1);
   return RETRY_BACKOFF_MS[idx];
-}
-
-/// Compute adaptive debounce delay dựa trên consecutive mutations.
-/// - 1st mutation: BASE (45s)
-/// - 2nd: 60s
-/// - 3rd: 75s
-/// - 6th+: capped at MAX (120s)
-function adaptiveDebounce(consecutive: number): number {
-  const delay = DEBOUNCE_BASE_MS + consecutive * DEBOUNCE_STEP_MS;
-  return Math.min(delay, DEBOUNCE_MAX_MS);
 }
 
 const ACTIVITY_EVENTS = ["mousedown", "keydown", "wheel", "touchstart"] as const;
@@ -170,9 +158,16 @@ export function useCloudSync({
   /// Guard re-entry — true từ lúc doSync bắt đầu đến khi finally. Tránh
   /// 2 sync concurrent (force click khi debounce vừa fire chẳng hạn).
   const syncInFlightRef = useRef(false);
-  /// Đếm mutations liên tục trong window hiện tại (reset khi debounce fire).
-  /// Dùng compute delay adaptive: edit càng nhiều liên tục → delay dài hơn.
-  const consecutiveMutationsRef = useRef(0);
+  /// True khi caller yêu cầu pull (startup / forceSync / RTDB event). False
+  /// khi mutation-triggered (chỉ cần push). Set bởi caller trước khi
+  /// gọi doSync, clear trong finally.
+  const needPullRef = useRef(true); // startup đầu tiên luôn pull
+  /// Ngày flush log cuối cùng (YYYY-MM-DD). Skip log flush nếu same date +
+  /// queue chưa critical — A3 optimization giảm Class A PUT.
+  const lastLogFlushDateRef = useRef<string>("");
+  /// Timestamp mutation gần nhất — FE dùng để tính timer có reset không.
+  /// Flat debounce 45s, không còn counter ladder.
+  const lastMutationAtRef = useRef(0);
   const statusRef = useRef<SyncStatus>(status);
   useEffect(() => {
     statusRef.current = status;
@@ -212,8 +207,8 @@ export function useCloudSync({
     syncInFlightRef.current = true;
     clearDebounce();
     clearRetry();
-    // Reset counter — sync vừa fire xong, next mutation sẽ start từ BASE.
-    consecutiveMutationsRef.current = 0;
+    // Reset mutation timestamp — sync vừa fire xong, next mutation start fresh.
+    lastMutationAtRef.current = 0;
     // Clear remote-pending flag — sync đang consume tín hiệu RTDB.
     setHasRemoteChangePending(false);
     setStatus("syncing");
@@ -221,8 +216,26 @@ export function useCloudSync({
     try {
       const idToken = await getAuthToken();
 
-      setSyncPhase("pulling");
-      const pullReport = await syncV9PullAll(idToken);
+      // B5 optimization: skip pull nếu không có lý do (local-only mutation
+      // trigger, không có RTDB event). Pull mỗi lần tốn 1 get_manifest GET
+      // dù không có delta mới. Chỉ pull khi: startup / forceSync /
+      // RTDB remote push event / online handler.
+      //
+      // Logic safety: needPullRef mặc định true (startup, RTDB, force). Chỉ
+      // khi mutation path (scheduleDebounce → doSync) mới set false.
+      let pullReport = {
+        appliedDeltas: 0,
+        totalEvents: 0,
+        skipped: 0,
+        skippedByHlc: 0,
+        tombstonesApplied: 0,
+        rowsDeleted: 0,
+        totalBytes: 0,
+      };
+      if (needPullRef.current) {
+        setSyncPhase("pulling");
+        pullReport = await syncV9PullAll(idToken);
+      }
 
       setSyncPhase("pushing");
       const pushReport = await syncV9PushAll(idToken);
@@ -267,11 +280,17 @@ export function useCloudSync({
         );
       }
 
-      // Flush sync event log lên R2 (best-effort, không block status).
-      // Nếu không flush, sync_event_log table accumulate forever.
-      void syncV9LogFlush(idToken).catch((e) => {
-        console.warn("[sync v9] log flush failed:", e);
-      });
+      // A3 optimization: flush log chỉ khi date rollover. Trước đây mỗi
+      // sync flush 1 PUT/date → 30 sync/ngày = 30 PUT cùng file. Giờ flush
+      // 1 lần/ngày + khi close app (qua beforeunload handler).
+      // Safety: events vẫn persist local, không mất. Chỉ delay upload.
+      const today = new Date().toISOString().slice(0, 10);
+      if (lastLogFlushDateRef.current !== today) {
+        lastLogFlushDateRef.current = today;
+        void syncV9LogFlush(idToken).catch((e) => {
+          console.warn("[sync v9] log flush failed:", e);
+        });
+      }
 
       // Check compaction trigger (P10, best-effort). Threshold > 100 deltas
       // → tạo snapshot + clear manifest.deltas. Long-running (upload 500MB)
@@ -310,20 +329,26 @@ export function useCloudSync({
     } finally {
       setSyncPhase(null);
       syncInFlightRef.current = false;
+      // Reset về default pull=true cho next sync (safe default).
+      // Callers gọi doSync vì mutation sẽ set false trước mỗi lần gọi.
+      needPullRef.current = true;
     }
     // scheduleDebounce khai báo bên dưới — forward ref qua closure.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /// Flat debounce — mỗi call clear timer cũ, setTimeout mới DEBOUNCE_MS.
+  /// Mutation liên tục reset về fresh 45s, không ladder-up.
+  ///
+  /// B5 optimization: mutation-triggered sync KHÔNG cần pull (local dirty,
+  /// push-only đủ). needPullRef=false bỏ qua manifest GET.
   const scheduleDebounce = useCallback(() => {
     clearDebounce();
-    const delay = adaptiveDebounce(consecutiveMutationsRef.current);
     const timerId = window.setTimeout(() => {
       debounceRef.current = null;
-      // Reset counter khi debounce fire — next mutation sau đó sẽ start từ BASE.
-      consecutiveMutationsRef.current = 0;
+      needPullRef.current = false; // push-only sync
       void doSync();
-    }, delay);
+    }, DEBOUNCE_MS);
     debounceRef.current = timerId;
   }, [doSync]);
 
@@ -450,8 +475,10 @@ export function useCloudSync({
     if (mutationVersion === 0) return;
 
     setStatus("dirty");
-    consecutiveMutationsRef.current += 1;
+    lastMutationAtRef.current = Date.now();
     if (!pausedByForm) {
+      // clearDebounce + setTimeout fresh → user edit lần 2 trong window
+      // cũ sẽ throw away timer cũ, bắt đầu 45s mới tính từ mutation này.
       scheduleDebounce();
     }
 

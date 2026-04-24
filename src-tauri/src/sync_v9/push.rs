@@ -224,6 +224,141 @@ pub fn plan_push_default(conn: &Connection, clock_ms: i64) -> Result<Vec<PushPay
 }
 
 // =============================================================
+// A1 OPTIMIZATION: Bundle deltas — multi-table into 1 R2 file
+// =============================================================
+
+/// Metadata per-table trong bundle, dùng advance cursor + skip-identical
+/// tracking per table (dù tất cả chung 1 R2 file).
+#[derive(Debug, Clone)]
+pub struct TableBundleRange {
+    pub table: String,
+    pub cursor_lo: String,
+    pub cursor_hi: String,
+    pub row_count: u32,
+    /// Hash riêng cho content NDJSON của table này (pre-merge). Dùng
+    /// skip-identical check ở mark_uploaded. KHÔNG phải hash bundle.
+    pub content_hash: String,
+}
+
+/// Bundle push payload — 1 file R2 chứa events nhiều tables.
+///
+/// So với per-table PushPayload:
+/// - Tiết kiệm Class A PUT: N PUT → 1 PUT (giảm 5-10×)
+/// - Manifest entry: vẫn 1/table nhưng cùng trỏ tới `r2_key` → pull-side
+///   dedup fetch → 1 GET thay N GET
+/// - Skip-identical vẫn per-table: table nào content không đổi → không vào
+///   bundle
+#[derive(Debug, Clone)]
+pub struct BundlePushPayload {
+    /// R2 object key format mới: `deltas/bundle/{clock_ms}_{hash_prefix}.ndjson.zst`
+    pub r2_key: String,
+    /// zstd-compressed NDJSON bytes (merged events từ nhiều tables).
+    pub bytes: Vec<u8>,
+    /// SHA-256 hex của `bytes` — integrity.
+    pub hash: String,
+    pub clock_ms: i64,
+    /// Tổng số events trong bundle (sum of per-table row_count).
+    pub total_row_count: u32,
+    pub size_bytes: i64,
+    /// Per-table range info — caller iterate để:
+    /// 1. Append manifest entry per table (trỏ cùng r2_key)
+    /// 2. mark_uploaded cursor + content_hash per table
+    pub table_ranges: Vec<TableBundleRange>,
+}
+
+/// Build bundle payload — capture mọi table có delta, merge NDJSON, compress 1
+/// lần, trả Option<BundlePushPayload>. None nếu không có table nào có data.
+///
+/// Thứ tự table trong bundle = SYNC_TABLES order (FK dependency) → apply
+/// side đọc tuần tự vẫn đúng dependency order.
+///
+/// Per-table skip-identical: mỗi table compute hash riêng cho portion của nó.
+/// Nếu match `last_uploaded_hash` → bỏ khỏi bundle (không count, không cursor
+/// advance). Bundle-level hash là hash của toàn bộ compressed bytes.
+pub fn plan_push_bundle(
+    conn: &Connection,
+    clock_ms: i64,
+    sv: u32,
+    max_bytes: usize,
+) -> Result<Option<BundlePushPayload>> {
+    if is_fresh_install_pending(conn)? {
+        return Ok(None);
+    }
+
+    // Per-table NDJSON bytes + metadata, accumulate trước khi merge.
+    let mut all_ndjson: Vec<u8> = Vec::new();
+    let mut ranges: Vec<TableBundleRange> = Vec::new();
+
+    for descriptor in SYNC_TABLES {
+        let cursor = read_cursor(conn, descriptor.name)?;
+        let batch = match capture_table_delta(
+            conn,
+            descriptor,
+            &cursor.last_uploaded_cursor,
+            max_bytes,
+            clock_ms,
+            sv,
+        )? {
+            Some(b) => b,
+            None => continue, // table không có row mới
+        };
+
+        // Skip-identical per-table: hash NDJSON raw (không phải compressed).
+        // Dùng so sánh với last_uploaded_hash cũ — nếu match → không vào bundle.
+        let content_hash = sha256_hex(&batch.ndjson);
+        if cursor.last_uploaded_hash.as_deref() == Some(content_hash.as_str())
+            && cursor.last_uploaded_cursor == batch.cursor_hi
+        {
+            continue;
+        }
+
+        let row_count = batch.events.len() as u32;
+        // Merge vào all_ndjson — NDJSON append-safe (mỗi event 1 line).
+        all_ndjson.extend_from_slice(&batch.ndjson);
+
+        ranges.push(TableBundleRange {
+            table: batch.table,
+            cursor_lo: batch.cursor_lo,
+            cursor_hi: batch.cursor_hi,
+            row_count,
+            content_hash,
+        });
+    }
+
+    if all_ndjson.is_empty() {
+        return Ok(None);
+    }
+
+    let compressed = zstd_compress(&all_ndjson).context("zstd compress bundle")?;
+    let bundle_hash = sha256_hex(&compressed);
+    let total_row_count: u32 = ranges.iter().map(|r| r.row_count).sum();
+    let r2_key = format!(
+        "deltas/bundle/{}_{}.ndjson.zst",
+        clock_ms,
+        &bundle_hash[..12]
+    );
+    let size_bytes = compressed.len() as i64;
+
+    Ok(Some(BundlePushPayload {
+        r2_key,
+        bytes: compressed,
+        hash: bundle_hash,
+        clock_ms,
+        total_row_count,
+        size_bytes,
+        table_ranges: ranges,
+    }))
+}
+
+/// Convenience: plan_push_bundle với default SV + 5MB max.
+pub fn plan_push_bundle_default(
+    conn: &Connection,
+    clock_ms: i64,
+) -> Result<Option<BundlePushPayload>> {
+    plan_push_bundle(conn, clock_ms, SV_CURRENT, default_max_bytes())
+}
+
+// =============================================================
 // Tests
 // =============================================================
 

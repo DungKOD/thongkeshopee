@@ -211,98 +211,96 @@ pub struct PushReport {
 
 const CAS_MAX_RETRY: u32 = 3;
 
-/// Full push cycle: plan → upload deltas → CAS manifest put (retry max 3).
+/// Full push cycle (v9.1 bundle): plan 1 bundle file → upload 1× → CAS
+/// manifest put với N entries trỏ cùng key (retry max 3).
 ///
-/// Fresh-install guard: nếu `fresh_install_pending = 1` → no-op (rule giữ data).
+/// **Tối ưu A1:** N tables thay đổi → 1 R2 PUT (thay vì N). Manifest entries
+/// vẫn per-table để pull-side preserve cursor tracking. Pull dedup theo key
+/// → 1 fetch cho cả bundle.
+///
+/// Fresh-install guard: `fresh_install_pending = 1` → no-op.
 #[tauri::command]
 pub async fn sync_v9_push_all(
     db: State<'_, DbState>,
     base_url: String,
     id_token: String,
 ) -> CmdResult<PushReport> {
-    // 1. Plan + capture + compress (lock held for DB read only).
-    let (payloads, fingerprint, clock_ms) = {
+    // 1. Plan bundle + capture + compress (lock held for DB read only).
+    let (bundle_opt, fingerprint, clock_ms) = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         if bootstrap::is_bootstrap_pending(&conn).map_err(|e| CmdError::msg(e.to_string()))? {
             return Ok(PushReport::default());
         }
         let clock = hlc::next_hlc_ms(&conn)?;
         let fp = machine_fingerprint_stable();
-        let plan = push::plan_push_default(&conn, clock)
+        let bundle = push::plan_push_bundle_default(&conn, clock)
             .map_err(|e| CmdError::msg(e.to_string()))?;
-        (plan, fp, clock)
+        (bundle, fp, clock)
     };
 
-    if payloads.is_empty() {
+    let Some(bundle) = bundle_opt else {
         return Ok(PushReport::default());
-    }
+    };
 
-    let mut uploaded = 0u32;
-    let mut skipped = 0u32;
-    let mut total_bytes = 0u64;
-    let mut new_entries: Vec<ManifestDeltaEntry> = Vec::new();
+    let uploaded = bundle.table_ranges.len() as u32;
+    let total_bytes = bundle.bytes.len() as u64;
+    // Skipped tables: SYNC_TABLES count - uploaded tables. Chỉ để log, không
+    // strict precise (table không có row cũng count skipped, không hẳn
+    // "skip-identical", nhưng user UX message OK).
+    let skipped = (descriptors::SYNC_TABLES.len() as u32)
+        .saturating_sub(uploaded);
 
-    // 2. Upload each (awaits, no lock).
-    for payload in payloads {
-        // Skip-identical check với cursor state.
-        let should_skip = {
-            let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-            let cursor = push::read_cursor(&conn, &payload.table)
-                .map_err(|e| CmdError::msg(e.to_string()))?;
-            push::should_skip_by_hash(&cursor, &payload)
-        };
-        if should_skip {
-            skipped += 1;
-            continue;
-        }
-
-        // Emit log event trước khi upload (debug observability).
-        {
-            let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // 2. Emit log events per-table (debug observability, match format cũ).
+    {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        for range in &bundle.table_ranges {
             let ts = hlc::next_hlc_rfc3339(&conn)?;
             let _ = event_log::append(
                 &conn,
                 &ts,
                 &fingerprint,
                 &SyncEventCtx::PushUpload {
-                    table: payload.table.clone(),
-                    cursor_lo: payload.cursor_lo.clone(),
-                    cursor_hi: payload.cursor_hi.clone(),
-                    bytes: payload.bytes.len() as u64,
-                    delta_key: payload.r2_key.clone(),
-                    row_count: payload.row_count,
+                    table: range.table.clone(),
+                    cursor_lo: range.cursor_lo.clone(),
+                    cursor_hi: range.cursor_hi.clone(),
+                    bytes: (bundle.bytes.len() as u64) / (bundle.table_ranges.len() as u64).max(1),
+                    delta_key: bundle.r2_key.clone(),
+                    row_count: range.row_count,
                 },
             );
         }
-
-        client::upload_delta(&base_url, &id_token, &payload.r2_key, &payload.bytes)
-            .await
-            .map_err(|e| CmdError::msg(format!("upload_delta {}: {e}", payload.table)))?;
-
-        total_bytes += payload.bytes.len() as u64;
-        uploaded += 1;
-
-        // Cursor advance sau upload OK (idempotent retry safe).
-        {
-            let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-            push::mark_uploaded(&conn, &payload.table, &payload.cursor_hi, &payload.hash)
-                .map_err(|e| CmdError::msg(e.to_string()))?;
-        }
-
-        new_entries.push(ManifestDeltaEntry {
-            table: payload.table.clone(),
-            key: payload.r2_key.clone(),
-            cursor_lo: payload.cursor_lo.clone(),
-            cursor_hi: payload.cursor_hi.clone(),
-            clock_ms: payload.clock_ms,
-            size_bytes: payload.size_bytes,
-            row_count: payload.row_count,
-        });
     }
 
-    // 3. CAS manifest put (retry max 3).
-    let cas_retries = cas_append_manifest_retry(&db, &base_url, &id_token, &new_entries, clock_ms)
-        .await?;
+    // 3. Upload 1 bundle file (no lock).
+    client::upload_delta(&base_url, &id_token, &bundle.r2_key, &bundle.bytes)
+        .await
+        .map_err(|e| CmdError::msg(format!("upload_delta bundle: {e}")))?;
+
+    // 4. Advance cursor + build manifest entries per-table (idempotent retry safe).
+    let mut new_entries: Vec<ManifestDeltaEntry> = Vec::new();
+    {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        for range in &bundle.table_ranges {
+            push::mark_uploaded(&conn, &range.table, &range.cursor_hi, &range.content_hash)
+                .map_err(|e| CmdError::msg(e.to_string()))?;
+            new_entries.push(ManifestDeltaEntry {
+                table: range.table.clone(),
+                // All entries share cùng r2_key — pull side dedup theo key.
+                key: bundle.r2_key.clone(),
+                cursor_lo: range.cursor_lo.clone(),
+                cursor_hi: range.cursor_hi.clone(),
+                clock_ms: bundle.clock_ms,
+                // size_bytes per-entry là proportional share (approximate).
+                // Field này chỉ cho UI display, không ảnh hưởng correctness.
+                size_bytes: bundle.size_bytes / (bundle.table_ranges.len() as i64).max(1),
+                row_count: range.row_count,
+            });
+        }
+    }
+
+    // 5. CAS manifest put với N entries cùng key (retry max 3).
+    let cas_retries =
+        cas_append_manifest_retry(&db, &base_url, &id_token, &new_entries, clock_ms).await?;
 
     Ok(PushReport {
         uploaded_count: uploaded,
@@ -419,25 +417,45 @@ pub async fn sync_v9_pull_all(
 
     let mut report = PullReport::default();
 
-    // 3. Per-file: fetch + parse + apply (TX per file).
+    // 3. Dedupe pending entries theo R2 key — bundle delta có N manifest
+    // entries (per-table) trỏ cùng 1 file. Fetch 1 lần, advance N cursor.
+    // Tiết kiệm: N GET → 1 GET cho bundle. Legacy per-table delta (1 key
+    // = 1 entry) không đổi behavior.
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<String, Vec<&ManifestDeltaEntry>> = BTreeMap::new();
     for entry in &pending {
-        let bytes = client::fetch_delta(&base_url, &id_token, &entry.key)
+        by_key.entry(entry.key.clone()).or_default().push(entry);
+    }
+    // Sort keys theo min(clock_ms) của entries trong key để apply causal order.
+    let mut keys_sorted: Vec<(String, Vec<&ManifestDeltaEntry>)> =
+        by_key.into_iter().collect();
+    keys_sorted.sort_by_key(|(_, entries)| {
+        entries.iter().map(|e| e.clock_ms).min().unwrap_or(0)
+    });
+
+    // 4. Per-file: fetch + parse + apply (TX per file).
+    for (key, entries) in &keys_sorted {
+        let bytes = client::fetch_delta(&base_url, &id_token, key)
             .await
-            .map_err(|e| CmdError::msg(format!("fetch_delta {}: {e}", entry.key)))?;
+            .map_err(|e| CmdError::msg(format!("fetch_delta {}: {e}", key)))?;
         report.total_bytes += bytes.len() as u64;
         let events = pull::parse_delta_file(&bytes)
-            .map_err(|e| CmdError::msg(format!("parse {}: {e}", entry.key)))?;
+            .map_err(|e| CmdError::msg(format!("parse {}: {e}", key)))?;
         let max_clock = pull::max_event_clock_ms(&events);
 
         // Apply trong TX (lock held qua apply — tiny vs network).
+        // Bundle file chứa events nhiều tables — apply_events dispatch qua
+        // event.table field, xử lý tự động theo descriptor per-event.
         let stats = {
             let mut conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-            let stats =
-                pull::apply_events(&mut conn, &events).map_err(|e| CmdError::msg(e.to_string()))?;
-
-            // Advance per-table cursor + absorb remote clock.
-            pull::advance_pulled_cursor(&conn, &entry.table, &entry.cursor_hi)
+            let stats = pull::apply_events(&mut conn, &events)
                 .map_err(|e| CmdError::msg(e.to_string()))?;
+
+            // Advance cursor cho MỖI table trong bundle.
+            for entry in entries {
+                pull::advance_pulled_cursor(&conn, &entry.table, &entry.cursor_hi)
+                    .map_err(|e| CmdError::msg(e.to_string()))?;
+            }
             hlc::absorb_remote_clock(&conn, max_clock)?;
             stats
         };
