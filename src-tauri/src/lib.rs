@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod sync_v9;
 
 use tauri::Manager;
 

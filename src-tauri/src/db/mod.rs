@@ -207,6 +207,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     // partial index WHERE reverted_at IS NULL), add cột reverted_at, backfill
     // 3 bảng mapping từ source_file_id hiện có.
     migrate_import_history_v10(conn).context("import history v10 migration failed")?;
+    // v11 = Sync v9 infrastructure (additive only ở Phase 1): thêm 3 table mới
+    // (sync_cursor_state, sync_manifest_state, sync_event_log). Không động
+    // sync_state cũ — đợi Phase 2 thay sync logic mới drop cột v8 thừa.
+    migrate_v11_sync_infra(conn).context("v11 sync v9 infra migration failed")?;
     // Dọn orphan imported_files mỗi startup — idempotent. Xử lý legacy DB
     // của user đã xóa ngày trước khi batch_commit_deletes biết cleanup
     // (kẻo re-import cùng file bị chặn bởi hash dedup).
@@ -848,6 +852,86 @@ pub fn setup(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// v11 — Sync v9 infrastructure: thêm các bảng cần cho per-table incremental
+/// delta sync. Additive only (Phase 1): không động sync_state v8 + triggers cũ
+/// để sync engine cũ vẫn compile & chạy được đến khi Phase 2 thay xong.
+///
+/// 3 bảng mới:
+/// - `sync_cursor_state` — per-table high-water-mark cho push/pull
+/// - `sync_manifest_state` — singleton: manifest etag + snapshot pointer + fresh-install flag
+/// - `sync_event_log` — ring buffer debug events (5000 entries max)
+///
+/// Idempotent: dùng CREATE TABLE IF NOT EXISTS, INSERT OR IGNORE.
+fn migrate_v11_sync_infra(conn: &Connection) -> Result<()> {
+    // Singleton manifest state. fresh_install_pending=1 ngăn push empty đè
+    // remote trong bootstrap (rule giữ data).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_manifest_state (
+             id                            INTEGER PRIMARY KEY CHECK (id = 1),
+             last_remote_etag              TEXT,
+             last_pulled_manifest_clock_ms INTEGER NOT NULL DEFAULT 0,
+             last_snapshot_key             TEXT,
+             last_snapshot_clock_ms        INTEGER NOT NULL DEFAULT 0,
+             fresh_install_pending         INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO sync_manifest_state (id) VALUES (1);
+
+         CREATE TABLE IF NOT EXISTS sync_cursor_state (
+             table_name            TEXT PRIMARY KEY,
+             last_uploaded_cursor  TEXT NOT NULL DEFAULT '0',
+             last_pulled_cursor    TEXT NOT NULL DEFAULT '0',
+             last_uploaded_hash    TEXT,
+             updated_at            TEXT NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS sync_event_log (
+             event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+             ts           TEXT NOT NULL,
+             fingerprint  TEXT NOT NULL,
+             kind         TEXT NOT NULL,
+             ctx_json     TEXT NOT NULL,
+             uploaded_at  TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_sync_event_log_pending
+             ON sync_event_log(uploaded_at) WHERE uploaded_at IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_sync_event_log_ts
+             ON sync_event_log(ts);
+         CREATE INDEX IF NOT EXISTS idx_sync_event_log_kind
+             ON sync_event_log(kind);",
+    )?;
+
+    // Seed cursor state cho 10 table syncable. updated_at=now để distinguish
+    // "chưa init" (không có row) vs "đã init và chưa có gì push" (row có cursor='0').
+    let now = chrono::Utc::now().to_rfc3339();
+    let tables = [
+        "imported_files",
+        "raw_shopee_clicks",
+        "raw_shopee_order_items",
+        "raw_fb_ads",
+        "clicks_to_file",
+        "orders_to_file",
+        "fb_ads_to_file",
+        "manual_entries",
+        "shopee_accounts",
+        "tombstones",
+    ];
+    for table in tables {
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_cursor_state
+                 (table_name, last_uploaded_cursor, last_pulled_cursor, updated_at)
+             VALUES (?, '0', '0', ?)",
+            rusqlite::params![table, now],
+        )?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_version(version, applied_at)
+         VALUES(11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +969,55 @@ mod tests {
         for name in expected {
             assert!(tables.iter().any(|t| t == name), "missing table {name}");
         }
+    }
+
+    #[test]
+    fn v11_sync_infra_tables_created() {
+        let conn = test_conn();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        for name in ["sync_cursor_state", "sync_manifest_state", "sync_event_log"] {
+            assert!(tables.iter().any(|t| t == name), "v11 missing table {name}");
+        }
+
+        // Singleton row cho manifest_state phải được seed.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_manifest_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "sync_manifest_state phải có singleton row");
+
+        // Cursor state phải seed cho 10 bảng syncable.
+        let cursor_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_cursor_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cursor_count, 10, "sync_cursor_state phải seed 10 bảng");
+
+        // Verify schema version 11 đã mark.
+        let v11_marked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_version WHERE version = 11",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v11_marked, 1, "_schema_version phải có entry 11");
+    }
+
+    #[test]
+    fn v11_migration_idempotent() {
+        let conn = test_conn();
+        // Chạy migrate() lần 2 — không được fail, không duplicate.
+        migrate(&conn).expect("migrate lần 2 không được fail");
+        let cursor_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_cursor_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cursor_count, 10, "idempotent: không duplicate cursor rows");
     }
 
     #[test]
