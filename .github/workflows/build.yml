@@ -67,7 +67,9 @@ jobs:
           VITE_ADMIN_NOTE: dummy
 
   build:
-    needs: preflight
+    # KHÔNG depend preflight — matrix mac/windows chạy song song để user có
+    # artifact nhanh. Preflight chạy độc lập làm checker regression, fail
+    # hiện trong PR checks nhưng không block release artifacts.
     strategy:
       fail-fast: false
       matrix:
