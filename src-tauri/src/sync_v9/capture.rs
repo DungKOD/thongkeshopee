@@ -515,6 +515,100 @@ mod tests {
         }
     }
 
+    /// Regression: imported_files cursor PHẢI dùng imported_at (monotonic
+    /// timestamp) thay vì id (content_id = random hash → non-monotonic).
+    ///
+    /// Scenario mô phỏng bug v0.4.3: 2 file hash khác nhau cho id(F_a) > id(F_b)
+    /// (ngược thứ tự insert). Nếu cursor dùng id, sau push F_a cursor = id(F_a),
+    /// capture F_b với `WHERE id > id(F_a)` bỏ qua → child FK fail bên receiver.
+    /// Fix v0.4.4: cursor dùng imported_at → F_b (insert sau) có imported_at
+    /// lớn hơn → match `WHERE imported_at > last_cursor` → capture đầy đủ.
+    #[test]
+    fn capture_imported_files_handles_non_monotonic_id() {
+        let conn = test_conn();
+        // Insert F_a với id LỚN, imported_at SỚM.
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash)
+             VALUES(?, 'a.csv', 'shopee_clicks', '2026-04-25T08:00:00Z', 'hash_a')",
+            params![9_000_000_000_000_000_000_i64],
+        )
+        .unwrap();
+        // Insert F_b với id NHỎ (simulate content_id ngược), imported_at MUỘN.
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash)
+             VALUES(?, 'b.csv', 'shopee_clicks', '2026-04-25T09:00:00Z', 'hash_b')",
+            params![100_000_i64],
+        )
+        .unwrap();
+
+        let desc = find_descriptor("imported_files").unwrap();
+        assert_eq!(
+            desc.cursor_kind,
+            CursorKind::UpdatedAt,
+            "imported_files descriptor phải là UpdatedAt cursor post-v0.4.4"
+        );
+        assert_eq!(desc.cursor_column, "imported_at");
+
+        // Batch 1: cursor='0' → capture cả 2 file, ORDER BY imported_at ASC.
+        let batch1 = capture_table_delta(&conn, desc, "0", 5_000_000, 1, SV_CURRENT)
+            .unwrap()
+            .expect("some");
+        assert_eq!(batch1.events.len(), 2, "capture cả F_a và F_b");
+        assert_eq!(batch1.cursor_lo, "2026-04-25T08:00:00Z");
+        assert_eq!(batch1.cursor_hi, "2026-04-25T09:00:00Z");
+
+        // Batch 2: simulate advance cursor sau push batch 1.
+        // Trước fix (cursor_kind=PrimaryKey + cursor=id), cursor sẽ là "9000000000000000000"
+        // và batch kế không bắt được F_b (id=100000 < 9e18). Post-fix dùng timestamp,
+        // insert file mới có imported_at > '2026-04-25T09:00:00Z' sẽ luôn capture được.
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash)
+             VALUES(?, 'c.csv', 'shopee_clicks', '2026-04-25T10:00:00Z', 'hash_c')",
+            params![50_i64],
+        )
+        .unwrap();
+        let batch2 =
+            capture_table_delta(&conn, desc, &batch1.cursor_hi, 5_000_000, 2, SV_CURRENT)
+                .unwrap()
+                .expect("some");
+        assert_eq!(
+            batch2.events.len(),
+            1,
+            "F_c (id=50, tiny) vẫn capture được nhờ imported_at cursor"
+        );
+        assert_eq!(batch2.cursor_hi, "2026-04-25T10:00:00Z");
+    }
+
+    /// Regression paired: shopee_accounts cursor cũng phải dùng created_at
+    /// vì id = content_id(name) cũng non-monotonic.
+    #[test]
+    fn capture_shopee_accounts_uses_created_at_cursor() {
+        let conn = test_conn();
+        // Clear default account để test fresh.
+        conn.execute("DELETE FROM shopee_accounts", []).unwrap();
+        conn.execute(
+            "INSERT INTO shopee_accounts(id, name, color, created_at)
+             VALUES(?, 'A', '#fff', '2026-04-25T08:00:00Z')",
+            params![9_000_000_000_000_000_000_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shopee_accounts(id, name, color, created_at)
+             VALUES(?, 'B', '#000', '2026-04-25T09:00:00Z')",
+            params![50_i64],
+        )
+        .unwrap();
+
+        let desc = find_descriptor("shopee_accounts").unwrap();
+        assert_eq!(desc.cursor_kind, CursorKind::UpdatedAt);
+        assert_eq!(desc.cursor_column, "created_at");
+
+        let batch = capture_table_delta(&conn, desc, "0", 5_000_000, 1, SV_CURRENT)
+            .unwrap()
+            .expect("some");
+        assert_eq!(batch.events.len(), 2, "capture cả A và B bất chấp id order");
+    }
+
     #[test]
     fn capture_tombstone_event() {
         let conn = test_conn();
