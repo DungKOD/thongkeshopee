@@ -66,17 +66,23 @@ pub struct TableDescriptor {
 
 /// List tất cả bảng syncable, theo push dependency order.
 pub const SYNC_TABLES: &[TableDescriptor] = &[
+    // Cursor PHẢI dùng cột timestamp monotonic, KHÔNG được dùng `id`. Reason:
+    // `id = content_id(natural_key)` = SHA-256 hash → uniform random i63, không
+    // monotonic. Dùng id làm cursor → row mới có id < cursor cũ bị bỏ qua vĩnh
+    // viễn → child rows (FK source_file_id) push lên R2 mà parent chưa push →
+    // máy khác pull FK fail. Migration v1 reset cursor cho 2 table này (xem
+    // db/mod.rs init_db_at).
     TableDescriptor {
         name: "shopee_accounts",
-        cursor_kind: CursorKind::PrimaryKey,
-        cursor_column: "id",
+        cursor_kind: CursorKind::UpdatedAt,
+        cursor_column: "created_at",
         pk_columns: &["id"],
         op: DeltaOp::Insert,
     },
     TableDescriptor {
         name: "imported_files",
-        cursor_kind: CursorKind::PrimaryKey,
-        cursor_column: "id",
+        cursor_kind: CursorKind::UpdatedAt,
+        cursor_column: "imported_at",
         pk_columns: &["id"],
         op: DeltaOp::Insert,
     },

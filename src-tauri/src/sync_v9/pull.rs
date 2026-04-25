@@ -83,6 +83,11 @@ fn truncate(s: &str) -> String {
 /// causal). Caller responsibility.
 pub fn apply_events(conn: &mut Connection, events: &[DeltaEvent]) -> Result<ApplyStats> {
     let tx = conn.transaction().context("begin apply TX")?;
+    // Defer FK check tới COMMIT — cho phép apply intra-bundle out-of-order
+    // (parent table event đứng sau child trong NDJSON vẫn OK miễn là cùng TX).
+    // Tự reset về OFF sau commit/rollback.
+    tx.execute_batch("PRAGMA defer_foreign_keys = ON")
+        .context("enable defer_foreign_keys")?;
     let mut stats = ApplyStats::default();
 
     for ev in events {
