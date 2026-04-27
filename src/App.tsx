@@ -28,7 +28,6 @@ import {
 } from "./hooks/useSettings";
 import { useToast } from "./components/ToastProvider";
 import { commitCsvBatch, previewCsvBatch } from "./lib/dbImport";
-import { invoke } from "./lib/tauri";
 import type { PreviewBatch } from "./lib/dbImport";
 import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
