@@ -2,6 +2,8 @@ import type { Unsubscribe } from "firebase/database";
 import { invoke } from "./tauri";
 import {
   DEFAULT_DEVICE_LIMIT,
+  getMyDeviceLimit,
+  getMyDevices,
   subscribeMyDevice,
   upsertMyDevice,
   type DeviceInfo,
@@ -32,9 +34,16 @@ export async function getDeviceInfo(): Promise<DeviceInfo> {
 ///
 /// - Admin (`isAdmin === true`): upsert entry để hiển thị trong admin UI,
 ///   KHÔNG check limit.
-/// - User thường: cố write entry. Rules `database.rules.json` enforce
-///   `numChildren < limit` → fail = PERMISSION_DENIED → return
-///   `limit_exceeded`. Caller (AuthContext) sẽ signOut.
+/// - User thường: pre-check FE-side (đọc devices + limit hiện tại). Nếu
+///   máy này đã có entry → chỉ update lastSeen. Nếu mới + count < limit →
+///   register. Nếu mới + count >= limit → reject với message liệt kê các
+///   thiết bị hiện có (giúp user/admin biết cái nào cần xóa).
+///
+/// FE-side check ưu tiên hơn rules:
+/// - Diagnostic chính xác: hiển thị limit + count + danh sách devices.
+/// - Tránh được trường hợp rules production stale (chưa deploy `firebase
+///   deploy --only database`) → user thấy fail confusing.
+/// - Rules vẫn enforce làm backstop bảo mật.
 ///
 /// Note race window vài ms khi 2 device login đồng thời — chấp nhận với
 /// MVP. Admin có thể xóa entry thừa thủ công.
@@ -44,6 +53,40 @@ export async function enforceDeviceLimit(
 ): Promise<EnforceResult> {
   try {
     const info = await getDeviceInfo();
+
+    // Admin: bypass limit check, vẫn upsert để hiển thị trong admin UI.
+    if (isAdmin) {
+      await upsertMyDevice(uid, info);
+      return { ok: true, deviceInfo: info };
+    }
+
+    // FE-side pre-check: đọc state hiện tại trước khi quyết định write.
+    const [devices, overrideLimit] = await Promise.all([
+      getMyDevices(uid),
+      getMyDeviceLimit(uid),
+    ]);
+    const limit = overrideLimit ?? DEFAULT_DEVICE_LIMIT;
+    const fingerprints = Object.keys(devices);
+    const alreadyRegistered = fingerprints.includes(info.fingerprint);
+
+    if (!alreadyRegistered && fingerprints.length >= limit) {
+      // Liệt kê hostname + os để user biết devices nào đang chiếm slot.
+      // Sort theo lastSeen desc để cái cũ nhất hiển thị cuối (gợi ý xóa).
+      const list = Object.values(devices)
+        .sort((a, b) => (b.lastSeen ?? 0) - (a.lastSeen ?? 0))
+        .map((d) => `• ${d.hostname} (${d.os})`)
+        .join("\n");
+      return {
+        ok: false,
+        reason: "limit_exceeded",
+        message:
+          `Tài khoản đã đạt giới hạn ${limit} thiết bị (đang dùng ${fingerprints.length}).\n\n` +
+          `Thiết bị đang đăng ký:\n${list}\n\n` +
+          `Liên hệ admin (vnz.luffy@gmail.com) để xóa thiết bị cũ hoặc nâng limit.`,
+      };
+    }
+
+    // OK to register/update. upsertMyDevice phân biệt set vs update tự.
     await upsertMyDevice(uid, info);
     return { ok: true, deviceInfo: info };
   } catch (e) {
@@ -58,25 +101,30 @@ export async function enforceDeviceLimit(
         deviceInfo: cachedDeviceInfo ?? (await getDeviceInfo()),
       };
     }
-    // Firebase RTDB throw object có code "PERMISSION_DENIED" hoặc message
-    // chứa "permission_denied" / "Permission denied".
+    // Backstop: rules reject (vd race window 2 device login đồng thời, hoặc
+    // FE pre-check skip do read fail). Message generic không có detailed list.
     const lower = msg.toLowerCase();
     if (
       lower.includes("permission_denied") ||
       lower.includes("permission denied")
     ) {
       if (isAdmin) {
-        // Admin không nên gặp permission denied — log để debug nhưng cho qua.
         console.error(
           "[deviceGate] admin gặp PERMISSION_DENIED khi upsert device:",
           msg,
         );
-        return { ok: true, deviceInfo: cachedDeviceInfo ?? (await getDeviceInfo()) };
+        return {
+          ok: true,
+          deviceInfo: cachedDeviceInfo ?? (await getDeviceInfo()),
+        };
       }
       return {
         ok: false,
         reason: "limit_exceeded",
-        message: `Tài khoản đã đạt giới hạn ${DEFAULT_DEVICE_LIMIT} thiết bị. Liên hệ admin (vnz.luffy@gmail.com) để xóa thiết bị cũ.`,
+        message:
+          `Đã đạt giới hạn thiết bị (RTDB rules reject). Có thể server rules ` +
+          `chưa được deploy phiên bản mới. Liên hệ admin để kiểm tra và xóa ` +
+          `thiết bị cũ hoặc deploy lại rules (firebase deploy --only database).`,
       };
     }
     console.error("[deviceGate] enforce failed:", e);

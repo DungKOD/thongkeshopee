@@ -81,6 +81,15 @@ export async function getMyDevices(
   return (snap.val() as Record<string, DeviceEntry> | null) ?? {};
 }
 
+/// Đọc per-user limit override. null = chưa set → caller dùng DEFAULT_DEVICE_LIMIT.
+/// Read rule cho phép user đọc limit của chính mình.
+export async function getMyDeviceLimit(uid: string): Promise<number | null> {
+  const db = requireRtdb();
+  const snap = await get(ref(db, `${ROOT_LIMITS}/${uid}`));
+  const v = snap.val();
+  return typeof v === "number" ? v : null;
+}
+
 /// Subscribe entry device hiện tại → fire khi admin xóa (snap === null).
 /// Caller dùng để force signOut khi bị revoke.
 export function subscribeMyDevice(
