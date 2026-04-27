@@ -132,17 +132,25 @@ fn list_days_with_rows_impl(
     filter: DaysFilter,
 ) -> CmdResult<Vec<UiDay>> {
     // Build query động theo filter. Tất cả đều parameterized — không string-concat user input.
-    let mut sql = String::from("SELECT date, notes FROM days");
-    let mut where_clauses: Vec<&str> = Vec::new();
+    //
+    // Pre-filter "has data": chỉ trả ngày thực sự có dữ liệu trong ít nhất 1
+    // trong 4 nguồn (raw clicks/orders/fb_ads/manual). Đẩy logic này lên SQL
+    // để LIMIT pick đúng N ngày có data — nếu không, ngày trong `days` table
+    // được auto-create (vd hôm nay user mở app nhưng chưa import) sẽ chiếm
+    // slot LIMIT → kết quả empty dù ngày trước đó có data. Ngữ nghĩa khớp với
+    // logic drop ở dưới (line ~200): rows.is_empty() && !has_totals_data.
+    let mut sql = String::from(
+        "SELECT date, notes FROM days WHERE (\
+         EXISTS (SELECT 1 FROM raw_shopee_clicks WHERE day_date = days.date) \
+         OR EXISTS (SELECT 1 FROM raw_shopee_order_items WHERE day_date = days.date) \
+         OR EXISTS (SELECT 1 FROM raw_fb_ads WHERE day_date = days.date) \
+         OR EXISTS (SELECT 1 FROM manual_entries WHERE day_date = days.date))",
+    );
     if filter.from_date.is_some() {
-        where_clauses.push("date >= ?");
+        sql.push_str(" AND date >= ?");
     }
     if filter.to_date.is_some() {
-        where_clauses.push("date <= ?");
-    }
-    if !where_clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_clauses.join(" AND "));
+        sql.push_str(" AND date <= ?");
     }
     sql.push_str(" ORDER BY date DESC");
     if filter.limit.is_some() {
