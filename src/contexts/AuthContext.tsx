@@ -20,7 +20,7 @@ import {
 import { httpsCallable } from "firebase/functions";
 import { auth, functions, googleProvider } from "../lib/firebase";
 import {
-  enforceDeviceLimit,
+  registerMyDeviceLogin,
   subscribeDeviceRevocation,
 } from "../lib/deviceGate";
 
@@ -31,9 +31,10 @@ interface AuthContextValue {
   /// fail nghiêm trọng). Khác `deviceCheckError`: error này = không xác định
   /// được auth state, app phải block. UI render splash error + reload.
   authError: string | null;
-  /// Set khi user vừa login nhưng bị block do vượt limit thiết bị (hoặc lỗi
-  /// system). Caller (App.tsx) render dialog blocking + nút Đăng xuất.
-  /// `null` khi chưa check / check pass.
+  /// Set khi register device entry sau login fail vì lỗi system (RTDB write
+  /// throw, không phải RTDB chưa config — case đó fail-soft). Caller
+  /// (App.tsx) render dialog blocking + nút Đăng xuất. `null` khi chưa
+  /// register / register pass.
   deviceCheckError: string | null;
   /// Set khi admin xóa entry device hiện tại trong lúc user đang chạy app.
   /// Caller render toast / dialog rồi gọi signOut.
@@ -153,7 +154,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
             }
           } catch (e) {
             // permission-denied = non-admin user, expected. Mọi lỗi khác log
-            // nhưng không block flow (deviceGate vẫn chạy với isAdmin=false).
+            // nhưng không block flow (registerMyDeviceLogin vẫn chạy bình thường).
             const code = (e as { code?: string }).code;
             if (code !== "functions/permission-denied") {
               console.warn(
@@ -164,7 +165,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           }
         }
 
-        const result = await enforceDeviceLimit(user.uid, isAdmin);
+        const result = await registerMyDeviceLogin(user.uid);
         if (cancelled) return;
         if (!result.ok) {
           // KHÔNG signOut ngay — để AuthGate hiện dialog blocking với nút
@@ -182,9 +183,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
         );
       } catch (e) {
         if (cancelled) return;
-        console.error("[AuthContext] device gate error:", e);
+        console.error("[AuthContext] device register error:", e);
         setDeviceCheckError(
-          `Không kiểm tra được thiết bị: ${(e as Error).message}`,
+          `Không đăng ký được thiết bị: ${(e as Error).message}`,
         );
       }
     })();

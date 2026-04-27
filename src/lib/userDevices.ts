@@ -31,15 +31,7 @@ export interface DeviceInfo {
 /// Map { uid -> { fingerprint -> DeviceEntry } } — admin subscribe toàn bộ.
 export type AllDevicesMap = Record<string, Record<string, DeviceEntry>>;
 
-/// Map { uid -> limit } — admin subscribe toàn bộ.
-export type AllLimitsMap = Record<string, number>;
-
 const ROOT_DEVICES = "user_devices";
-const ROOT_LIMITS = "user_device_limits";
-
-/// Default limit khi `/user_device_limits/{uid}` chưa được admin set.
-/// Phải khớp với rules `database.rules.json` (else branch của `numChildren < limit`).
-export const DEFAULT_DEVICE_LIMIT = 2;
 
 function requireRtdb(): NonNullable<typeof rtdb> {
   if (!rtdb) throw new Error("RTDB chưa config (VITE_FIREBASE_DATABASE_URL)");
@@ -48,7 +40,9 @@ function requireRtdb(): NonNullable<typeof rtdb> {
 
 /// Upsert device entry cho user hiện tại. Lần đầu → create với
 /// `createdAt = serverTimestamp()`. Lần sau → chỉ update `lastSeen`.
-/// Rules sẽ chặn nếu user vượt limit (PERMISSION_DENIED).
+///
+/// Không còn limit enforcement (v0.4.8+) — user login bao nhiêu máy cũng OK.
+/// Tracking giữ lại để admin xem ai đang dùng máy nào + revoke từng entry.
 export async function upsertMyDevice(
   uid: string,
   device: DeviceInfo,
@@ -70,24 +64,6 @@ export async function upsertMyDevice(
       lastSeen: serverTimestamp(),
     });
   }
-}
-
-/// Đọc tất cả devices của user (để admin UI cũng xài được nếu admin).
-export async function getMyDevices(
-  uid: string,
-): Promise<Record<string, DeviceEntry>> {
-  const db = requireRtdb();
-  const snap = await get(ref(db, `${ROOT_DEVICES}/${uid}`));
-  return (snap.val() as Record<string, DeviceEntry> | null) ?? {};
-}
-
-/// Đọc per-user limit override. null = chưa set → caller dùng DEFAULT_DEVICE_LIMIT.
-/// Read rule cho phép user đọc limit của chính mình.
-export async function getMyDeviceLimit(uid: string): Promise<number | null> {
-  const db = requireRtdb();
-  const snap = await get(ref(db, `${ROOT_LIMITS}/${uid}`));
-  const v = snap.val();
-  return typeof v === "number" ? v : null;
 }
 
 /// Subscribe entry device hiện tại → fire khi admin xóa (snap === null).
@@ -116,19 +92,6 @@ export function subscribeAllDevices(
   });
 }
 
-/// Admin subscribe toàn bộ limits (cross-user) cho UI quản lý.
-export function subscribeAllLimits(
-  cb: (map: AllLimitsMap) => void,
-): Unsubscribe {
-  if (!rtdb) {
-    cb({});
-    return () => {};
-  }
-  return onValue(ref(rtdb, ROOT_LIMITS), (snap) => {
-    cb((snap.val() as AllLimitsMap | null) ?? {});
-  });
-}
-
 /// Admin xóa 1 device entry → user trên máy đó sẽ bị signOut khi
 /// `subscribeMyDevice` fire null.
 export async function removeDevice(
@@ -137,16 +100,4 @@ export async function removeDevice(
 ): Promise<void> {
   const db = requireRtdb();
   await remove(ref(db, `${ROOT_DEVICES}/${uid}/${fingerprint}`));
-}
-
-/// Admin set per-user limit (1-99). Rules validate range.
-export async function setDeviceLimit(
-  uid: string,
-  limit: number,
-): Promise<void> {
-  if (!Number.isInteger(limit) || limit < 1 || limit > 99) {
-    throw new Error("Limit phải là số nguyên từ 1 đến 99");
-  }
-  const db = requireRtdb();
-  await set(ref(db, `${ROOT_LIMITS}/${uid}`), limit);
 }

@@ -2,13 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { getAuthToken } from "../lib/firebase";
 import { adminListUsers, type UserListEntry } from "../lib/sync";
 import {
-  DEFAULT_DEVICE_LIMIT,
   removeDevice,
-  setDeviceLimit,
   subscribeAllDevices,
-  subscribeAllLimits,
   type AllDevicesMap,
-  type AllLimitsMap,
   type DeviceEntry,
 } from "../lib/userDevices";
 
@@ -16,26 +12,20 @@ interface RowData {
   uid: string;
   email: string;
   isAdmin: boolean;
-  limit: number;
   devices: Array<{ fingerprint: string; entry: DeviceEntry }>;
 }
 
 export function AdminDeviceManagement() {
   const [allDevices, setAllDevices] = useState<AllDevicesMap>({});
-  const [allLimits, setAllLimits] = useState<AllLimitsMap>({});
   const [users, setUsers] = useState<UserListEntry[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  // Subscribe RTDB realtime — auto refresh khi admin xóa device hoặc limit đổi.
+  // Subscribe RTDB realtime — auto refresh khi admin xóa device.
   useEffect(() => {
-    const u1 = subscribeAllDevices(setAllDevices);
-    const u2 = subscribeAllLimits(setAllLimits);
-    return () => {
-      u1();
-      u2();
-    };
+    const unsub = subscribeAllDevices(setAllDevices);
+    return () => unsub();
   }, []);
 
   // Load user list 1 lần (uid → email mapping).
@@ -61,14 +51,11 @@ export function AdminDeviceManagement() {
     };
   }, []);
 
-  /// Gộp 3 nguồn (RTDB devices + RTDB limits + Firestore user profiles) thành
-  /// rows hiển thị. Sort: admin đẩy xuống cuối, còn lại theo email asc.
+  /// Gộp 2 nguồn (RTDB devices + Firestore user profiles) thành rows.
+  /// Sort: admin đẩy xuống cuối, còn lại theo email asc.
   const rows = useMemo<RowData[]>(() => {
     const userByUid = new Map(users.map((u) => [u.uid, u]));
-    const uids = new Set([
-      ...Object.keys(allDevices),
-      ...Object.keys(allLimits),
-    ]);
+    const uids = new Set(Object.keys(allDevices));
     const out: RowData[] = [];
     for (const uid of uids) {
       const u = userByUid.get(uid);
@@ -80,7 +67,6 @@ export function AdminDeviceManagement() {
         uid,
         email: u?.email ?? `(uid: ${uid.slice(0, 12)}…)`,
         isAdmin: u?.admin === true,
-        limit: allLimits[uid] ?? DEFAULT_DEVICE_LIMIT,
         devices,
       });
     }
@@ -89,7 +75,7 @@ export function AdminDeviceManagement() {
       return a.email.localeCompare(b.email);
     });
     return out;
-  }, [allDevices, allLimits, users]);
+  }, [allDevices, users]);
 
   const toggleExpand = (uid: string) => {
     setExpanded((prev) => {
@@ -110,8 +96,8 @@ export function AdminDeviceManagement() {
         </span>
       </h3>
       <p className="mb-3 text-xs text-white/50">
-        User thường mặc định login 1 thiết bị. Đổi máy → user liên hệ admin →
-        admin xóa entry máy cũ. Đặt limit cao hơn cho user cần nhiều máy.
+        Liệt kê thiết bị từng user đang đăng ký (không còn giới hạn số máy).
+        Xóa entry → user trên máy đó sẽ bị đăng xuất tự động.
       </p>
 
       {error && (
@@ -151,32 +137,7 @@ interface UserRowProps {
 }
 
 function UserRow({ row, expanded, onToggle }: UserRowProps) {
-  const [editingLimit, setEditingLimit] = useState(false);
-  const [limitDraft, setLimitDraft] = useState(String(row.limit));
-  const [saving, setSaving] = useState(false);
   const [opError, setOpError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setLimitDraft(String(row.limit));
-  }, [row.limit]);
-
-  const handleSaveLimit = async () => {
-    const n = Number(limitDraft);
-    if (!Number.isInteger(n) || n < 1 || n > 99) {
-      setOpError("Limit phải là số nguyên 1-99");
-      return;
-    }
-    setSaving(true);
-    setOpError(null);
-    try {
-      await setDeviceLimit(row.uid, n);
-      setEditingLimit(false);
-    } catch (e) {
-      setOpError((e as Error).message ?? String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
 
   const handleDelete = async (fingerprint: string, hostname: string) => {
     const ok = window.confirm(
@@ -200,10 +161,7 @@ function UserRow({ row, expanded, onToggle }: UserRowProps) {
         <span className="material-symbols-rounded text-base text-white/50">
           {expanded ? "expand_more" : "chevron_right"}
         </span>
-        <span
-          className="flex-1 truncate"
-          title={`${row.email} (${row.uid})`}
-        >
+        <span className="flex-1 truncate" title={`${row.email} (${row.uid})`}>
           {row.email}
         </span>
         {row.isAdmin && (
@@ -212,68 +170,11 @@ function UserRow({ row, expanded, onToggle }: UserRowProps) {
           </span>
         )}
         <span className="text-xs tabular-nums text-white/50">
-          {row.devices.length} / {row.isAdmin ? "∞" : row.limit} máy
+          {row.devices.length} máy
         </span>
       </div>
       {expanded && (
         <div className="space-y-2 border-t border-surface-8 bg-surface-2 px-4 py-3">
-          {/* Limit editor — chỉ ý nghĩa với non-admin (admin unlimited). */}
-          {!row.isAdmin && (
-            <div className="flex items-center gap-2 text-xs text-white/70">
-              <span>Giới hạn thiết bị:</span>
-              {editingLimit ? (
-                <>
-                  <input
-                    type="number"
-                    min={1}
-                    max={99}
-                    value={limitDraft}
-                    disabled={saving}
-                    onChange={(e) => setLimitDraft(e.currentTarget.value)}
-                    onWheel={(e) => (e.target as HTMLInputElement).blur()}
-                    className="w-16 rounded-md border border-surface-8 bg-surface-1 px-2 py-1 text-right tabular-nums text-shopee-300 focus:border-shopee-500 focus:outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleSaveLimit}
-                    disabled={saving}
-                    className="btn-ripple rounded-md bg-shopee-500/30 px-2 py-1 text-[11px] font-medium text-shopee-200 hover:bg-shopee-500/40 disabled:opacity-50"
-                  >
-                    {saving ? "..." : "Lưu"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setEditingLimit(false);
-                      setLimitDraft(String(row.limit));
-                    }}
-                    disabled={saving}
-                    className="btn-ripple rounded-md bg-surface-1 px-2 py-1 text-[11px] font-medium text-white/70 hover:bg-surface-4"
-                  >
-                    Hủy
-                  </button>
-                </>
-              ) : (
-                <>
-                  <span className="rounded-md bg-surface-1 px-2 py-0.5 font-mono tabular-nums text-shopee-300">
-                    {row.limit}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setEditingLimit(true)}
-                    className="btn-ripple flex items-center gap-1 rounded-md bg-surface-1 px-2 py-0.5 text-[11px] font-medium text-white/70 hover:bg-surface-4"
-                    title="Sửa limit"
-                  >
-                    <span className="material-symbols-rounded text-sm">
-                      edit
-                    </span>
-                    Sửa
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-
           {opError && (
             <div className="rounded-lg border border-red-500/40 bg-red-900/20 p-2 text-xs text-red-200">
               {opError}
