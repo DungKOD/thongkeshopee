@@ -20,7 +20,7 @@
       "$uid": {
         ".read": "auth != null && (auth.uid === $uid || auth.token.admin === true)",
         "$fingerprint": {
-          ".write": "auth != null && (auth.token.admin === true || (auth.uid === $uid && newData.exists() && (data.exists() || root.child('user_devices').child($uid).numChildren() < (root.child('user_device_limits').child($uid).val() != null ? root.child('user_device_limits').child($uid).val() : 1))))",
+          ".write": "auth != null && (auth.token.admin === true || (auth.uid === $uid && newData.exists() && (data.exists() || root.child('user_devices').child($uid).numChildren() < (root.child('user_device_limits').child($uid).val() != null ? root.child('user_device_limits').child($uid).val() : 2))))",
           ".validate": "newData.hasChildren(['hostname', 'os', 'createdAt', 'lastSeen'])"
         }
       }

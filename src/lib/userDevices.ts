@@ -39,7 +39,7 @@ const ROOT_LIMITS = "user_device_limits";
 
 /// Default limit khi `/user_device_limits/{uid}` chưa được admin set.
 /// Phải khớp với rules `database.rules.json` (else branch của `numChildren < limit`).
-export const DEFAULT_DEVICE_LIMIT = 1;
+export const DEFAULT_DEVICE_LIMIT = 2;
 
 function requireRtdb(): NonNullable<typeof rtdb> {
   if (!rtdb) throw new Error("RTDB chưa config (VITE_FIREBASE_DATABASE_URL)");
