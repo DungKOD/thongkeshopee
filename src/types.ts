@@ -30,6 +30,12 @@ export type UiRow = {
    *  manual → edit dialog dùng activeAccountId. String vì content_id hash
    *  có thể > 2^53. */
   shopeeAccountId: string | null;
+  /** Account id mà row thuộc về (sau khi tách per-account aggregate khi
+   *  filter=All). Null = "FB chung" — FB ad attribute cho ≥2 Shopee owner
+   *  cùng ngày, không gắn được duy nhất 1 acc. */
+  accountId: string | null;
+  /** Tên account hiển thị UI; null cùng `accountId` (FB chung). */
+  accountName: string | null;
 };
 
 /** Day-level totals — tính từ MỌI tuple trước row-0 filter. KPI dùng field

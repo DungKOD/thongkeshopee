@@ -219,6 +219,8 @@ pub fn revert_import(
     file_id: i64,
 ) -> CmdResult<RevertResult> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: bootstrap restore window guard.
+    assert_not_bootstrapping(&conn)?;
 
     // Snapshot file info TRƯỚC khi revert — cần stored_path để xóa CSV khỏi disk.
     let (filename, stored_path_rel, already_reverted): (String, Option<String>, bool) = conn

@@ -48,6 +48,18 @@ pub struct UiRow {
     /// hash có thể > 2^53 (JS Number precision loss).
     #[serde(with = "id_str_opt")]
     pub shopee_account_id: Option<i64>,
+
+    /// Account id mà row này thuộc về (sau khi tách per-account aggregate).
+    /// Khi filter=All và 1 tuple có data của nhiều account, mỗi account thành
+    /// 1 row riêng với `account_id` của nó. `None` = "FB chung" — FB ad có
+    /// 2+ Shopee owner trên cùng ngày, không gắn được duy nhất 1 acc.
+    /// String serialize cùng lý do `shopee_account_id`.
+    #[serde(with = "id_str_opt")]
+    pub account_id: Option<i64>,
+
+    /// Tên account hiển thị UI (nullable cùng `account_id`). Backend lookup từ
+    /// `shopee_accounts` 1 lần per query để tránh N+1.
+    pub account_name: Option<String>,
 }
 
 mod id_str_opt {

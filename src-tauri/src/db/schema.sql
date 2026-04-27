@@ -176,6 +176,11 @@ CREATE TABLE IF NOT EXISTS raw_fb_ads (
     cpc                REAL,
     impressions        INTEGER,
     reach              INTEGER,
+    -- Thuế % gắn cho file FB lúc import (TK Việt Nam VAT/business tax). Spend
+    -- raw từ FB report là pre-tax; query time nhân (1 + tax_rate/100.0) ra cost
+    -- thật. Default 0 = không tax. UPSERT: re-import file cùng (day, level,
+    -- name) với tax_rate khác → đè giá trị mới (latest file thắng).
+    tax_rate           REAL NOT NULL DEFAULT 0,
     day_date           TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
     source_file_id     INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
     UNIQUE(day_date, level, name)
@@ -242,15 +247,33 @@ CREATE TABLE IF NOT EXISTS sync_state (
 INSERT OR IGNORE INTO sync_state (id) VALUES (1);
 
 -- =============================================================
+-- app_settings — key-value store cho user preferences (sync qua R2).
+-- Mỗi user (DB per-user) có set keys riêng. clickSources keys dynamic theo
+-- referrer thực tế user gặp (Facebook, TikTok, ...). profitFees + autoSync
+-- là keys cố định. Conflict resolution: LWW theo updated_at HLC.
+-- =============================================================
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,    -- JSON-encoded: '"true"', '"10.98"', '"Facebook"'
+    updated_at TEXT NOT NULL      -- HLC RFC3339 Z
+);
+
+-- =============================================================
 -- Sync v9 tracking infrastructure.
 -- =============================================================
 
 -- Per-table cursor (upload + pull) cho delta sync.
+-- last_full_hash: SHA-256 toàn bảng tại lần upload gần nhất, dùng cho revert
+-- detection ở 4 bảng nhỏ (app_settings, manual_entries, imported_files,
+-- shopee_accounts). Trước khi push, hash hiện tại == last_full_hash → skip
+-- upload (state cuối window = state đầu, mọi mutation đã revert). Bảng to
+-- (raw_*) luôn NULL — không hash full table vì O(N) chậm.
 CREATE TABLE IF NOT EXISTS sync_cursor_state (
     table_name            TEXT PRIMARY KEY,
     last_uploaded_cursor  TEXT NOT NULL DEFAULT '0',
     last_pulled_cursor    TEXT NOT NULL DEFAULT '0',
     last_uploaded_hash    TEXT,
+    last_full_hash        TEXT,
     updated_at            TEXT NOT NULL
 );
 
@@ -265,7 +288,8 @@ INSERT OR IGNORE INTO sync_cursor_state (table_name, updated_at) VALUES
     ('fb_ads_to_file',           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     ('manual_entries',           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     ('shopee_accounts',          strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('tombstones',               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+    ('tombstones',               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    ('app_settings',             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
 -- Manifest state singleton (last remote etag + snapshot metadata).
 CREATE TABLE IF NOT EXISTS sync_manifest_state (

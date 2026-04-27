@@ -58,13 +58,30 @@ pub fn absorb_remote_clock(conn: &Connection, remote_max_ms: i64) -> rusqlite::R
     Ok(())
 }
 
-/// ms → RFC3339 UTC string. Fallback Utc::now nếu ms invalid.
+/// ms → RFC3339 UTC string với suffix `Z` (millisecond precision).
+///
+/// **Bug F fix**: trước đây dùng `to_rfc3339()` → suffix `+00:00`. Schema seed
+/// + một số code path dùng `Z` → mix 2 format trong cùng column. Lex compare
+/// (`+` < `Z`) sai chronological order → cursor advance sai → row bị skip
+/// vĩnh viễn (vd default shopee_account `+00:00` vs user-created `Z`).
+///
+/// Chuẩn hóa: mọi timestamp sync-critical dùng `Z` suffix, millisecond
+/// precision (đủ cho HLC monotonic). Fallback Utc::now nếu ms invalid.
 pub fn ms_to_rfc3339(ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
+    use chrono::{SecondsFormat, TimeZone, Utc};
     Utc.timestamp_millis_opt(ms)
         .single()
         .unwrap_or_else(Utc::now)
-        .to_rfc3339()
+        .to_rfc3339_opts(SecondsFormat::Millis, true) // true = use 'Z' suffix
+}
+
+/// Helper: `Utc::now()` formatted với suffix `Z` + millisecond precision.
+/// Dùng cho timestamps NON-HLC nhưng vẫn ở sync-critical columns (cursor
+/// columns vd `imported_at`, `created_at`). Đảm bảo cùng format với
+/// `next_hlc_rfc3339` để lex compare consistent cross-row.
+pub fn now_rfc3339_z() -> String {
+    use chrono::{SecondsFormat, Utc};
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// Parse RFC3339 → ms. 0 nếu parse fail (safe default cho absorb_remote_clock:
@@ -128,6 +145,36 @@ mod tests {
         let s = ms_to_rfc3339(ms);
         let back = rfc3339_to_ms(&s);
         assert_eq!(back, ms);
+    }
+
+    #[test]
+    fn rfc3339_uses_z_suffix() {
+        // Bug F regression: PHẢI dùng 'Z' suffix, KHÔNG phải '+00:00'. Mix
+        // format → lex compare sai (vd cursor advance qua `+00:00` row →
+        // `Z` row sau bị skip vì lex `Z` > `+`).
+        let s = ms_to_rfc3339(1_745_234_600_123);
+        assert!(s.ends_with('Z'), "phải kết thúc 'Z', got: {s}");
+        assert!(!s.contains("+00:00"), "không được có '+00:00', got: {s}");
+    }
+
+    #[test]
+    fn now_rfc3339_z_uses_z_suffix() {
+        let s = now_rfc3339_z();
+        assert!(s.ends_with('Z'));
+        assert!(!s.contains('+'));
+    }
+
+    #[test]
+    fn next_hlc_rfc3339_consistent_with_now_helper() {
+        // Cùng format giữa HLC-driven và raw-now timestamps.
+        let conn = conn_with_sync_state();
+        let hlc_ts = next_hlc_rfc3339(&conn).unwrap();
+        let now_ts = now_rfc3339_z();
+        // Cùng pattern '...Z' suffix.
+        assert!(hlc_ts.ends_with('Z'));
+        assert!(now_ts.ends_with('Z'));
+        // Lex compare 2 string đồng format an toàn.
+        let _ = hlc_ts < now_ts || hlc_ts >= now_ts; // ensure no panic
     }
 
     #[test]

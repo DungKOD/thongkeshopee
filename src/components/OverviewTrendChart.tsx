@@ -40,6 +40,13 @@ interface Props {
 
 type ChartMode = "finance" | "roi" | "cumulative";
 
+/// Brand colors — spend là chi tiêu FB Ads → màu xanh Facebook; commission là
+/// hoa hồng Shopee Affiliate → màu cam Shopee. Convention dùng cho mọi chart
+/// liên quan spend/commission để user nhanh nhận biết source.
+const SPEND_COLOR = "#1877F2"; // Facebook blue
+const COMMISSION_COLOR = "#EE4D2D"; // Shopee orange (= shopee-500 trong tailwind)
+const PROFIT_COLOR = "#22c55e"; // Green
+
 const GRANULARITY_LABEL: Record<TrendGranularity, string> = {
   day: "Ngày",
   week: "Tuần",
@@ -161,12 +168,12 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
               >
                 <defs>
                   <linearGradient id="grad-cum-profit" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#22c55e" stopOpacity={0.6} />
-                    <stop offset="95%" stopColor="#22c55e" stopOpacity={0.05} />
+                    <stop offset="5%" stopColor={PROFIT_COLOR} stopOpacity={0.6} />
+                    <stop offset="95%" stopColor={PROFIT_COLOR} stopOpacity={0.05} />
                   </linearGradient>
                   <linearGradient id="grad-cum-spend" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#f97316" stopOpacity={0.4} />
-                    <stop offset="95%" stopColor="#f97316" stopOpacity={0.02} />
+                    <stop offset="5%" stopColor={SPEND_COLOR} stopOpacity={0.4} />
+                    <stop offset="95%" stopColor={SPEND_COLOR} stopOpacity={0.02} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid stroke="#ffffff10" vertical={false} />
@@ -204,7 +211,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
                   type="monotone"
                   dataKey="cumulativeSpend"
                   name="Chi tiêu tích luỹ"
-                  stroke="#f97316"
+                  stroke={SPEND_COLOR}
                   fill="url(#grad-cum-spend)"
                   strokeWidth={2}
                 />
@@ -212,7 +219,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
                   type="monotone"
                   dataKey="cumulativeProfit"
                   name="Lãi tích luỹ"
-                  stroke="#22c55e"
+                  stroke={PROFIT_COLOR}
                   fill="url(#grad-cum-profit)"
                   strokeWidth={2.5}
                 />
@@ -253,7 +260,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
                   <Bar
                     dataKey="spend"
                     name="Chi tiêu ADS"
-                    fill="#f97316"
+                    fill={SPEND_COLOR}
                     radius={[4, 4, 0, 0]}
                     barSize={14}
                   />
@@ -261,7 +268,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
                 <Bar
                   dataKey="netCommission"
                   name="Hoa hồng ròng"
-                  fill="#3b82f6"
+                  fill={COMMISSION_COLOR}
                   radius={[4, 4, 0, 0]}
                   barSize={14}
                 />
@@ -269,9 +276,9 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
                   type="monotone"
                   dataKey="profit"
                   name="Lợi nhuận"
-                  stroke="#22c55e"
+                  stroke={PROFIT_COLOR}
                   strokeWidth={2.5}
-                  dot={{ r: 3, fill: "#22c55e" }}
+                  dot={{ r: 3, fill: PROFIT_COLOR }}
                   activeDot={{ r: 5 }}
                 />
                 <ReferenceLine
@@ -323,7 +330,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
                   type="monotone"
                   dataKey="roi"
                   name="ROI %"
-                  stroke="#22c55e"
+                  stroke={PROFIT_COLOR}
                   strokeWidth={2.5}
                   dot={(props: {
                     cx?: number;
@@ -339,7 +346,7 @@ export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
                       payload.roi === null
                         ? "#ffffff40"
                         : payload.roi >= 0
-                        ? "#22c55e"
+                        ? PROFIT_COLOR
                         : "#ef4444";
                     return (
                       <circle
@@ -412,7 +419,7 @@ function CumulativeTooltip({ active, payload }: TrendTooltipProps) {
       </div>
       <dl className="space-y-0.5 text-xs">
         <TooltipRow
-          color="#22c55e"
+          color={PROFIT_COLOR}
           label="Lãi tích luỹ"
           value={fmtVnd(point.cumulativeProfit)}
           valueClass={
@@ -420,12 +427,12 @@ function CumulativeTooltip({ active, payload }: TrendTooltipProps) {
           }
         />
         <TooltipRow
-          color="#f97316"
+          color={SPEND_COLOR}
           label="Chi tiêu tích luỹ"
           value={fmtVnd(point.cumulativeSpend)}
         />
         <TooltipRow
-          color="#3b82f6"
+          color={COMMISSION_COLOR}
           label="Hoa hồng tích luỹ"
           value={fmtVnd(point.cumulativeRevenue)}
         />
@@ -460,15 +467,15 @@ function TrendTooltip({
       {mode === "finance" ? (
         <dl className="space-y-0.5 text-xs">
           {point.spend > 0 && (
-            <TooltipRow color="#f97316" label="Chi tiêu ADS" value={fmtVnd(point.spend)} />
+            <TooltipRow color={SPEND_COLOR} label="Chi tiêu ADS" value={fmtVnd(point.spend)} />
           )}
           <TooltipRow
-            color="#3b82f6"
+            color={COMMISSION_COLOR}
             label="Hoa hồng ròng"
             value={fmtVnd(point.netCommission)}
           />
           <TooltipRow
-            color="#22c55e"
+            color={PROFIT_COLOR}
             label="Lợi nhuận"
             value={fmtVnd(point.profit)}
             valueClass={
@@ -493,7 +500,7 @@ function TrendTooltip({
               point.roi === null
                 ? "#ffffff40"
                 : point.roi >= 0
-                ? "#22c55e"
+                ? PROFIT_COLOR
                 : "#ef4444"
             }
             label="ROI"
@@ -506,9 +513,9 @@ function TrendTooltip({
                 : "text-red-300"
             }
           />
-          <TooltipRow color="#f97316" label="Chi tiêu" value={fmtVnd(point.spend)} />
+          <TooltipRow color={SPEND_COLOR} label="Chi tiêu" value={fmtVnd(point.spend)} />
           <TooltipRow
-            color="#22c55e"
+            color={PROFIT_COLOR}
             label="Lợi nhuận"
             value={fmtVnd(point.profit)}
           />

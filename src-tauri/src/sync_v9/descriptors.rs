@@ -70,8 +70,7 @@ pub const SYNC_TABLES: &[TableDescriptor] = &[
     // `id = content_id(natural_key)` = SHA-256 hash → uniform random i63, không
     // monotonic. Dùng id làm cursor → row mới có id < cursor cũ bị bỏ qua vĩnh
     // viễn → child rows (FK source_file_id) push lên R2 mà parent chưa push →
-    // máy khác pull FK fail. Migration v1 reset cursor cho 2 table này (xem
-    // db/mod.rs init_db_at).
+    // máy khác pull FK fail.
     TableDescriptor {
         name: "shopee_accounts",
         cursor_kind: CursorKind::UpdatedAt,
@@ -135,6 +134,17 @@ pub const SYNC_TABLES: &[TableDescriptor] = &[
         pk_columns: &["sub_id1", "sub_id2", "sub_id3", "sub_id4", "sub_id5", "day_date"],
         op: DeltaOp::Upsert,
     },
+    // app_settings — key-value user preferences (clickSources, profitFees,
+    // autoSyncEnabled). Mỗi user-DB có row riêng (per-user isolation đã handle
+    // qua DB swap). Keys dynamic (vd `click_source.<referrer>`) — descriptor
+    // generic over PK string nên hoạt động native. LWW per-key qua updated_at.
+    TableDescriptor {
+        name: "app_settings",
+        cursor_kind: CursorKind::UpdatedAt,
+        cursor_column: "updated_at",
+        pk_columns: &["key"],
+        op: DeltaOp::Upsert,
+    },
     TableDescriptor {
         name: "tombstones",
         cursor_kind: CursorKind::DeletedAt,
@@ -154,13 +164,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_tables_has_10_entries() {
-        assert_eq!(SYNC_TABLES.len(), 10, "match seed trong migrate_v11");
+    fn sync_tables_has_11_entries() {
+        assert_eq!(SYNC_TABLES.len(), 11, "match seed trong schema.sql (v3 thêm app_settings)");
     }
 
     #[test]
     fn sync_tables_names_match_seed() {
-        // Phải giống danh sách seed trong `migrate_v11_sync_infra`.
+        // Phải giống danh sách seed trong schema.sql.
         let names: Vec<&str> = SYNC_TABLES.iter().map(|d| d.name).collect();
         let expected = [
             "shopee_accounts",
@@ -172,6 +182,7 @@ mod tests {
             "orders_to_file",
             "fb_ads_to_file",
             "manual_entries",
+            "app_settings",
             "tombstones",
         ];
         for name in expected {

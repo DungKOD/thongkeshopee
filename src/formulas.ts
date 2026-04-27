@@ -56,9 +56,18 @@ export type AggregatedProductRow = {
   daysActive: number;
 };
 
-/** Row identity dạng string để dùng làm key trong Set/Map. */
-export function uiRowKey(dayDate: string, subIds: readonly string[]): string {
-  return `${dayDate}|${subIds.join("\x1f")}`;
+/** Row identity dạng string để dùng làm key trong Set/Map.
+ *
+ *  `accountId` BẮT BUỘC vì sau v0.4.5+ aggregate tách theo (canonical, account)
+ *  → 2 row có cùng `subIds` nhưng khác account khi filter=All. Bỏ accountId
+ *  khỏi key sẽ gây React duplicate-key warning + staged-delete nhầm row của
+ *  account khác. `null` = "FB chung" bucket (FB ad ≥2 owner). */
+export function uiRowKey(
+  dayDate: string,
+  subIds: readonly string[],
+  accountId: string | null,
+): string {
+  return `${dayDate}|${subIds.join("\x1f")}|${accountId ?? ""}`;
 }
 
 /**
@@ -246,6 +255,11 @@ export function aggregateProductRows(
 ): AggregatedProductRow[] {
   const includeAds = source === "all";
   const map = new Map<string, AggregatedProductRow>();
+  // Track distinct dayDate per agg — sau v0.4.5+ aggregate split per-account
+  // 1 day có thể chứa nhiều UiRow cùng tuple (acc A, acc B, FB chung); nếu
+  // tăng counter mỗi row thì daysActive over-count. Set per agg đếm distinct
+  // ngày.
+  const daysSeen = new Map<string, Set<string>>();
   for (const day of days) {
     for (const r of day.rows) {
       if (!rowMatchesSource(r, source)) continue;
@@ -266,6 +280,7 @@ export function aggregateProductRows(
           daysActive: 0,
         };
         map.set(key, agg);
+        daysSeen.set(key, new Set());
       }
       if (!agg.displayName && r.displayName) agg.displayName = r.displayName;
       const spend = includeAds ? r.totalSpend ?? 0 : 0;
@@ -279,8 +294,11 @@ export function aggregateProductRows(
       agg.orderValueTotal += r.orderValueTotal;
       agg.netCommission += net;
       agg.profit += net - spend;
-      agg.daysActive += 1;
+      daysSeen.get(key)!.add(r.dayDate);
     }
+  }
+  for (const [key, agg] of map) {
+    agg.daysActive = daysSeen.get(key)!.size;
   }
   return Array.from(map.values());
 }
@@ -738,8 +756,20 @@ export function fmtHistoryTime(ms: number): string {
   )}/${d.getFullYear()}`;
 }
 
-/** Tone semantic cho UI — unify style mapping khắp components (chart, card, KPI). */
-export type Tone = "positive" | "negative" | "neutral" | "muted";
+/** Tone semantic cho UI — unify style mapping khắp components (chart, card, KPI).
+ *  Brand tones `spend`/`commission` dùng cho metric source-specific:
+ *  - `spend` = chi tiêu FB Ads → màu xanh FB
+ *  - `commission` = hoa hồng Shopee → màu cam Shopee
+ *  Convention dùng đồng bộ với chart Xu hướng theo ngày (xem
+ *  OverviewTrendChart SPEND_COLOR/COMMISSION_COLOR const).
+ */
+export type Tone =
+  | "positive"
+  | "negative"
+  | "neutral"
+  | "muted"
+  | "spend"
+  | "commission";
 
 /** Text color class theo tone — tailwind classes. */
 export function toneTextClass(tone: Tone): string {
@@ -752,6 +782,28 @@ export function toneTextClass(tone: Tone): string {
       return "text-white/70";
     case "neutral":
       return "text-white";
+    case "spend":
+      return "text-blue-400";
+    case "commission":
+      return "text-shopee-400";
+  }
+}
+
+/** Icon color class theo tone — match toneTextClass cho brand tone, neutral
+ *  default cho tone không có ý nghĩa màu (KPI value tự nó đã có màu). */
+export function toneIconClass(tone: Tone): string {
+  switch (tone) {
+    case "spend":
+      return "text-blue-400";
+    case "commission":
+      return "text-shopee-400";
+    case "positive":
+      return "text-green-400";
+    case "negative":
+      return "text-red-400";
+    case "muted":
+    case "neutral":
+      return "text-white/40";
   }
 }
 
@@ -787,8 +839,15 @@ export function buildDayTsv(
   const round2 = (n: number) => n.toFixed(2);
   const empty = "";
 
+  // Auto-detect multi-account: nếu rows có ≥2 accountId khác nhau (kể cả
+  // null = FB chung), thêm cột "TK Shopee" để user paste vào Sheet không bị
+  // duplicate display_name không phân biệt được.
+  const distinctAccountIds = new Set(day.rows.map((r) => r.accountId ?? ""));
+  const showAccount = distinctAccountIds.size >= 2;
+
   const header = [
     "Sản phẩm",
+    ...(showAccount ? ["TK Shopee"] : []),
     "Click ADS",
     "Click Shopee",
     "CPC",
@@ -806,6 +865,7 @@ export function buildDayTsv(
     const c = computeUiRow(r, fees, shopeeClicks);
     return [
       r.displayName || "(chưa đặt tên)",
+      ...(showAccount ? [r.accountName ?? "FB chung"] : []),
       r.adsClicks != null ? round0(r.adsClicks) : empty,
       round0(shopeeClicks),
       c.cpc > 0 ? round0(c.cpc) : empty,
@@ -820,15 +880,25 @@ export function buildDayTsv(
   });
 
   const totals = computeUiDayTotals(day, clickSources, fees);
+  // CR/AOV TB ở row Tổng — match cell tfoot UI (DayBlock). Tránh user copy
+  // sang Excel rồi miss 2 cột. orderValueTotal lấy trực tiếp từ day.totals
+  // (UiDayTotals pre-filter — KPI rule).
+  const avgConversion =
+    totals.shopeeClicks > 0
+      ? (totals.orders / totals.shopeeClicks) * 100
+      : null;
+  const avgOrderValue =
+    totals.orders > 0 ? day.totals.orderValueTotal / totals.orders : null;
   const totalLine = [
     "Tổng",
+    ...(showAccount ? [empty] : []),
     round0(totals.clicks),
     round0(totals.shopeeClicks),
     empty,
     round0(totals.totalSpend),
     round0(totals.orders),
-    empty,
-    empty,
+    avgConversion !== null ? round2(avgConversion) : empty,
+    avgOrderValue !== null ? round0(avgOrderValue) : empty,
     round0(totals.commission),
     round0(totals.profit),
     empty,

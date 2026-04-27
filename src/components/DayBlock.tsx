@@ -6,6 +6,7 @@ import {
   computeUiRow,
   fmtDate,
   fmtInt,
+  fmtPct,
   fmtVnd,
   uiRowKey,
 } from "../formulas";
@@ -41,6 +42,12 @@ const ROI_TOOLTIP =
 const HEADERS: Array<{ label: string; tooltip?: string }> = [
   { label: "#" },
   { label: "Sản phẩm" },
+  {
+    label: "TK Shopee",
+    tooltip:
+      "Tài khoản Shopee mà dòng này thuộc về. 'FB chung' = quảng cáo FB " +
+      "có ≥2 TK Shopee cùng tuple sub_id trong ngày → không quy về 1 TK duy nhất.",
+  },
   { label: "Click ADS", tooltip: "Tổng click quảng cáo FB (link_clicks)" },
   {
     label: "Click Shopee",
@@ -88,6 +95,36 @@ export function DayBlock({
   const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
   const sectionRef = useRef<HTMLElement>(null);
   const { settings } = useSettings();
+
+  // Cột "TK Shopee" chỉ render khi user đang xem tất cả account (filter All).
+  // Khi filter 1 acc cụ thể, mọi row đều cùng acc → cột trùng lặp, bỏ.
+  const showAccount = !accountFilter || accountFilter.kind === "all";
+  const headers = useMemo(
+    () => (showAccount ? HEADERS : HEADERS.filter((h) => h.label !== "TK Shopee")),
+    [showAccount],
+  );
+
+  // Tuple đa-account: same canonical sub_ids xuất hiện trong ≥2 row khác
+  // accountId. Khi user xóa 1 row trong số này, BE batch_commit_deletes wipe
+  // hết data cùng tuple/day cho mọi acc (delete_prefix_compatible không filter
+  // shopee_account_id) → rủi ro mất data acc khác. Chặn nút delete + tooltip
+  // hướng dẫn switch filter trước. Set chứa subIds.join key cho lookup O(1).
+  const multiAccountTuples = useMemo(() => {
+    const groups = new Map<string, Set<string | null>>();
+    for (const r of day.rows) {
+      const k = r.subIds.join("\x1f");
+      let s = groups.get(k);
+      if (!s) {
+        s = new Set();
+        groups.set(k, s);
+      }
+      s.add(r.accountId);
+    }
+    const multi = new Set<string>();
+    for (const [k, s] of groups) if (s.size >= 2) multi.add(k);
+    return multi;
+  }, [day.rows]);
+  const hasAnyMultiAccount = multiAccountTuples.size > 0;
 
   // Copy TSV → clipboard. Hiện icon "done" 1.5s rồi revert.
   const [copied, setCopied] = useState(false);
@@ -165,7 +202,7 @@ export function DayBlock({
     !dayPending &&
     day.rows.length > 0 &&
     day.rows.every((r) =>
-      pendingRowDeletes.has(uiRowKey(r.dayDate, r.subIds)),
+      pendingRowDeletes.has(uiRowKey(r.dayDate, r.subIds, r.accountId)),
     );
   const effectiveDayPending = dayPending || allRowsPending;
 
@@ -269,6 +306,18 @@ export function DayBlock({
         </div>
       </header>
 
+      {showAccount && hasAnyMultiAccount && !readOnly && (
+        <div
+          className="flex items-center gap-2 border-b border-surface-8 bg-blue-500/5 px-5 py-2 text-xs text-blue-200/80"
+          title="Khi 1 sub_id có data của ≥2 TK Shopee, nút xóa hàng bị khóa vì BE hiện xóa theo tuple — sẽ wipe data của tất cả TK. Chuyển dropdown sang TK cụ thể rồi mới xóa."
+        >
+          <span className="material-symbols-rounded text-sm text-blue-300/70">info</span>
+          <span>
+            Có sub_id chia sẻ giữa nhiều TK — nút xóa hàng đã khóa cho các dòng đó.
+            Chuyển dropdown TK sang TK cụ thể nếu cần xóa.
+          </span>
+        </div>
+      )}
       {day.totals.mcnFeeTotal > 0 && (
         <div
           className="flex items-center gap-2 border-b border-surface-8 bg-amber-500/5 px-5 py-2 text-xs text-amber-200/80"
@@ -287,10 +336,10 @@ export function DayBlock({
         <table className="w-full border-collapse text-sm">
           <thead>
             <tr className="border-b-2 border-shopee-500/50 bg-gradient-to-b from-shopee-900/35 to-shopee-900/15 text-shopee-100">
-              {HEADERS.map((h, i) => {
+              {headers.map((h, i) => {
                 const isIndex = i === 0;
                 const isProduct = i === 1;
-                const isAction = i === HEADERS.length - 1;
+                const isAction = i === headers.length - 1;
                 const alignCls = isIndex
                   ? "w-12 px-2 text-center"
                   : isProduct
@@ -321,7 +370,7 @@ export function DayBlock({
             {day.rows.length === 0 ? (
               <tr>
                 <td
-                  colSpan={HEADERS.length}
+                  colSpan={headers.length}
                   className="border border-gray-700 px-4 py-6 text-center text-sm text-gray-500"
                 >
                   Chưa có dòng — bấm "+ Thêm dòng" hoặc import CSV
@@ -329,13 +378,18 @@ export function DayBlock({
               </tr>
             ) : (
               sortedRows.map((r, i) => {
-                const key = uiRowKey(r.dayDate, r.subIds);
+                const key = uiRowKey(r.dayDate, r.subIds, r.accountId);
+                const tupleKey = r.subIds.join("\x1f");
+                const deleteBlocked =
+                  showAccount && multiAccountTuples.has(tupleKey);
                 return (
                   <VideoRow
                     key={key}
                     index={i + 1}
                     row={r}
+                    showAccount={showAccount}
                     pending={effectiveDayPending || pendingRowDeletes.has(key)}
+                    deleteBlocked={deleteBlocked}
                     onEdit={() => onEditRow(r)}
                     onToggleDelete={() => {
                       // Nếu day đang pending (xóa cả ngày) mà user undo 1 row:
@@ -343,7 +397,7 @@ export function DayBlock({
                       if (dayPending) {
                         onToggleDayDelete(day.date);
                         for (const other of day.rows) {
-                          if (uiRowKey(other.dayDate, other.subIds) !== key) {
+                          if (uiRowKey(other.dayDate, other.subIds, other.accountId) !== key) {
                             onToggleRowDelete(other);
                           }
                         }
@@ -365,6 +419,7 @@ export function DayBlock({
                 <td className="px-4 py-4 text-left text-sm uppercase tracking-wider text-shopee-300">
                   Tổng
                 </td>
+                {showAccount && <td />}
                 <td className="px-3 py-4 text-center tabular-nums">
                   {fmtInt(totals.clicks)}
                 </td>
@@ -372,15 +427,33 @@ export function DayBlock({
                   {fmtInt(totals.shopeeClicks)}
                 </td>
                 <td />
-                <td className="px-3 py-4 text-center tabular-nums">
+                <td className="px-3 py-4 text-center tabular-nums text-blue-400">
                   {fmtVnd(totals.totalSpend)}
                 </td>
                 <td className="px-3 py-4 text-center tabular-nums">
                   {fmtInt(totals.orders)}
                 </td>
-                <td />
-                <td />
-                <td className="px-3 py-4 text-center tabular-nums">
+                <td
+                  className="px-3 py-4 text-center tabular-nums"
+                  title={
+                    totals.shopeeClicks === 0
+                      ? "Không có Click Shopee → không tính được CR"
+                      : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
+                  }
+                >
+                  {totals.shopeeClicks > 0
+                    ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
+                    : "—"}
+                </td>
+                <td
+                  className="px-3 py-4 text-center tabular-nums"
+                  title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
+                >
+                  {totals.orders > 0
+                    ? fmtVnd(day.totals.orderValueTotal / totals.orders)
+                    : "—"}
+                </td>
+                <td className="px-3 py-4 text-center tabular-nums text-shopee-400">
                   {fmtVnd(totals.commission)}
                 </td>
                 <td

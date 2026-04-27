@@ -92,6 +92,13 @@ interface UseCloudSyncOptions {
   /// đang edit → đè mất input. Force sync vẫn chạy khi user click.
   /// Transition true→false sẽ trigger 1 sync catch-up ngay lập tức.
   pausedByForm?: boolean;
+  /// User toggle (Settings) — false thì mutation KHÔNG arm debounce/flush
+  /// auto. Status vẫn set "dirty" để SyncBadge hiển thị có pending; user
+  /// phải bấm "Đồng bộ ngay" thủ công. Force sync, pull, RTDB notify, 2h
+  /// safety tick vẫn chạy. Default true (giữ behavior cũ).
+  /// Transition false→true với status đang dirty sẽ arm debounce ngay để
+  /// flush các mutations tích lũy trong quãng off.
+  autoSyncEnabled?: boolean;
   /// Gọi sau mỗi lần pull đã apply deltas mới từ R2 (UI phải refetch).
   onRemoteApplied?: () => void | Promise<void>;
 }
@@ -137,6 +144,7 @@ export function useCloudSync({
   mutationVersion,
   enabled,
   pausedByForm = false,
+  autoSyncEnabled = true,
   onRemoteApplied,
 }: UseCloudSyncOptions): UseCloudSyncResult {
   const [status, setStatus] = useState<SyncStatus>(() =>
@@ -165,6 +173,10 @@ export function useCloudSync({
   /// Guard re-entry — true từ lúc doSync bắt đầu đến khi finally. Tránh
   /// 2 sync concurrent (force click khi debounce vừa fire chẳng hạn).
   const syncInFlightRef = useRef(false);
+  /// Đã thử force refresh token trong sync attempt hiện tại chưa. Reset trong
+  /// finally → mỗi attempt được phép refresh 1 lần. Tránh loop refresh-fail-
+  /// refresh-fail nếu Firebase server từ chối.
+  const tokenRefreshAttemptedRef = useRef(false);
   /// True khi caller yêu cầu pull (startup / forceSync / RTDB event). False
   /// khi mutation-triggered (chỉ cần push). Set bởi caller trước khi
   /// gọi doSync, clear trong finally.
@@ -180,6 +192,11 @@ export function useCloudSync({
   /// Timestamp mutation ĐẦU TIÊN sau lần sync gần nhất. Dùng MAX_WAIT_MS cap.
   /// 0 = chưa có mutation pending.
   const firstMutationAtRef = useRef(0);
+  /// mutationVersion đã được effect dưới xử lý lần cuối. Dùng phân biệt
+  /// "mutation thật" với "effect re-run do dep khác đổi" (autoSyncEnabled /
+  /// pausedByForm). Toggle setting KHÔNG được mark dirty khi mutationVersion
+  /// chưa tăng — nếu không user tắt/bật auto-sync sẽ thấy "Chờ đồng bộ" giả.
+  const lastSeenMutationRef = useRef(0);
   const statusRef = useRef<SyncStatus>(status);
   useEffect(() => {
     statusRef.current = status;
@@ -274,6 +291,11 @@ export function useCloudSync({
         skippedIdentical: pushReport.skippedIdentical,
       });
       retryAttemptRef.current = 0;
+      // Reset token refresh flag CHỈ trên success path. Nếu reset trong
+      // finally, refresh-fail-retry-401 sẽ lại allow refresh → loop. Reset
+      // ở đây nghĩa là: 1 refresh per rolling fail-window, kết thúc khi sync
+      // thành công lần đầu.
+      tokenRefreshAttemptedRef.current = false;
 
       // UI refetch nếu pull đã apply deltas (local DB có row mới từ máy khác).
       if (pullReport.appliedDeltas > 0) {
@@ -353,14 +375,40 @@ export function useCloudSync({
       }
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
+      // Detect 401 / Unauthorized / token expired → force refresh ID token
+      // và retry NGAY 1 lần. Token Firebase TTL 1h; user offline >1h rồi
+      // online lại sẽ gặp 401 vì cache token đã hết hạn. Force refresh fix
+      // root cause thay vì chờ exponential backoff.
+      const isAuthErr =
+        /\b401\b|unauthorized|invalid.*token|expired.*token/i.test(msg);
+      const alreadyRefreshed = tokenRefreshAttemptedRef.current;
+      if (isAuthErr && !alreadyRefreshed) {
+        tokenRefreshAttemptedRef.current = true;
+        try {
+          await getAuthToken(true); // force refresh
+          // Retry doSync NGAY (sync_in_flight đã clear bên dưới — chờ finally).
+          // Schedule sau finally cleanup bằng setTimeout 0.
+          setTimeout(() => {
+            void doSync();
+          }, 0);
+          return;
+        } catch (refreshErr) {
+          console.warn("[sync v9] token refresh failed:", refreshErr);
+          // Fall through → set error normal.
+        }
+      }
       setError(msg);
       setStatus("error");
-      const delay = backoffFor(retryAttemptRef.current);
-      retryAttemptRef.current += 1;
-      retryRef.current = window.setTimeout(() => {
-        retryRef.current = null;
-        void doSync();
-      }, delay);
+      // Skip retry khi offline — `online` event listener sẽ tự trigger doSync
+      // khi mạng về. Tránh retry loop ăn cycles + tích backoff cap.
+      if (navigator.onLine) {
+        const delay = backoffFor(retryAttemptRef.current);
+        retryAttemptRef.current += 1;
+        retryRef.current = window.setTimeout(() => {
+          retryRef.current = null;
+          void doSync();
+        }, delay);
+      }
     } finally {
       setSyncPhase(null);
       syncInFlightRef.current = false;
@@ -431,12 +479,15 @@ export function useCloudSync({
       const msg = (e as Error).message ?? String(e);
       setError(msg);
       setStatus("error");
-      const delay = backoffFor(retryAttemptRef.current);
-      retryAttemptRef.current += 1;
-      retryRef.current = window.setTimeout(() => {
-        retryRef.current = null;
-        void doStartupCheck();
-      }, delay);
+      // Skip retry khi offline — `online` listener trigger lại khi mạng về.
+      if (navigator.onLine) {
+        const delay = backoffFor(retryAttemptRef.current);
+        retryAttemptRef.current += 1;
+        retryRef.current = window.setTimeout(() => {
+          retryRef.current = null;
+          void doStartupCheck();
+        }, delay);
+      }
     }
   }, [doSync]);
 
@@ -529,6 +580,11 @@ export function useCloudSync({
       return;
     }
     if (mutationVersion === 0) return;
+    // Effect re-run do autoSyncEnabled / pausedByForm đổi (không phải
+    // mutation mới) — bail. Nếu không, toggle setting sẽ bump dirty giả
+    // dù không có gì thay đổi để sync.
+    if (mutationVersion === lastSeenMutationRef.current) return;
+    lastSeenMutationRef.current = mutationVersion;
 
     setStatus("dirty");
     const now = Date.now();
@@ -542,6 +598,14 @@ export function useCloudSync({
       return () => {
         clearDebounce();
       };
+    }
+
+    // User toggle OFF — counters & status="dirty" vẫn set để SyncBadge hiện
+    // "Chờ đồng bộ", nhưng KHÔNG arm debounce/flush. User phải bấm force.
+    // Khi user toggle ON lại, effect riêng dưới sẽ schedule debounce nếu
+    // còn dirty.
+    if (!autoSyncEnabled) {
+      return;
     }
 
     // Trigger 1: count đủ 100 mutations → flush ngay (cost-efficient bundle).
@@ -563,7 +627,25 @@ export function useCloudSync({
       clearDebounce();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mutationVersion, enabled, pausedByForm, scheduleDebounce, flushNow]);
+  }, [mutationVersion, enabled, autoSyncEnabled, pausedByForm, scheduleDebounce, flushNow]);
+
+  /// Re-arm debounce khi user toggle autoSync OFF→ON. Nếu có pending mutations
+  /// (status="dirty") tích lũy trong quãng off, schedule flush sau 45s. User
+  /// vẫn có thể bấm force sync để push ngay.
+  /// Note: dùng status snapshot (không read ref) — re-render khi autoSync flip
+  /// đủ để effect chạy với status mới nhất. Không depend vào status để tránh
+  /// schedule lại mỗi lần status đổi sang dirty (đã có effect trên handle).
+  const prevAutoSyncRef = useRef(autoSyncEnabled);
+  useEffect(() => {
+    const wasOff = !prevAutoSyncRef.current;
+    const isOn = autoSyncEnabled;
+    prevAutoSyncRef.current = autoSyncEnabled;
+    if (!enabled) return;
+    if (wasOff && isOn && status === "dirty") {
+      scheduleDebounce();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoSyncEnabled, enabled]);
 
   // Idle flush ĐÃ XÓA. Lý do user request: edit save manual entry trong
   // bảng ngày → user thường idle ~30s sau click → idle flush fire ở 30s
@@ -580,6 +662,9 @@ export function useCloudSync({
     if (!enabled) return;
     const onOnline = () => {
       retryAttemptRef.current = 0;
+      // Reset token refresh: token có thể đã expire trong window offline
+      // → cho phép force refresh ở lần sync đầu tiên khi online lại.
+      tokenRefreshAttemptedRef.current = false;
       clearRetry();
       void (async () => {
         const s = await syncV9GetState();
@@ -686,6 +771,9 @@ export function useCloudSync({
     clearDebounce();
     clearRetry();
     retryAttemptRef.current = 0;
+    // Reset token refresh flag: user manual click "Đồng bộ ngay" có thể là
+    // sau khi đã sửa account ở dashboard (claim đổi). Allow refresh lại.
+    tokenRefreshAttemptedRef.current = false;
     // Ép pull: mutation path (scheduleDebounce/flushNow) có thể đã set
     // needPullRef=false và doSync đang inflight. Set true trước khi gọi
     // để inflight doSync thấy flag đúng ở check line 251, hoặc next call

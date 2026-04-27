@@ -142,6 +142,9 @@ pub fn resolve_active_imports_dir(conn: &Connection) -> Result<PathBuf> {
 
 /// Mở hoặc tạo DB tại `path`, apply PRAGMA + `schema.sql`, seed "Mặc định".
 /// Idempotent — schema dùng `IF NOT EXISTS`, seed dùng `INSERT OR IGNORE`.
+///
+/// **No-migration design**: schema đổi = user xóa DB tay. `schema.sql` tự đủ
+/// để tạo DB fresh (mọi `CREATE` + `INSERT OR IGNORE` seed đều idempotent).
 pub fn init_db_at(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("không mở được DB tại {}", path.display()))?;
@@ -158,32 +161,8 @@ pub fn init_db_at(path: &Path) -> Result<Connection> {
         .context("không apply được schema")?;
 
     seed_default_account(&conn).context("seed default account thất bại")?;
-    apply_post_schema_migrations(&conn).context("post-schema migrations thất bại")?;
 
     Ok(conn)
-}
-
-/// Migration nhỏ chạy sau SCHEMA_SQL, idempotent qua `PRAGMA user_version`.
-///
-/// **v1**: Reset `sync_cursor_state` cho `imported_files` và `shopee_accounts`
-/// vì cursor type đổi từ PrimaryKey (id integer) sang UpdatedAt (TEXT timestamp).
-/// Cursor cũ định dạng số nguyên không còn parse đúng cho compare TEXT — phải
-/// reset về '0' để capture re-push toàn bộ rows. INSERT OR IGNORE bên receiver
-/// xử lý dup (id deterministic content_id).
-fn apply_post_schema_migrations(conn: &Connection) -> Result<()> {
-    let current: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .context("đọc user_version")?;
-    if current < 1 {
-        conn.execute_batch(
-            "UPDATE sync_cursor_state
-             SET last_uploaded_cursor = '0', last_uploaded_hash = NULL
-             WHERE table_name IN ('imported_files', 'shopee_accounts');
-             PRAGMA user_version = 1;",
-        )
-        .context("v1: reset cursor cho content-id tables")?;
-    }
-    Ok(())
 }
 
 /// Seed account "Mặc định" với id = content_id(name). Idempotent qua
@@ -191,7 +170,10 @@ fn apply_post_schema_migrations(conn: &Connection) -> Result<()> {
 /// vào account này khi user delete account cụ thể.
 fn seed_default_account(conn: &Connection) -> Result<()> {
     let id = content_id::shopee_account_id(DEFAULT_ACCOUNT_NAME);
-    let now = chrono::Utc::now().to_rfc3339();
+    // Bug F fix: chuẩn hoá `Z` suffix cho cursor column `created_at`. Trước
+    // đây dùng `to_rfc3339()` → `+00:00`. accounts.rs::create_shopee_account
+    // dùng `Z` format → mix 2 format trong cùng column → lex compare sai.
+    let now = crate::sync_v9::hlc::now_rfc3339_z();
     conn.execute(
         "INSERT OR IGNORE INTO shopee_accounts (id, name, color, created_at)
          VALUES (?, ?, ?, ?)",
@@ -212,14 +194,13 @@ pub fn setup(app: &AppHandle) -> Result<()> {
 }
 
 /// Test helper: apply full schema + seed trên connection in-memory có sẵn.
-/// Giữ tên `migrate_for_tests` cho compat với tests cũ; no-migration design
-/// chỉ chạy SCHEMA_SQL + seed Mặc định.
+/// No-migration design — chỉ chạy SCHEMA_SQL + seed Mặc định. Tên giữ
+/// `migrate_for_tests` cho compat với hàng chục test files đã import.
 #[cfg(test)]
 pub fn migrate_for_tests(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA_SQL)?;
     seed_default_account(conn)?;
-    apply_post_schema_migrations(conn)?;
     Ok(())
 }
 
@@ -278,7 +259,7 @@ mod tests {
         let cursor_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sync_cursor_state", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cursor_count, 10, "sync_cursor_state phải seed 10 bảng");
+        assert_eq!(cursor_count, 11, "sync_cursor_state phải seed 11 bảng");
 
         let sync_state_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
@@ -309,7 +290,7 @@ mod tests {
         let cursor_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sync_cursor_state", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cursor_count, 10, "idempotent: không duplicate cursor rows");
+        assert_eq!(cursor_count, 11, "idempotent: không duplicate cursor rows");
 
         let default_count: i64 = conn
             .query_row(

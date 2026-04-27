@@ -183,8 +183,8 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
   );
 
   const toggleRowPending = useCallback(
-    (dayDate: string, subIds: SubIds) => {
-      const key = uiRowKey(dayDate, subIds);
+    (dayDate: string, subIds: SubIds, accountId: string | null) => {
+      const key = uiRowKey(dayDate, subIds, accountId);
       setPendingRowDeletes((prev) => {
         const next = new Map(prev);
         if (next.has(key)) next.delete(key);
@@ -216,6 +216,34 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
       (k) => !pendingDayDeletes.has(k.dayDate),
     );
 
+    // Guard multi-account: BE delete_prefix_compatible KHÔNG filter
+    // shopee_account_id → wipe data của TẤT CẢ TK trên tuple đó. Khi user
+    // pending row ở filter=Account(A) rồi switch filter=All, có thể hiện ra
+    // tuple cùng có data ở TK khác. Chặn commit + báo user trở lại filter
+    // 1 TK rồi review/clear pending. Quét `days` slice hiện tại để check.
+    const conflictTuples: string[] = [];
+    for (const k of rowKeys) {
+      const day = days.find((d) => d.date === k.dayDate);
+      if (!day) continue;
+      const matchedAccs = new Set<string | null>();
+      const tupleKey = k.subIds.join("\x1f");
+      for (const r of day.rows) {
+        if (r.subIds.join("\x1f") === tupleKey) matchedAccs.add(r.accountId);
+      }
+      if (matchedAccs.size >= 2) {
+        const label = k.subIds.filter(Boolean).join("-") || "(empty)";
+        conflictTuples.push(`${k.dayDate} – ${label}`);
+      }
+    }
+    if (conflictTuples.length > 0) {
+      throw new Error(
+        `Có ${conflictTuples.length} dòng pending thuộc sub_id chia sẻ giữa nhiều TK ` +
+          `(${conflictTuples.slice(0, 3).join("; ")}${conflictTuples.length > 3 ? "; ..." : ""}). ` +
+          `Commit sẽ wipe data của tất cả TK trên các tuple này. ` +
+          `Hãy chuyển dropdown TK sang TK cụ thể, "Hủy" pending hiện tại, rồi tạo lại.`,
+      );
+    }
+
     await invoke<{ daysDeleted: number; rowsDeleted: number }>(
       "batch_commit_deletes",
       {
@@ -228,7 +256,14 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
     markMutation();
     clearPending();
     await refetch();
-  }, [pendingDayDeletes, pendingRowDeletes, clearPending, refetch, markMutation]);
+  }, [
+    pendingDayDeletes,
+    pendingRowDeletes,
+    clearPending,
+    refetch,
+    markMutation,
+    days,
+  ]);
 
   const pendingCount = pendingRowDeletes.size + pendingDayDeletes.size;
 

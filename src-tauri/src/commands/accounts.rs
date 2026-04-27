@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use super::query::{is_prefix, to_canonical, Canonical};
-use super::{CmdError, CmdResult};
+use super::{assert_not_bootstrapping, CmdError, CmdResult};
 use crate::db::DbState;
 
 /// Tên reserved cho account "Mặc định" — catch-all cho sub_id chưa gán TK.
@@ -116,9 +116,10 @@ pub fn create_shopee_account(
         return Err(CmdError::msg("Tên account không được để trống"));
     }
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let now = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
+    // Bug E fix: bootstrap restore window guard.
+    assert_not_bootstrapping(&conn)?;
+    // Bug F: dùng helper chung để chuẩn hoá format `Z` toàn project.
+    let now = crate::sync_v9::hlc::now_rfc3339_z();
     // v13: id = content_id(name). Cross-machine stable — không còn autoincrement
     // collision khi 2 máy tạo cùng account fresh.
     let id = crate::sync_v9::content_id::shopee_account_id(&trimmed);
@@ -147,6 +148,8 @@ pub fn rename_shopee_account(
 ) -> CmdResult<()> {
     let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: bootstrap restore window guard.
+    assert_not_bootstrapping(&conn)?;
     if is_default_account(&conn, id)? {
         return Err(CmdError::msg(
             "TK hệ thống 'Mặc định' không thể đổi tên",
@@ -185,6 +188,8 @@ pub fn update_shopee_account_color(
 ) -> CmdResult<()> {
     let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: bootstrap restore window guard.
+    assert_not_bootstrapping(&conn)?;
     conn.execute(
         "UPDATE shopee_accounts SET color = ?1 WHERE id = ?2",
         params![color, id],
@@ -298,6 +303,8 @@ pub fn delete_shopee_account(
     let also_delete_fb = also_delete_fb.unwrap_or(false);
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: bootstrap restore window guard.
+    assert_not_bootstrapping(&conn)?;
     if is_default_account(&conn, id)? {
         return Err(CmdError::msg("TK hệ thống 'Mặc định' không thể xóa"));
     }
@@ -427,6 +434,8 @@ pub fn reassign_shopee_account_data(
         return Err(CmdError::msg("from_id và to_id phải khác nhau"));
     }
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: bootstrap restore window guard.
+    assert_not_bootstrapping(&conn)?;
     if is_default_account(&conn, to_id)? {
         return Err(CmdError::msg(
             "Không thể chuyển data về TK 'Mặc định' — chọn TK thật",

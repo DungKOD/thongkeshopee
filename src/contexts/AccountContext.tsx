@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -31,6 +32,35 @@ export type AccountFilter =
   | { kind: "all" }
   | { kind: "account"; id: string };
 
+/// localStorage key prefix — per-uid để multi-tenant không leak filter giữa
+/// các user dùng chung máy (memory: multi-tenant DB isolation).
+const FILTER_STORAGE_PREFIX = "thongkeshopee.accountfilter.v1.";
+
+function loadAccountFilter(uid: string | null): AccountFilter {
+  if (!uid) return { kind: "all" };
+  try {
+    const raw = localStorage.getItem(FILTER_STORAGE_PREFIX + uid);
+    if (!raw) return { kind: "all" };
+    const parsed = JSON.parse(raw);
+    if (parsed?.kind === "all") return { kind: "all" };
+    if (parsed?.kind === "account" && typeof parsed.id === "string") {
+      return { kind: "account", id: parsed.id };
+    }
+    return { kind: "all" };
+  } catch {
+    return { kind: "all" };
+  }
+}
+
+function persistAccountFilter(uid: string | null, f: AccountFilter): void {
+  if (!uid) return;
+  try {
+    localStorage.setItem(FILTER_STORAGE_PREFIX + uid, JSON.stringify(f));
+  } catch {
+    // ignore quota / privacy-mode errors
+  }
+}
+
 interface AccountContextValue {
   /// List account từ DB. Null = đang load lần đầu.
   accounts: ShopeeAccount[] | null;
@@ -58,8 +88,29 @@ export function AccountProvider({ children }: AccountProviderProps) {
   const { user } = useAuth();
   const uid = user?.uid ?? null;
   const [accounts, setAccounts] = useState<ShopeeAccount[] | null>(null);
-  const [filter, setFilter] = useState<AccountFilter>({ kind: "all" });
+  // Init từ localStorage — uid lúc mount có thể null (chưa login), khi đó
+  // load trả về "all". Effect [uid] phía dưới sẽ re-load khi uid xuất hiện.
+  const [filter, setFilterState] = useState<AccountFilter>(() =>
+    loadAccountFilter(uid),
+  );
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+
+  /// Mirror uid vào ref — refresh + setFilter callback đọc qua ref để tránh
+  /// stale closure: App.tsx capture refreshAccounts ở mount-time với uid=null
+  /// (auth chưa load), khi callback execute async sau đó, uid thực sự đã có
+  /// nhưng closure giữ null → persistAccountFilter no-op → state đổi nhưng
+  /// storage không update.
+  const uidRef = useRef(uid);
+  useEffect(() => {
+    uidRef.current = uid;
+  }, [uid]);
+
+  /// Wrap setFilter — mọi thay đổi filter đều persist ngay theo uid hiện tại.
+  /// User chuyển TK trong dropdown → reload app vẫn giữ TK đã chọn.
+  const setFilter = useCallback((f: AccountFilter) => {
+    setFilterState(f);
+    persistAccountFilter(uidRef.current, f);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -79,6 +130,25 @@ export function AccountProvider({ children }: AccountProviderProps) {
         }
         return prev;
       });
+      // Validate persisted filter — account đã bị xóa từ máy khác (sync pull)
+      // hoặc user xóa thủ công thì filter trỏ id rỗng → query empty. Fallback
+      // về "all" + persist update để lần sau không lặp lại.
+      //
+      // CRITICAL: chỉ validate khi `list` có ít nhất 1 account. List rỗng có
+      // thể do DB chưa ready ở refresh đầu mount (sync chưa pull xong) — wipe
+      // ở đây sẽ ăn mất filter user đã save. Khi sync pull xong, refresh sẽ
+      // chạy lại với list thật và validate đúng. Edge case "user thật sự xóa
+      // hết account" rất hiếm + harmless (filter Y vô nghĩa, query trả empty,
+      // user pick "all" thủ công).
+      if (list.length > 0) {
+        setFilterState((prev) => {
+          if (prev.kind !== "account") return prev;
+          if (list.some((a) => a.id === prev.id)) return prev;
+          const fallback: AccountFilter = { kind: "all" };
+          persistAccountFilter(uidRef.current, fallback);
+          return fallback;
+        });
+      }
     } catch (e) {
       console.error("[accounts] refresh failed:", e);
     }
@@ -94,9 +164,13 @@ export function AccountProvider({ children }: AccountProviderProps) {
   //
   // Refresh thực sự do `useCloudSync.onRemoteApplied` trigger SAU khi switch
   // hoàn tất (xem App.tsx `onRemoteApplied` callback).
+  //
+  // Filter: load từ localStorage cho uid mới (per-uid storage). Mỗi user có
+  // filter riêng — switch user A→B sẽ load filter của B, không leak filter
+  // của A. Logout (uid=null) reset về "all".
   useEffect(() => {
     setAccounts(null);
-    setFilter({ kind: "all" });
+    setFilterState(loadAccountFilter(uid));
     setActiveAccountId(null);
   }, [uid]);
 

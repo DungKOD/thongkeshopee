@@ -20,6 +20,7 @@ import {
   fmtVnd,
   profitTone,
   roiTone,
+  toneIconClass,
   toneTextClass,
   type AggregatedProductRow,
   type OverviewTotals,
@@ -468,7 +469,7 @@ function PrimaryKpiRow({
         icon="payments"
         label="Hoa hồng gross"
         value={fmtVnd(totals.commission)}
-        tone="neutral"
+        tone="commission"
         sub={`GMV ${fmtVnd(totals.orderValueTotal)}`}
       />
       {showAds ? (
@@ -476,7 +477,7 @@ function PrimaryKpiRow({
           icon="shopping_bag"
           label="Tổng tiền chạy"
           value={fmtVnd(totals.totalSpend)}
-          tone="muted"
+          tone="spend"
           sub={`${fmtInt(totals.clicks)} click ADS`}
         />
       ) : (
@@ -511,8 +512,8 @@ function SecondaryKpiRow({
     totals.orders > 0 ? totals.commission / totals.orders : null;
 
   const gridCols = showAds
-    ? "md:grid-cols-3 lg:grid-cols-6"
-    : "md:grid-cols-2 lg:grid-cols-4";
+    ? "md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7"
+    : "md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5";
   return (
     <section className={`grid grid-cols-2 gap-3 ${gridCols}`}>
       {showAds && (
@@ -532,6 +533,7 @@ function SecondaryKpiRow({
           label="CPC (FB)"
           value={cpc !== null ? fmtVnd(cpc) : "—"}
           icon="paid"
+          tone="spend"
           tooltip="CPC = Tổng tiền chạy / Click ADS"
         />
       )}
@@ -540,6 +542,7 @@ function SecondaryKpiRow({
           label="CPC thực tế"
           value={cpcShopee !== null ? fmtVnd(cpcShopee) : "—"}
           icon="request_quote"
+          tone="spend"
           tooltip="CPC thực tế = Tổng tiền chạy / Click Shopee"
         />
       )}
@@ -557,14 +560,21 @@ function SecondaryKpiRow({
         label="Tỷ lệ chuyển đổi"
         value={cr !== null ? fmtPct(cr) : "—"}
         icon="trending_up"
-        sub={avgOrder !== null ? `GMV TB ${fmtVnd(avgOrder)}` : undefined}
         tooltip="CR = Số đơn / Click Shopee × 100%"
       />
       <SmallKpi
         label="GMV"
         value={fmtVnd(totals.orderValueTotal)}
         icon="payments"
+        tone="commission"
         tooltip="Tổng Giá trị đơn hàng"
+      />
+      <SmallKpi
+        label="Giá trị đơn hàng TB"
+        value={avgOrder !== null ? fmtVnd(avgOrder) : "—"}
+        icon="receipt_long"
+        tone="commission"
+        tooltip="AOV = GMV / Số đơn — giá trị trung bình mỗi đơn hàng"
       />
     </section>
   );
@@ -586,7 +596,9 @@ function BigKpi({
   return (
     <div className="rounded-xl bg-surface-4 p-5 shadow-elev-2 transition-shadow hover:shadow-elev-4">
       <div className="flex items-center gap-2">
-        <span className="material-symbols-rounded text-lg text-white/40">{icon}</span>
+        <span className={`material-symbols-rounded text-lg ${toneIconClass(tone)}`}>
+          {icon}
+        </span>
         <p className="text-xs font-semibold uppercase tracking-wider text-white/55">
           {label}
         </p>
@@ -612,20 +624,25 @@ function SmallKpi({
   icon,
   sub,
   tooltip,
+  tone = "neutral",
 }: {
   label: string;
   value: string;
   icon: string;
   sub?: string;
   tooltip?: string;
+  /** Brand tone — spend/commission color icon. Default neutral (white/40). */
+  tone?: Tone;
 }) {
+  const iconCls =
+    tone === "neutral" ? "text-white/35" : toneIconClass(tone);
   return (
     <div
       className="rounded-lg bg-surface-2 px-4 py-3 shadow-elev-1"
       title={tooltip}
     >
       <div className="flex items-center gap-1.5">
-        <span className="material-symbols-rounded text-sm text-white/35">{icon}</span>
+        <span className={`material-symbols-rounded text-sm ${iconCls}`}>{icon}</span>
         <p className={`text-[11px] font-medium uppercase tracking-wider text-white/55 ${tooltip ? "cursor-help" : ""}`}>
           {label}
         </p>

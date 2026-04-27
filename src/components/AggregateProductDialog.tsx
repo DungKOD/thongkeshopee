@@ -7,8 +7,11 @@ import {
   fmtInt,
   fmtPct,
   fmtVnd,
+  toneIconClass,
+  toneTextClass,
   type AggregatedProductRow,
   type SourceFilter,
+  type Tone,
 } from "../formulas";
 import { useSettings } from "../hooks/useSettings";
 import { invoke } from "../lib/tauri";
@@ -305,6 +308,7 @@ export function AggregateProductDialog({
               label="Số đơn"
               value={fmtInt(product.ordersCount)}
               sub={fmtVnd(product.commissionTotal) + " hoa hồng"}
+              tone="commission"
             />
             {showAds ? (
               <KpiCard
@@ -316,7 +320,7 @@ export function AggregateProductDialog({
                     ? `${fmtInt(product.adsClicks)} click · CPC ${cpc !== null ? fmtVnd(cpc) : "—"}`
                     : undefined
                 }
-                tone="muted"
+                tone="spend"
               />
             ) : (
               <KpiCard
@@ -426,6 +430,9 @@ export function AggregateProductDialog({
                   <table className="w-full border-collapse text-xs">
                     <thead>
                       <tr className="bg-surface-4 text-shopee-200">
+                        <th className="border-b border-surface-8 px-2 py-2.5 text-center font-semibold uppercase tracking-wider">
+                          #
+                        </th>
                         <th className="border-b border-surface-8 px-3 py-2.5 text-center font-semibold uppercase tracking-wider">
                           Ngày
                         </th>
@@ -468,6 +475,9 @@ export function AggregateProductDialog({
                             key={`${it.orderId}-${it.itemId}-${it.modelId}-${idx}`}
                             className="border-b border-surface-8 last:border-b-0 text-white/85 transition-colors hover:bg-shopee-500/15"
                           >
+                            <td className="whitespace-nowrap px-2 py-2 text-center tabular-nums text-white/40">
+                              {idx + 1}
+                            </td>
                             <td
                               className="whitespace-nowrap px-3 py-2 text-center tabular-nums text-white/70"
                               title={it.orderTime ?? undefined}
@@ -641,18 +651,12 @@ function KpiCard({
   label: string;
   value: string;
   sub?: string;
-  tone?: "positive" | "negative" | "neutral" | "muted";
+  tone?: Tone;
 }) {
-  const toneMap: Record<string, string> = {
-    positive: "text-green-400",
-    negative: "text-red-400",
-    neutral: "text-white",
-    muted: "text-white/70",
-  };
   return (
     <div className="rounded-xl bg-surface-4 p-4 shadow-elev-2 transition-shadow hover:shadow-elev-4">
       <div className="flex items-center gap-1.5">
-        <span className="material-symbols-rounded text-base text-white/40">
+        <span className={`material-symbols-rounded text-base ${toneIconClass(tone)}`}>
           {icon}
         </span>
         <p className="text-[11px] font-medium uppercase tracking-wider text-white/55">
@@ -660,7 +664,7 @@ function KpiCard({
         </p>
       </div>
       <p
-        className={`num-glow mt-1.5 truncate text-2xl font-bold tabular-nums ${toneMap[tone]}`}
+        className={`num-glow mt-1.5 truncate text-2xl font-bold tabular-nums ${toneTextClass(tone)}`}
         title={value}
       >
         {value}

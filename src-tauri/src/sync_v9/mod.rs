@@ -22,6 +22,7 @@ pub mod client;
 pub mod compaction;
 pub mod compress;
 pub mod content_id;
+pub mod dedup;
 pub mod descriptors;
 pub mod event_log;
 pub mod hlc;

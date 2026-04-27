@@ -10,7 +10,10 @@ interface ImportPreviewDialogProps {
   /// Account id mà toàn bộ Shopee file trong batch sẽ tag về. User chọn ở
   /// ImportAccountPickerDialog trước khi pick file → dialog này chỉ hiển thị.
   shopeeAccountId: string | null;
-  onConfirm: () => Promise<void>;
+  /// User confirm import. `fbTaxRates` map index FB file → % thuế (0..100).
+  /// Shopee/rejected file index không có entry. App layer forward sang
+  /// `commitCsvBatch`.
+  onConfirm: (fbTaxRates: Record<number, number>) => Promise<void>;
   onCancel: () => void;
 }
 
@@ -23,11 +26,16 @@ export function ImportPreviewDialog({
   const { accounts } = useAccounts();
   const [committing, setCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /// State per-file tax rate. Key = index trong batch.files (giữ nguyên qua
+  /// re-render vì batch.files không reorder). Value = % (0..100, 2 decimal).
+  /// Reset mỗi lần batch đổi (useEffect dưới).
+  const [taxRates, setTaxRates] = useState<Record<number, number>>({});
 
   useEffect(() => {
     if (!batch) return;
     setError(null);
     setCommitting(false);
+    setTaxRates({});
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !committing) onCancel();
     };
@@ -49,7 +57,7 @@ export function ImportPreviewDialog({
     setCommitting(true);
     setError(null);
     try {
-      await onConfirm();
+      await onConfirm(taxRates);
     } catch (e) {
       setError((e as Error).message ?? String(e));
       setCommitting(false);
@@ -60,11 +68,60 @@ export function ImportPreviewDialog({
     if (e.target === e.currentTarget && !committing) onCancel();
   };
 
-  // Chỉ skip file duplicate trong cùng batch (FE detect). File hash match
-  // với DB vẫn cho commit — Rust reuse entry cũ + UPSERT idempotent.
-  const isSkipped = (p: typeof batch.files[0]["preview"]) => p.batchDuplicate;
-  const activeFiles = batch.files.filter((f) => !isSkipped(f.preview));
-  const duplicateFiles = batch.files.filter((f) => isSkipped(f.preview));
+  // 3 trạng thái loại trừ commit: rejected (parse-stage fail), batchDuplicate
+  // (cùng hash trong batch). File hash match với DB vẫn cho commit — Rust reuse
+  // entry cũ + UPSERT idempotent. Rejected ưu tiên hơn duplicate khi cả 2 cờ
+  // bật (rejected file không có rawContent nên không thể là duplicate, nhưng
+  // vẫn phòng hờ).
+  const isRejected = (p: typeof batch.files[0]["preview"]) => p.rejected === true;
+  const isDuplicate = (p: typeof batch.files[0]["preview"]) =>
+    !isRejected(p) && p.batchDuplicate;
+  const isInactive = (p: typeof batch.files[0]["preview"]) =>
+    isRejected(p) || isDuplicate(p);
+
+  const activeFiles = batch.files.filter((f) => !isInactive(f.preview));
+  const duplicateFiles = batch.files.filter((f) => isDuplicate(f.preview));
+  const rejectedFiles = batch.files.filter((f) => isRejected(f.preview));
+
+  // Multi-day batch: user dễ scan nếu rows nhóm theo ngày. Sort active theo
+  // dayDate ASC rồi filename, rejected/duplicate xuống cuối (dayDate="").
+  // Map item → original index trong batch.files để state taxRates dùng key
+  // ổn định, không bị shift theo sort order.
+  const origIndexMap = new Map(
+    batch.files.map((item, idx) => [item, idx] as const),
+  );
+  const sortedFiles = [...batch.files].sort((a, b) => {
+    const aInactive = isInactive(a.preview);
+    const bInactive = isInactive(b.preview);
+    if (aInactive !== bInactive) return aInactive ? 1 : -1;
+    const dateCmp = a.preview.dayDate.localeCompare(b.preview.dayDate);
+    if (dateCmp !== 0) return dateCmp;
+    return a.preview.filename.localeCompare(b.preview.filename);
+  });
+
+  // Detect multi-day để show hint trong footer. Expand range
+  // dayDateFrom..dayDateTo cho mỗi file (Shopee có thể span nhiều ngày trong
+  // 1 file) → union vào set để count chính xác. ISO date string sort + add
+  // 1 day = 86400000ms hoạt động vì JS parse "YYYY-MM-DD" thành UTC midnight.
+  const coveredDays = (() => {
+    const set = new Set<string>();
+    for (const f of activeFiles) {
+      const from = f.preview.dayDateFrom;
+      const to = f.preview.dayDateTo || from;
+      if (!from) continue;
+      const startMs = Date.parse(from);
+      const endMs = Date.parse(to);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        set.add(from);
+        continue;
+      }
+      for (let ms = startMs; ms <= endMs; ms += 86_400_000) {
+        set.add(new Date(ms).toISOString().slice(0, 10));
+      }
+    }
+    return set;
+  })();
+  const isMultiDay = coveredDays.size > 1;
   const hashMatchActive = activeFiles.filter((f) => f.preview.hashMatch);
   const totalReplace = activeFiles.reduce(
     (a, f) => a + f.preview.replaceRows,
@@ -80,14 +137,17 @@ export function ImportPreviewDialog({
       f.parsed.kind === "shopee_clicks" ||
       f.parsed.kind === "shopee_commission",
   );
-  const allDuplicates = activeFiles.length === 0 && duplicateFiles.length > 0;
+  // Không có gì để commit — chỉ rejected/duplicate. Disable confirm button.
+  const noActiveFiles = activeFiles.length === 0;
 
-  // Date range của batch (toàn file) — hiện ở header.
+  // Date range chỉ tính trên file active — rejected có dayDate="" sẽ làm hỏng
+  // sort. Nếu mọi file inactive → header hiện "Không có file để import".
   const dateRange = (() => {
-    const from = batch.files
+    if (activeFiles.length === 0) return null;
+    const from = activeFiles
       .map((f) => f.preview.dayDateFrom)
       .sort()[0];
-    const to = batch.files
+    const to = activeFiles
       .map((f) => f.preview.dayDateTo)
       .sort()
       .reverse()[0];
@@ -117,7 +177,7 @@ export function ImportPreviewDialog({
               id="import-preview-title"
               className="text-lg font-semibold text-white/90"
             >
-              {dateRange}
+              {dateRange ?? "Không có file hợp lệ để import"}
             </h2>
           </div>
           <div className="shrink-0 text-right text-xs">
@@ -139,6 +199,32 @@ export function ImportPreviewDialog({
                 account_circle
               </span>{" "}
               Shopee files sẽ tag về TK: <b>{accountName}</b>
+            </div>
+          )}
+
+          {rejectedFiles.length > 0 && (
+            <div
+              role="alert"
+              className="rounded-lg border-2 border-red-500 bg-red-950/40 px-4 py-3 text-sm"
+            >
+              <p className="mb-2 font-semibold text-red-200">
+                <span className="material-symbols-rounded align-middle text-base">
+                  block
+                </span>{" "}
+                {rejectedFiles.length} file bị bỏ qua (không thể import):
+              </p>
+              <ul className="space-y-1 pl-6 text-xs text-white/80">
+                {rejectedFiles.map((f, i) => (
+                  <li key={i}>
+                    <div className="truncate font-medium" title={f.preview.filename}>
+                      • {f.preview.filename}
+                    </div>
+                    <div className="pl-3 text-red-300/90">
+                      {f.preview.rejectReason ?? "Không rõ lý do"}
+                    </div>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
@@ -232,7 +318,9 @@ export function ImportPreviewDialog({
               </span>
               <div className="flex-1 space-y-1">
                 <p className="text-sm font-bold uppercase tracking-wide text-amber-300">
-                  Ngày này đã có data — sẽ replace một số dòng
+                  {isMultiDay
+                    ? "Một số ngày trong batch đã có data — sẽ replace một số dòng"
+                    : "Ngày này đã có data — sẽ replace một số dòng"}
                 </p>
                 <p className="text-xs text-white/70">
                   Các dòng trùng identity sẽ bị ghi đè giá trị mới. Dòng không
@@ -256,6 +344,12 @@ export function ImportPreviewDialog({
                   <th className="border-b border-surface-8 px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider">
                     Ngày
                   </th>
+                  <th
+                    className="border-b border-surface-8 px-2 py-2 text-center text-[11px] font-semibold uppercase tracking-wider"
+                    title="Thuế % cho FB ad spend (VAT/business tax). Spend × (1 + thuế/100) = chi phí thật"
+                  >
+                    Thuế %
+                  </th>
                   <th className="border-b border-surface-8 px-3 py-2 text-right text-[11px] font-semibold uppercase tracking-wider">
                     Tổng
                   </th>
@@ -268,32 +362,55 @@ export function ImportPreviewDialog({
                 </tr>
               </thead>
               <tbody>
-                {batch.files.map(({ preview }, i) => {
-                  const isDup = isSkipped(preview);
-                  const dateCell =
-                    preview.dayDateFrom === preview.dayDateTo
+                {sortedFiles.map((item, i) => {
+                  const { parsed, preview } = item;
+                  const rej = isRejected(preview);
+                  const dup = isDuplicate(preview);
+                  const inactive = rej || dup;
+                  const isFb =
+                    parsed.kind === "fb_ad_group" ||
+                    parsed.kind === "fb_campaign";
+                  const origIdx = origIndexMap.get(item) ?? -1;
+                  const taxValue = taxRates[origIdx] ?? 0;
+                  const dateCell = rej
+                    ? "—"
+                    : preview.dayDateFrom === preview.dayDateTo
                       ? fmtDate(preview.dayDateFrom)
                       : `${fmtDate(preview.dayDateFrom)} → ${fmtDate(preview.dayDateTo)}`;
+                  const rowClass = rej
+                    ? "bg-red-950/20 text-white/40 line-through"
+                    : dup
+                      ? "bg-amber-950/20 text-white/40 line-through"
+                      : "text-white/80 hover:bg-shopee-500/15";
                   return (
                     <tr
                       key={i}
-                      className={`border-b border-surface-8 last:border-b-0 transition-colors ${
-                        isDup
-                          ? "bg-amber-950/20 text-white/40 line-through"
-                          : "text-white/80 hover:bg-shopee-500/15"
-                      }`}
+                      className={`border-b border-surface-8 last:border-b-0 transition-colors ${rowClass}`}
                     >
                       <td className="px-3 py-2">
-                        <span className="inline-flex items-center gap-1.5 rounded-full bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-200">
-                          {kindLabel(preview.kind)}
-                        </span>
+                        {rej ? (
+                          <span className="inline-flex items-center gap-1.5 rounded-full bg-red-900/40 px-2 py-0.5 text-xs font-medium text-red-200 no-underline">
+                            <span className="material-symbols-rounded text-[12px]">
+                              block
+                            </span>
+                            Lỗi
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 rounded-full bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-200">
+                            {kindLabel(preview.kind)}
+                          </span>
+                        )}
                       </td>
                       <td
                         className="max-w-[260px] truncate px-3 py-2 text-xs"
-                        title={preview.filename}
+                        title={
+                          rej
+                            ? `${preview.filename} — ${preview.rejectReason ?? ""}`
+                            : preview.filename
+                        }
                       >
                         {preview.filename}
-                        {!isDup && preview.hashMatch && (
+                        {!inactive && preview.hashMatch && (
                           <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-blue-500/20 px-2 py-0.5 text-[10px] font-medium text-blue-300">
                             <span className="material-symbols-rounded text-[10px]">
                               restart_alt
@@ -305,21 +422,63 @@ export function ImportPreviewDialog({
                       <td className="px-3 py-2 text-xs text-white/60 tabular-nums">
                         {dateCell}
                       </td>
+                      <td className="px-1 py-1 text-center">
+                        {isFb && !inactive ? (
+                          <input
+                            type="number"
+                            min={0}
+                            max={100}
+                            step={0.01}
+                            // Hiển thị empty khi tax=0 (default) để user gõ
+                            // "10" KHÔNG ra "010". placeholder show "0" gợi ý
+                            // default. Khi taxValue=0 → input rỗng → user gõ
+                            // "1" thành "1" thẳng, không append vào "0".
+                            value={taxValue === 0 ? "" : taxValue}
+                            placeholder="0"
+                            disabled={committing}
+                            // Wheel scroll mặc định tăng/giảm number input —
+                            // gây khó chịu khi user scroll trong dialog.
+                            // Blur input khi wheel → mất focus → wheel
+                            // không sửa value.
+                            onWheel={(e) => (e.target as HTMLInputElement).blur()}
+                            onChange={(e) => {
+                              const raw = e.target.value;
+                              // Empty input → reset về 0 (không phải undefined để
+                              // Number(...) downstream khỏi NaN). Người dùng xóa hết
+                              // thường có ý reset.
+                              if (raw === "") {
+                                setTaxRates((m) => ({ ...m, [origIdx]: 0 }));
+                                return;
+                              }
+                              const n = Number(raw);
+                              if (!Number.isFinite(n)) return;
+                              // Clamp 0..100. Decimal precision do step=0.01 lo;
+                              // không round thêm vì user gõ "8.25" → giữ nguyên f64.
+                              const clamped = Math.min(100, Math.max(0, n));
+                              setTaxRates((m) => ({ ...m, [origIdx]: clamped }));
+                            }}
+                            className="w-16 rounded border border-surface-8 bg-surface-2 px-1.5 py-0.5 text-center text-xs tabular-nums text-white/85 focus:border-shopee-400 focus:outline-none disabled:opacity-50"
+                            aria-label={`Thuế % cho ${preview.filename}`}
+                          />
+                        ) : (
+                          <span className="text-white/30">—</span>
+                        )}
+                      </td>
                       <td className="px-3 py-2 text-right tabular-nums">
-                        {fmtInt(preview.totalRows)}
+                        {rej ? "—" : fmtInt(preview.totalRows)}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-green-400">
-                        {!isDup && preview.newRows > 0 ? "+" : ""}
-                        {isDup ? "—" : fmtInt(preview.newRows)}
+                        {!inactive && preview.newRows > 0 ? "+" : ""}
+                        {inactive ? "—" : fmtInt(preview.newRows)}
                       </td>
                       <td
                         className={`px-3 py-2 text-right tabular-nums ${
-                          !isDup && preview.replaceRows > 0
+                          !inactive && preview.replaceRows > 0
                             ? "text-amber-300"
                             : "text-white/30"
                         }`}
                       >
-                        {isDup
+                        {inactive
                           ? "—"
                           : preview.replaceRows > 0
                             ? `⟳ ${fmtInt(preview.replaceRows)}`
@@ -341,11 +500,17 @@ export function ImportPreviewDialog({
 
         <footer className="flex shrink-0 items-center justify-between gap-2 border-t border-surface-8 bg-surface-1 px-6 py-3">
           <p className="text-xs text-white/50">
-            {allDuplicates
+            {noActiveFiles
               ? "Không có file nào để commit."
               : hasReplacements
               ? "Xác nhận sẽ ghi đè các dòng trùng. Data không trùng được giữ nguyên."
               : "Tất cả dòng sẽ được thêm mới."}
+            {!noActiveFiles && isMultiDay && (
+              <span className="ml-2 text-white/40">
+                · {activeFiles.length} file qua {coveredDays.size} ngày,
+                mỗi file 1 transaction riêng.
+              </span>
+            )}
           </p>
           <div className="flex gap-2">
             <button
@@ -354,14 +519,14 @@ export function ImportPreviewDialog({
               disabled={committing}
               className="btn-ripple rounded-lg px-5 py-2 text-sm font-medium text-white/80 hover:bg-white/5 disabled:opacity-50"
             >
-              Hủy
+              {noActiveFiles ? "Đóng" : "Hủy"}
             </button>
             <button
               type="button"
               onClick={handleConfirm}
               disabled={
                 committing ||
-                allDuplicates ||
+                noActiveFiles ||
                 (hasAnyShopee && shopeeAccountId === null)
               }
               className={`btn-ripple flex items-center gap-2 rounded-lg px-5 py-2 text-sm font-semibold text-white shadow-elev-2 hover:shadow-elev-4 disabled:cursor-not-allowed disabled:opacity-50 ${

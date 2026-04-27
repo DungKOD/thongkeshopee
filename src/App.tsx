@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { DayBlock } from "./components/DayBlock";
 import { OverviewTab } from "./components/OverviewTab";
 import { SubIdTimelineBlock } from "./components/SubIdTimelineBlock";
@@ -14,9 +21,14 @@ import {
   prevMonthRange,
   useFilterMode,
 } from "./hooks/useFilterMode";
-import { SettingsProvider, useSettings } from "./hooks/useSettings";
+import {
+  APP_SETTING_MUTATION_EVENT,
+  SettingsProvider,
+  useSettings,
+} from "./hooks/useSettings";
 import { useToast } from "./components/ToastProvider";
 import { commitCsvBatch, previewCsvBatch } from "./lib/dbImport";
+import { invoke } from "./lib/tauri";
 import type { PreviewBatch } from "./lib/dbImport";
 import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
@@ -135,6 +147,18 @@ function AppInner() {
   const { view: adminView, busy: adminBusy, exit: adminExit } = useAdminView();
   const inAdminView = adminView !== null;
 
+  // Settings (clickSources / profitFees / autoSyncEnabled) sync qua app_settings
+  // table — same pipeline với data. SettingsProvider fire window event sau mỗi
+  // mutate; relay sang markMutation để useCloudSync đăng ký dirty + debounce
+  // push 45s (hoặc ngay khi user bấm "Đồng bộ ngay"). Đồng bộ với data nghĩa là
+  // user tắt autoSync → settings cũng KHÔNG push tự động cho đến khi force.
+  useEffect(() => {
+    const handler = () => markMutation();
+    window.addEventListener(APP_SETTING_MUTATION_EVENT, handler);
+    return () =>
+      window.removeEventListener(APP_SETTING_MUTATION_EVENT, handler);
+  }, [markMutation]);
+
 
   // Sync v2: pull-merge-push. Khi vào app: metadata check; nếu dirty hoặc remote
   // mới + khác máy → pull-merge-push + refetch UI. UI chặn overlay suốt startup
@@ -147,15 +171,35 @@ function AppInner() {
   // account list. AccountContext dep uid-change đã refetch lần 1, nhưng race
   // với switch_db_to_user (AccountContext effect fire trước switch xong) →
   // cần re-trigger ở đây để đảm bảo list account đúng sau khi DB swapped.
+  // useSettings phải khai báo trước onRemoteApplied vì callback dùng reload.
+  // Các setter consume bên dưới ổn vì closure (đã giữ ở phần sau bên dưới).
+  const settingsCtx = useSettings();
+
   const onRemoteApplied = useCallback(async () => {
     await refetch();
     await refreshAccounts();
-  }, [refetch, refreshAccounts]);
+    // Settings reload sau DB swap — fix race: SettingsProvider mount với pre-auth
+    // DB → list rỗng → defer migration; remote_applied = swap đã xong + initial
+    // pull đã merge → reload từ user DB thật + retry migration nếu localStorage
+    // legacy vẫn còn.
+    await settingsCtx.reload();
+  }, [refetch, refreshAccounts, settingsCtx]);
 
   // L1 form-dirty defer state — update sau khi entryDialog/previewBatch
   // state được khai báo (phía dưới). Khởi tạo false; effect sau set-true
   // khi form mở, useCloudSync re-run với giá trị mới.
   const [pausedByForm, setPausedByForm] = useState(false);
+
+  // useSettings đã được lấy ở `settingsCtx` phía trên (cần cho onRemoteApplied
+  // .reload). Destructure lại các setter từ ctx để không thay đổi call sites.
+  const {
+    settings,
+    setClickSource,
+    registerSources,
+    setProfitFee,
+    setAutoSyncEnabled,
+    hydrated: settingsHydrated,
+  } = settingsCtx;
 
   const {
     status: syncStatus,
@@ -170,8 +214,23 @@ function AppInner() {
     mutationVersion,
     enabled: !inAdminView,
     pausedByForm,
+    autoSyncEnabled: settings.autoSyncEnabled,
     onRemoteApplied,
   });
+
+  // Trigger settings reload + migration KHI startup phase settles (DB swap +
+  // initial pull đã xong). Cover fresh user case: không có remote data →
+  // onRemoteApplied không fire → reload() không bao giờ chạy → migration kẹt.
+  // Settle = isStartupPhase chuyển true→false → reload chắc chắn DB user-owned.
+  const prevStartupPhaseRef = useRef(isStartupPhase);
+  useEffect(() => {
+    const prev = prevStartupPhaseRef.current;
+    prevStartupPhaseRef.current = isStartupPhase;
+    if (prev && !isStartupPhase) {
+      // Vừa settle: DB swap xong, an toàn migrate + load.
+      void settingsCtx.reload();
+    }
+  }, [isStartupPhase, settingsCtx]);
 
   // Khi swap sang DB khác (hoặc thoát) → refetch + clear pending changes
   // của admin (pending state UI không hợp lệ với DB mới).
@@ -303,15 +362,18 @@ function AppInner() {
   }, []);
 
   const { showToast } = useToast();
-  const { settings, setClickSource, registerSources, setProfitFee } =
-    useSettings();
 
   // Auto-register referrers từ DB vào settings.clickSources.
   // Mỗi khi DB thay đổi (import mới, xóa, v.v.) → refetch → referrers mới → register.
   // registerSources chỉ thêm referrer mới (default enabled), không đụng trạng thái cũ.
+  //
+  // Bug B fix: gate trên settingsHydrated. Nếu fire trước hydrate, registerSources
+  // sẽ bị skip (internal guard) → referrer không được persist. Effect re-run khi
+  // hydrated flip false→true để pick up referrers đã có từ initial refetch.
   useEffect(() => {
+    if (!settingsHydrated) return;
     if (referrers.length > 0) registerSources(referrers);
-  }, [referrers, registerSources]);
+  }, [settingsHydrated, referrers, registerSources]);
 
 
   const isAdmin = useIsAdmin();
@@ -423,9 +485,15 @@ function AppInner() {
     }
   };
 
-  const handleConfirmImport = useCallback(async () => {
+  const handleConfirmImport = useCallback(async (
+    fbTaxRates: Record<number, number>,
+  ) => {
     if (!previewBatch || importAccountId === null) return;
-    const results = await commitCsvBatch(previewBatch, importAccountId);
+    const results = await commitCsvBatch(
+      previewBatch,
+      importAccountId,
+      fbTaxRates,
+    );
     await refreshAccounts();
     const totalNew = results.reduce((a, r) => a + r.inserted, 0);
     const totalReplace = results.reduce((a, r) => a + r.duplicated, 0);
@@ -592,6 +660,7 @@ function AppInner() {
           lastSyncAt={lastSyncAt}
           error
           onRetry={() => void authSignOut()}
+          extraActions={<OpenDataDirButton />}
         />
       );
     }
@@ -615,6 +684,7 @@ function AppInner() {
 
   return (
     <main className="min-h-full bg-surface-0 pb-24">
+      <OfflineBanner />
       {inAdminView && adminView && (
         <AdminViewBanner
           email={adminView.email}
@@ -645,13 +715,6 @@ function AppInner() {
           </div>
           <div className="flex items-center gap-2">
             {!inAdminView && (
-              <UpdatesDropdown
-                currentVersion={__APP_VERSION__}
-                repo="DungKOD/thongkeshopee"
-                limit={10}
-              />
-            )}
-            {!inAdminView && (
               <SyncBadge
                 status={syncStatus}
                 lastSyncAt={lastSyncAt}
@@ -659,6 +722,14 @@ function AppInner() {
                 hasRemoteChangePending={hasRemoteChangePending}
                 error={syncError}
                 onForce={forceSync}
+                autoSyncEnabled={settings.autoSyncEnabled}
+              />
+            )}
+            {!inAdminView && (
+              <UpdatesDropdown
+                currentVersion={__APP_VERSION__}
+                repo="DungKOD/thongkeshopee"
+                limit={10}
               />
             )}
             {!inAdminView && (
@@ -1069,7 +1140,7 @@ function AppInner() {
                     days={days}
                     pendingRowDeletes={pendingRowDeletes}
                     onToggleRowDelete={(r) =>
-                      toggleRowPending(r.dayDate, r.subIds)
+                      toggleRowPending(r.dayDate, r.subIds, r.accountId)
                     }
                     onEditRow={(r) =>
                       setEntryDialog({ date: r.dayDate, row: r })
@@ -1086,7 +1157,7 @@ function AppInner() {
                       pendingRowDeletes={pendingRowDeletes}
                       onToggleDayDelete={toggleDayPending}
                       onToggleRowDelete={(r) =>
-                        toggleRowPending(r.dayDate, r.subIds)
+                        toggleRowPending(r.dayDate, r.subIds, r.accountId)
                       }
                       onEditRow={(r) =>
                         setEntryDialog({ date: r.dayDate, row: r })
@@ -1121,6 +1192,7 @@ function AppInner() {
         productsCount={overview.totalRowsCount}
         onToggleClickSource={setClickSource}
         onSetProfitFee={setProfitFee}
+        onSetAutoSyncEnabled={setAutoSyncEnabled}
         onClose={() => setSettingsOpen(false)}
         onImportReverted={() => {
           // Revert = mutation (xóa raw rows, mark file reverted_at) → phải
@@ -1146,10 +1218,12 @@ function AppInner() {
           initialDate={entryDialog.date}
           initialRow={entryDialog.row}
           // Priority: row đang edit có manual → dùng account của row đó (không
-          // reassign sang active). Thêm mới + filter account → dùng filter id
-          // để gán vào đúng bucket user đang xem. Fallback cuối: activeAccountId.
+          // reassign sang active). Sau đó row.accountId (per-account split khi
+          // filter=All) → giữ đúng acc của row visible. Thêm mới + filter account
+          // → dùng filter id. Fallback cuối: activeAccountId.
           shopeeAccountId={
             entryDialog.row?.shopeeAccountId ??
+            entryDialog.row?.accountId ??
             (accountFilter.kind === "account" ? accountFilter.id : activeAccountId)
           }
           onSave={handleSaveEntry}
@@ -1332,7 +1406,14 @@ function TabButton({ active, onClick, icon, label }: TabButtonProps) {
 }
 
 function AuthGate() {
-  const { user, loading: authLoading } = useAuth();
+  const {
+    user,
+    loading: authLoading,
+    authError,
+    deviceCheckError,
+    deviceRevoked,
+    signOut: authSignOut,
+  } = useAuth();
   const { status, expiredAt } = usePremium();
   // Track online/offline để bypass paywall khi offline. User đã login rồi
   // (auth.currentUser còn nhờ browserLocalPersistence) → cho phép dùng local
@@ -1356,6 +1437,45 @@ function AuthGate() {
   useSelfPresence();
 
   if (authLoading) return <SplashScreen title="Đang tải..." />;
+
+  // AuthContext không xác định được state (Firebase init fail / 10s timeout).
+  // Hiện splash error + nút Reload — không có user object thì không có gì
+  // sửa được, reload để retry init từ đầu.
+  if (authError) {
+    return (
+      <SplashScreen
+        title="Lỗi xác thực"
+        subtitle={authError}
+        error
+        onRetry={() => window.location.reload()}
+      />
+    );
+  }
+
+  // Device gate: AuthContext đã check; nếu blocked, hiện splash với nút
+  // đăng xuất. Hiển thị TRƯỚC paywall/admin-view để user không truy cập
+  // được data trước khi xác nhận.
+  if (user && deviceCheckError) {
+    return (
+      <SplashScreen
+        title="Không thể đăng nhập trên thiết bị này"
+        subtitle={deviceCheckError}
+        error
+        onRetry={() => void authSignOut()}
+      />
+    );
+  }
+  if (user && deviceRevoked) {
+    return (
+      <SplashScreen
+        title="Thiết bị đã bị admin gỡ"
+        subtitle="Phiên đăng nhập trên máy này đã bị admin thu hồi. Đăng xuất rồi đăng nhập lại — nếu vẫn không vào được, liên hệ admin (vnz.luffy@gmail.com)."
+        error
+        onRetry={() => void authSignOut()}
+      />
+    );
+  }
+
   if (!user) return <LoginScreen />;
 
   // Offline bypass: user đã auth (token cached qua browserLocalPersistence).
@@ -1368,6 +1488,33 @@ function AuthGate() {
     if (status === "loading") return <SplashScreen title="Đang tải..." />;
     if (status === "inactive" || status === "expired") {
       return <PaywallScreen expiredAt={expiredAt} reason={status} />;
+    }
+    // Verify_failed: Firestore không emit profile trong 8s + chưa có cached
+    // (lần đầu login máy này). Hiện splash error với 2 nút: "Thử lại" reload
+    // (force re-init listener) và "Đăng xuất". Tránh treo splash mãi.
+    if (status === "verify_failed") {
+      return (
+        <SplashScreen
+          title="Không xác minh được trạng thái tài khoản"
+          subtitle={
+            "Không kết nối được Firestore để check premium. Có thể do mạng chập chờn hoặc Firebase đang lỗi. " +
+            "Bấm 'Thử lại' để reload — nếu vẫn không vào được, đăng xuất rồi thử lại sau."
+          }
+          error
+          onRetry={() => window.location.reload()}
+          retryLabel="Thử lại"
+          retryIcon="refresh"
+          extraActions={
+            <button
+              onClick={() => void authSignOut()}
+              className="btn-ripple flex items-center gap-2 rounded-lg border border-white/20 bg-white/5 px-4 py-2 text-sm font-medium text-white/80 hover:bg-white/15"
+            >
+              <span className="material-symbols-rounded text-base">logout</span>
+              Đăng xuất
+            </button>
+          }
+        />
+      );
     }
   }
 
@@ -1429,12 +1576,20 @@ function SplashScreen({
   lastSyncAt,
   error,
   onRetry,
+  retryLabel = "Đăng xuất và thử lại",
+  retryIcon = "logout",
+  extraActions,
 }: {
   title: string;
   subtitle?: string;
   lastSyncAt?: Date | null;
   error?: boolean;
   onRetry?: () => void;
+  retryLabel?: string;
+  retryIcon?: string;
+  /** Render thêm 1 hoặc nhiều nút phụ dưới retry. Dùng khi error cần
+   *  multi-action (vd "Mở thư mục data" để user inspect/repair DB). */
+  extraActions?: ReactNode;
 }) {
   return (
     <main className="min-h-screen bg-surface-0 px-6 text-white">
@@ -1465,13 +1620,93 @@ function SplashScreen({
               onClick={onRetry}
               className="btn-ripple mt-2 flex items-center gap-2 rounded-lg border border-white/40 bg-white/10 px-4 py-2 text-sm font-medium text-white hover:bg-white/20"
             >
-              <span className="material-symbols-rounded text-base">logout</span>
-              Đăng xuất và thử lại
+              <span className="material-symbols-rounded text-base">{retryIcon}</span>
+              {retryLabel}
             </button>
           )}
+          {extraActions}
         </div>
       </div>
     </main>
+  );
+}
+
+/// Banner sticky ở top khi `navigator.onLine === false`. Báo user app đang
+/// dùng data local, sync sẽ resume tự động khi mạng về. Dismissible per
+/// session để không che view nếu user biết và muốn ẩn — sẽ hiện lại lần
+/// vào app kế tiếp khi vẫn offline. Listen native online/offline events.
+function OfflineBanner() {
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const [dismissed, setDismissed] = useState(false);
+  useEffect(() => {
+    const onOnline = () => {
+      setIsOffline(false);
+      setDismissed(false);
+    };
+    const onOffline = () => setIsOffline(true);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+  if (!isOffline || dismissed) return null;
+  return (
+    <div
+      className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-xs text-amber-100"
+      role="status"
+    >
+      <span className="material-symbols-rounded text-base text-amber-300">
+        wifi_off
+      </span>
+      <span className="flex-1">
+        Đang offline — chỉ dùng data local. Sync sẽ tự resume khi có mạng.
+      </span>
+      <button
+        onClick={() => setDismissed(true)}
+        className="rounded-md px-2 py-0.5 text-amber-200/80 hover:bg-amber-500/15 hover:text-amber-100"
+        title="Ẩn banner"
+        aria-label="Ẩn banner offline"
+      >
+        <span className="material-symbols-rounded text-sm">close</span>
+      </button>
+    </div>
+  );
+}
+
+/// Nút "Mở thư mục data" hiện trong startup error splash. Cho user mở folder
+/// `app_data_dir` (root) trong Explorer — user navigate vào `users/{uid}/`
+/// thủ công để inspect/repair (xóa DB corrupt, copy backup, etc.).
+///
+/// CRITICAL: KHÔNG dùng `get_app_data_paths` Tauri command vì nó lock DbState
+/// để đọc PRAGMA. Khi `switch_db_to_user` fail, DbState vẫn trỏ pre-auth DB
+/// → `active_db_path` trả pre-auth path → user mở SAI folder. Dùng Tauri
+/// path API client-side trực tiếp — chỉ phụ thuộc app handle, không DbState.
+function OpenDataDirButton() {
+  const handleOpen = async () => {
+    try {
+      const [{ appDataDir }, { openPath }] = await Promise.all([
+        import("@tauri-apps/api/path"),
+        import("@tauri-apps/plugin-opener"),
+      ]);
+      const dir = await appDataDir();
+      // openPath cho folder = mở trong Explorer (default app cho directory).
+      await openPath(dir);
+    } catch (e) {
+      console.warn("[OpenDataDirButton] failed:", e);
+      alert(`Không mở được thư mục: ${(e as Error).message}`);
+    }
+  };
+  return (
+    <button
+      onClick={() => void handleOpen()}
+      className="btn-ripple flex items-center gap-2 rounded-lg border border-white/20 bg-white/5 px-4 py-2 text-sm font-medium text-white/80 hover:bg-white/15"
+      title="Mở Explorer vào app_data_dir — navigate vào users/{uid}/ để xem/sửa DB"
+    >
+      <span className="material-symbols-rounded text-base">folder_open</span>
+      Mở thư mục data
+    </button>
   );
 }
 

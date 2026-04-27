@@ -342,10 +342,20 @@ fn aggregate_rows_for_day(
         // float drift nếu data có fractional VND. `weighted_cpc_sum` giữ f64
         // (dùng làm numerator trong division → drift không tích lũy qua nhiều
         // row — chỉ được chia 1 lần cuối).
+        //
+        // Tax-aware (v2): mỗi row có cột `tax_rate` (% — VAT/business tax mà
+        // TK FB chịu). Spend thực = `spend * (1 + tax_rate/100)`. Áp dụng
+        // PER-ROW (trước SUM) để mix tax rates giữa file vẫn đúng. Khi
+        // tax_rate=0 (default cho data cũ + most TK), expression collapse về
+        // spend * 1.0 → bit-identical với behavior pre-v2.
+        //
+        // CPC weighted: clicks * cpc * (1 + tax_rate/100) — clicks không ảnh
+        // hưởng bởi tax, chỉ cost mới taxed. Identity: SUM(clicks * cpc_taxed)
+        // / SUM(clicks) = weighted CPC tax-aware.
         let mut stmt = conn.prepare(
             "WITH ranked AS (
                 SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-                       level, spend, clicks, cpc, impressions,
+                       level, spend, clicks, cpc, impressions, tax_rate,
                        MIN(CASE level WHEN 'ad_group' THEN 0 ELSE 1 END)
                          OVER (PARTITION BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5)
                          AS preferred_rank
@@ -353,11 +363,11 @@ fn aggregate_rows_for_day(
                 WHERE day_date = ?
              )
              SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-                    COALESCE(SUM(CAST(ROUND(spend * 100) AS INTEGER)), 0),
+                    COALESCE(SUM(CAST(ROUND(spend * (1.0 + tax_rate / 100.0) * 100) AS INTEGER)), 0),
                     SUM(impressions),
                     SUM(clicks),
                     SUM(CASE WHEN clicks IS NOT NULL AND cpc IS NOT NULL
-                             THEN clicks * cpc ELSE 0 END)
+                             THEN clicks * cpc * (1.0 + tax_rate / 100.0) ELSE 0 END)
              FROM ranked
              WHERE (CASE level WHEN 'ad_group' THEN 0 ELSE 1 END) = preferred_rank
              GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5",
@@ -379,9 +389,12 @@ fn aggregate_rows_for_day(
         }
     }
 
-    // Shopee clicks (grouped by tuple + referrer)
+    // Shopee clicks (grouped by tuple + referrer + account_id).
+    // account_id=0 = row chưa có shopee_account_id (legacy data); FE quy về
+    // Mặc định bucket khi populate accumulator.
     struct ShopeeClick {
         canonical: Canonical,
+        account_id: i64,
         referrer: String,
         count: i64,
     }
@@ -389,6 +402,7 @@ fn aggregate_rows_for_day(
     {
         let mut sql = String::from(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                    COALESCE(shopee_account_id, 0) AS acc,
                     COALESCE(referrer, '(khác)') AS ref, COUNT(*) AS cnt
              FROM raw_shopee_clicks
              WHERE day_date = ?",
@@ -396,7 +410,7 @@ fn aggregate_rows_for_day(
         if account_id_eq.is_some() {
             sql.push_str(" AND shopee_account_id = ?");
         }
-        sql.push_str(" GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, ref");
+        sql.push_str(" GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, acc, ref");
         let mut stmt = conn.prepare(&sql)?;
         let params_vec: Vec<Box<dyn rusqlite::ToSql>> = if let Some(id) = account_id_eq {
             vec![Box::new(day_date.to_string()), Box::new(id)]
@@ -410,8 +424,9 @@ fn aggregate_rows_for_day(
                 [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
             Ok(ShopeeClick {
                 canonical: to_canonical(tuple),
-                referrer: r.get(5)?,
-                count: r.get(6)?,
+                account_id: r.get(5)?,
+                referrer: r.get(6)?,
+                count: r.get(7)?,
             })
         })?;
         for row in iter {
@@ -426,6 +441,7 @@ fn aggregate_rows_for_day(
     // thành f64 khi populate UiRow cuối cùng.
     struct ShopeeOrder {
         canonical: Canonical,
+        account_id: i64,
         orders: i64,
         commission_cents: i64,
         /// Commission từ đơn trạng thái có rủi ro bị huỷ/hoàn — FE dùng để
@@ -443,6 +459,7 @@ fn aggregate_rows_for_day(
     {
         let mut sql = String::from(
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                    COALESCE(shopee_account_id, 0) AS acc,
                     COUNT(DISTINCT order_id),
                     COALESCE(SUM(CAST(ROUND(net_commission * 100) AS INTEGER)), 0),
                     COALESCE(SUM(CASE WHEN order_status IN ('Đang chờ xử lý', 'Chưa thanh toán')
@@ -456,7 +473,7 @@ fn aggregate_rows_for_day(
         if account_id_eq.is_some() {
             sql.push_str(" AND shopee_account_id = ?");
         }
-        sql.push_str(" GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5");
+        sql.push_str(" GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, acc");
         let mut stmt = conn.prepare(&sql)?;
         let params_vec: Vec<Box<dyn rusqlite::ToSql>> = if let Some(id) = account_id_eq {
             vec![Box::new(day_date.to_string()), Box::new(id)]
@@ -470,11 +487,12 @@ fn aggregate_rows_for_day(
                 [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
             Ok(ShopeeOrder {
                 canonical: to_canonical(tuple),
-                orders: r.get(5)?,
-                commission_cents: r.get(6)?,
-                commission_pending_cents: r.get(7)?,
-                order_value_cents: r.get(8)?,
-                mcn_fee_cents: r.get(9)?,
+                account_id: r.get(5)?,
+                orders: r.get(6)?,
+                commission_cents: r.get(7)?,
+                commission_pending_cents: r.get(8)?,
+                order_value_cents: r.get(9)?,
+                mcn_fee_cents: r.get(10)?,
             })
         })?;
         for row in iter {
@@ -594,12 +612,63 @@ fn aggregate_rows_for_day(
     });
 
     // ============================================================
-    // Phase 3: aggregate vào Accumulator theo representative.
+    // Phase 3: aggregate vào Accumulator theo (representative, account_id).
     //
-    // Monetary fields (spend, commission, order_value) accumulate ở **integer
-    // cents (i64)** để tránh float drift khi nhiều tuple merge vào cùng anchor
-    // (f64 `+=` non-associative). Convert cents → f64 khi populate UiRow cuối.
+    // Khi filter=All và 1 tuple có data của nhiều Shopee account, mỗi acc
+    // thành 1 row riêng — không merge cross-account vì hoa hồng/đơn của
+    // acc nào phải về acc đó. account_id=None chỉ dành cho FB ad mà tuple
+    // có ≥2 Shopee owner trên cùng ngày → "FB chung", FE hiển thị badge
+    // riêng (không thể quy về 1 acc nào).
+    //
+    // Khi filter=Account(X): SQL Shopee/manual đã restrict X, FB sau retain
+    // còn lại cũng map về X → key đồng nhất, behavior không khác trước.
+    //
+    // Monetary fields accumulate ở integer cents (i64) — tránh f64 drift
+    // (non-associative) khi nhiều tuple merge vào cùng anchor.
     // ============================================================
+
+    // Account name lookup — 1 query/call. Dùng lúc populate UiRow.
+    let account_names: HashMap<i64, String> = {
+        let mut stmt = conn.prepare("SELECT id, name FROM shopee_accounts")?;
+        let iter = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        iter.collect::<rusqlite::Result<HashMap<_, _>>>()?
+    };
+
+    // Map account_id thô từ SQL (0 = legacy NULL) → bucket key. Trả None khi
+    // = 0 và không có Mặc định trong DB (edge case lỗi setup; row vẫn được
+    // group nhưng không gán acc).
+    let bucket_for_shopee = |acc_id: i64| -> Option<i64> {
+        if acc_id == 0 {
+            default_id
+        } else {
+            Some(acc_id)
+        }
+    };
+
+    // FB attribution → bucket key:
+    // - filter=Account(X): luôn X (đã retain tuple thuộc X ở phía trên).
+    // - filter=All: 0 owner → Mặc định; 1 owner → owner đó; ≥2 owner → None
+    //   (FB chung — không gán được duy nhất 1 acc, render row riêng).
+    let fb_bucket_for = |canonical: &Canonical| -> Option<i64> {
+        match account_filter {
+            AccountFilterMode::Account { id } => Some(*id),
+            AccountFilterMode::All => {
+                let rep = resolve(canonical);
+                let owners = owners_for_day.get(&rep);
+                let owner_ids: Vec<i64> = owners
+                    .map(|s| s.iter().copied().filter(|v| *v != 0).collect())
+                    .unwrap_or_default();
+                match owner_ids.len() {
+                    0 => default_id,
+                    1 => Some(owner_ids[0]),
+                    _ => None,
+                }
+            }
+        }
+    };
+
+    type Key = (Canonical, Option<i64>);
+
     struct Accumulator {
         display_name: String,
         ads_clicks: Option<i64>,
@@ -628,7 +697,7 @@ fn aggregate_rows_for_day(
         shopee_account_id: Option<i64>,
     }
 
-    let mut map: HashMap<Canonical, Accumulator> = HashMap::new();
+    let mut map: HashMap<Key, Accumulator> = HashMap::new();
     let make_empty = |c: &Canonical| Accumulator {
         display_name: default_name(c),
         ads_clicks: None,
@@ -652,7 +721,9 @@ fn aggregate_rows_for_day(
     // FB ads (đã dedup ad_group ưu tiên trong SQL).
     for r in fb_ads {
         let rep = resolve(&r.canonical);
-        let entry = map.entry(rep.clone()).or_insert_with(|| make_empty(&rep));
+        let bucket = fb_bucket_for(&r.canonical);
+        let key: Key = (rep.clone(), bucket);
+        let entry = map.entry(key).or_insert_with(|| make_empty(&rep));
         entry.has_fb = true;
         entry.spend_cents = Some(entry.spend_cents.unwrap_or(0) + r.spend_cents);
         if r.imps.is_some() {
@@ -673,7 +744,8 @@ fn aggregate_rows_for_day(
     // Shopee clicks
     for r in shopee_clicks {
         let rep = resolve(&r.canonical);
-        let entry = map.entry(rep.clone()).or_insert_with(|| make_empty(&rep));
+        let key: Key = (rep.clone(), bucket_for_shopee(r.account_id));
+        let entry = map.entry(key).or_insert_with(|| make_empty(&rep));
         entry.has_shopee_clicks = true;
         entry.shopee_clicks_total += r.count;
         *entry
@@ -685,7 +757,8 @@ fn aggregate_rows_for_day(
     // Shopee orders
     for r in shopee_orders {
         let rep = resolve(&r.canonical);
-        let entry = map.entry(rep.clone()).or_insert_with(|| make_empty(&rep));
+        let key: Key = (rep.clone(), bucket_for_shopee(r.account_id));
+        let entry = map.entry(key).or_insert_with(|| make_empty(&rep));
         entry.has_shopee_orders = true;
         entry.orders_count += r.orders;
         entry.commission_cents += r.commission_cents;
@@ -697,7 +770,13 @@ fn aggregate_rows_for_day(
     // Manual entries — override field, display_name chỉ khi không có sub_id.
     for r in manuals {
         let rep = resolve(&r.canonical);
-        let entry = map.entry(rep.clone()).or_insert_with(|| make_empty(&rep));
+        // Manual entry account_id luôn NOT NULL (schema), nhưng `Option<i64>`
+        // ở struct local. Fallback 0 → bucket_for_shopee để giữ logic chung.
+        let key: Key = (
+            rep.clone(),
+            bucket_for_shopee(r.shopee_account_id.unwrap_or(0)),
+        );
+        let entry = map.entry(key).or_insert_with(|| make_empty(&rep));
         entry.has_manual = true;
         entry.shopee_account_id = r.shopee_account_id;
         // Display name rule: nếu canonical empty (no sub_id) + manual có name → dùng.
@@ -735,10 +814,10 @@ fn aggregate_rows_for_day(
     // Accumulate day-level totals BEFORE row-0 filter — KPI phải đúng 100%
     // với raw data kể cả khi tuple chỉ có click (không spend/commission) bị
     // filter khỏi row display.
-    let canonicals: Vec<(Canonical, Accumulator)> = map.into_iter().collect();
-    let mut rows: Vec<UiRow> = Vec::with_capacity(canonicals.len());
+    let entries: Vec<(Key, Accumulator)> = map.into_iter().collect();
+    let mut rows: Vec<UiRow> = Vec::with_capacity(entries.len());
     let mut day_totals = crate::db::types::UiDayTotals::default();
-    for (c, acc) in canonicals {
+    for ((c, account_id), acc) in entries {
         let total_spend = acc.spend_cents.map(|c| c as f64 / 100.0);
         let commission_total = acc.commission_cents as f64 / 100.0;
         let commission_pending = acc.commission_pending_cents as f64 / 100.0;
@@ -779,6 +858,10 @@ fn aggregate_rows_for_day(
             continue;
         }
 
+        let account_name = account_id
+            .as_ref()
+            .and_then(|id| account_names.get(id).cloned());
+
         rows.push(UiRow {
             day_date: day_date.to_string(),
             sub_ids: canonical_to_array(&c),
@@ -798,10 +881,23 @@ fn aggregate_rows_for_day(
             has_shopee_orders: acc.has_shopee_orders,
             has_manual: acc.has_manual,
             shopee_account_id: acc.shopee_account_id,
+            account_id,
+            account_name,
         });
     }
 
-    rows.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    // Sort: tên SP A→Z, account name A→Z (tie-break) — giữ ổn định khi cùng
+    // tuple có nhiều account, FB chung (None) xếp cuối.
+    rows.sort_by(|a, b| {
+        a.display_name
+            .cmp(&b.display_name)
+            .then_with(|| match (&a.account_name, &b.account_name) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+    });
     Ok((rows, day_totals))
 }
 
@@ -974,25 +1070,46 @@ pub struct OrderItemDetail {
 /// Matching theo prefix-compatible (xem `representative` ở aggregate). Order có
 /// canonical là prefix của `sub_ids` truyền vào (hoặc ngược lại) đều match.
 #[tauri::command]
+// `account_id`: Khi filter=All và row split per-account, chỉ trả orders của
+// đúng account đó. None hoặc empty = no filter (dialog aggregate cross-account).
+// FE serialize string vì content_id hash > 2^53.
 pub fn get_order_items_for_row(
     state: State<'_, DbState>,
     day_date: String,
     sub_ids: [String; 5],
+    account_id: Option<String>,
 ) -> CmdResult<Vec<OrderItemDetail>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let target_canonical = to_canonical(sub_ids);
 
-    let mut stmt = conn.prepare(
+    let account_id_filter: Option<i64> = account_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i64>().ok());
+
+    let mut sql = String::from(
         "SELECT order_id, checkout_id, item_id, model_id, item_name,
                 shop_name, order_status, order_time, click_time, completed_time,
                 price, quantity, order_value, net_commission, commission_total,
                 channel, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
          FROM raw_shopee_order_items
-         WHERE day_date = ?
-         ORDER BY order_time DESC",
-    )?;
+         WHERE day_date = ?",
+    );
+    if account_id_filter.is_some() {
+        sql.push_str(" AND shopee_account_id = ?");
+    }
+    sql.push_str(" ORDER BY order_time DESC");
+    let mut stmt = conn.prepare(&sql)?;
 
-    let iter = stmt.query_map(params![day_date], |r| {
+    let params_vec: Vec<Box<dyn rusqlite::ToSql>> = if let Some(id) = account_id_filter {
+        vec![Box::new(day_date.clone()), Box::new(id)]
+    } else {
+        vec![Box::new(day_date.clone())]
+    };
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+
+    let iter = stmt.query_map(params_refs.as_slice(), |r| {
         let subs: [String; 5] = [
             r.get(16)?,
             r.get(17)?,
@@ -1910,6 +2027,250 @@ mod tests {
         assert!(ov.oldest_date.is_none());
         assert!(ov.newest_date.is_none());
         assert!(ov.all_sub_ids.is_empty());
+    }
+
+    // ========================================================================
+    // Multi-account aggregate split — 2 acc Shopee cùng ngày tách thành rows
+    // riêng theo (canonical, account_id). Bảo vệ regression v0.4.5+.
+    // ========================================================================
+
+    fn seed_account(conn: &Connection, name: &str) -> i64 {
+        // shopee_accounts.id là INTEGER PRIMARY KEY → autoincrement nếu không
+        // truyền giá trị. Tests gen id liên tục từ DB (1, 2, ...).
+        conn.execute(
+            "INSERT INTO shopee_accounts(name, created_at) VALUES(?, datetime('now'))",
+            params![name],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn seed_imported_file(conn: &Connection, kind: &str, day_date: &str) -> i64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Counter unique per process — tránh file_hash collision khi 1 test gọi
+        // helper nhiều lần (UNIQUE(file_hash) trên imported_files).
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        conn.execute(
+            "INSERT OR IGNORE INTO days(date, created_at) VALUES(?, ?)",
+            params![day_date, format!("{day_date}T00:00:00Z")],
+        )
+        .unwrap();
+        let filename = format!("test-{kind}-{day_date}-{seq}.csv");
+        conn.execute(
+            "INSERT INTO imported_files(filename, kind, imported_at, file_hash, day_date)
+             VALUES(?, ?, datetime('now'), ?, ?)",
+            params![&filename, kind, format!("hash-{filename}-{seq}"), day_date],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Insert 1 raw_shopee_order_items row. Mỗi call = 1 đơn riêng (DISTINCT
+    /// order_id) → có thể seed N call để bơm orders_count.
+    fn seed_shopee_order(
+        conn: &Connection,
+        day_date: &str,
+        account_id: i64,
+        sub_ids: [&str; 5],
+        order_seq: i64,
+        net_commission: f64,
+        order_value: f64,
+    ) {
+        let file_id = seed_imported_file(conn, "shopee_orders", day_date);
+        conn.execute(
+            "INSERT INTO raw_shopee_order_items
+             (order_id, checkout_id, item_id, model_id, order_status,
+              order_value, net_commission,
+              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              day_date, source_file_id, shopee_account_id)
+             VALUES(?, ?, ?, '', 'Đã hoàn thành', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                format!("ORD-{account_id}-{order_seq}"),
+                format!("CHK-{account_id}-{order_seq}"),
+                format!("ITM-{account_id}-{order_seq}"),
+                order_value,
+                net_commission,
+                sub_ids[0],
+                sub_ids[1],
+                sub_ids[2],
+                sub_ids[3],
+                sub_ids[4],
+                day_date,
+                file_id,
+                account_id,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seed_fb_ad(
+        conn: &Connection,
+        day_date: &str,
+        sub_ids: [&str; 5],
+        spend: f64,
+        clicks: i64,
+    ) {
+        let file_id = seed_imported_file(conn, "fb_ads", day_date);
+        conn.execute(
+            "INSERT INTO raw_fb_ads
+             (level, name, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              spend, clicks, day_date, source_file_id)
+             VALUES('campaign', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                format!("camp-{}", sub_ids.join("-")),
+                sub_ids[0],
+                sub_ids[1],
+                sub_ids[2],
+                sub_ids[3],
+                sub_ids[4],
+                spend,
+                clicks,
+                day_date,
+                file_id,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn multi_account_same_tuple_splits_into_separate_rows() {
+        let conn = seed_conn();
+        let acc_a = seed_account(&conn, "ShopA");
+        let acc_b = seed_account(&conn, "ShopB");
+        let date = "2026-04-20";
+        seed_day(&conn, date);
+
+        // Cả 2 acc đều có 1 đơn cùng tuple sub_id, commission khác nhau.
+        seed_shopee_order(&conn, date, acc_a, ["camp", "x", "", "", ""], 1, 100.0, 1000.0);
+        seed_shopee_order(&conn, date, acc_b, ["camp", "x", "", "", ""], 2, 200.0, 2000.0);
+
+        let days =
+            list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        assert_eq!(days.len(), 1);
+        let day = &days[0];
+        // Phải tách thành 2 rows riêng — KHÔNG merge cross-account.
+        assert_eq!(day.rows.len(), 2, "expected 1 row per account");
+
+        let row_a = day.rows.iter().find(|r| r.account_id == Some(acc_a)).unwrap();
+        let row_b = day.rows.iter().find(|r| r.account_id == Some(acc_b)).unwrap();
+        assert_eq!(row_a.commission_total, 100.0);
+        assert_eq!(row_a.account_name.as_deref(), Some("ShopA"));
+        assert_eq!(row_b.commission_total, 200.0);
+        assert_eq!(row_b.account_name.as_deref(), Some("ShopB"));
+
+        // Day totals = sum across accounts (KPI tổng vẫn đúng).
+        assert_eq!(day.totals.commission_total, 300.0);
+        assert_eq!(day.totals.orders_count, 2);
+    }
+
+    #[test]
+    fn fb_with_two_owners_creates_fb_chung_row() {
+        let conn = seed_conn();
+        let acc_a = seed_account(&conn, "ShopA");
+        let acc_b = seed_account(&conn, "ShopB");
+        let date = "2026-04-21";
+        seed_day(&conn, date);
+
+        // Cùng tuple — 2 acc Shopee đều có order, FB ad cũng cùng tuple.
+        seed_shopee_order(&conn, date, acc_a, ["camp", "y", "", "", ""], 1, 50.0, 500.0);
+        seed_shopee_order(&conn, date, acc_b, ["camp", "y", "", "", ""], 2, 70.0, 700.0);
+        seed_fb_ad(&conn, date, ["camp", "y", "", "", ""], 999.0, 100);
+
+        let days =
+            list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+
+        // 3 rows: 1 cho A (Shopee), 1 cho B (Shopee), 1 cho FB chung (None).
+        assert_eq!(day.rows.len(), 3, "expected A + B + FB chung");
+        let fb_chung = day
+            .rows
+            .iter()
+            .find(|r| r.account_id.is_none())
+            .expect("expected FB chung row");
+        assert!(fb_chung.account_name.is_none());
+        assert_eq!(fb_chung.total_spend, Some(999.0));
+        assert!(fb_chung.has_fb);
+        assert!(!fb_chung.has_shopee_orders);
+
+        // Spend không được duplicate sang A/B — nằm 1 chỗ duy nhất ở FB chung.
+        let row_a = day.rows.iter().find(|r| r.account_id == Some(acc_a)).unwrap();
+        let row_b = day.rows.iter().find(|r| r.account_id == Some(acc_b)).unwrap();
+        assert_eq!(row_a.total_spend, None);
+        assert_eq!(row_b.total_spend, None);
+        // Day total spend chỉ count 1 lần (no double count).
+        assert_eq!(day.totals.total_spend, 999.0);
+    }
+
+    #[test]
+    fn fb_with_single_owner_merges_with_that_account() {
+        let conn = seed_conn();
+        let acc_a = seed_account(&conn, "ShopA");
+        let date = "2026-04-22";
+        seed_day(&conn, date);
+
+        seed_shopee_order(&conn, date, acc_a, ["camp", "z", "", "", ""], 1, 80.0, 800.0);
+        seed_fb_ad(&conn, date, ["camp", "z", "", "", ""], 500.0, 50);
+
+        let days =
+            list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+        // 1 owner → FB merge thẳng vào row của owner đó (behavior single-acc cũ).
+        assert_eq!(day.rows.len(), 1);
+        let row = &day.rows[0];
+        assert_eq!(row.account_id, Some(acc_a));
+        assert_eq!(row.total_spend, Some(500.0));
+        assert_eq!(row.commission_total, 80.0);
+        assert!(row.has_fb && row.has_shopee_orders);
+    }
+
+    #[test]
+    fn account_filter_returns_only_target_account_rows() {
+        let conn = seed_conn();
+        let acc_a = seed_account(&conn, "ShopA");
+        let acc_b = seed_account(&conn, "ShopB");
+        let date = "2026-04-23";
+        seed_day(&conn, date);
+
+        seed_shopee_order(&conn, date, acc_a, ["camp", "x", "", "", ""], 1, 100.0, 1000.0);
+        seed_shopee_order(&conn, date, acc_b, ["camp", "x", "", "", ""], 2, 200.0, 2000.0);
+        seed_fb_ad(&conn, date, ["camp", "x", "", "", ""], 999.0, 100);
+
+        let days = list_days_with_rows_impl(
+            &conn,
+            DaysFilter {
+                account_filter: Some(AccountFilterMode::Account { id: acc_a }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let day = &days[0];
+        // Filter=A → chỉ 1 row, FB attribute cho A (đã match owner A).
+        assert_eq!(day.rows.len(), 1);
+        assert_eq!(day.rows[0].account_id, Some(acc_a));
+        assert_eq!(day.rows[0].commission_total, 100.0);
+        assert_eq!(day.rows[0].total_spend, Some(999.0));
+    }
+
+    #[test]
+    fn legacy_default_account_seed_assigns_default_to_orphan_fb() {
+        let conn = seed_conn();
+        let date = "2026-04-24";
+        seed_day(&conn, date);
+
+        // Chỉ có FB ad — không có Shopee owner nào → FB phải gắn Mặc định.
+        seed_fb_ad(&conn, date, ["camp", "lonely", "", "", ""], 300.0, 30);
+        let default_id = default_account_id_lookup(&conn).expect("Mặc định seeded");
+
+        let days =
+            list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+        assert_eq!(day.rows.len(), 1);
+        assert_eq!(day.rows[0].account_id, Some(default_id));
+        assert_eq!(
+            day.rows[0].account_name.as_deref(),
+            Some(DEFAULT_ACCOUNT_NAME)
+        );
     }
 
     // ========================================================================

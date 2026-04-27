@@ -17,7 +17,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,7 +24,7 @@ use tauri::State;
 
 use crate::db::{resolve_active_imports_dir, DbState};
 
-use super::{CmdError, CmdResult};
+use super::{assert_not_bootstrapping, CmdError, CmdResult};
 
 // ============================================================
 // Shared helpers
@@ -256,9 +255,17 @@ pub fn import_shopee_clicks(
     };
 
     let hash = compute_hash(&payload.raw_content);
-    let now = Utc::now().to_rfc3339();
+    // Bug F fix: chuẩn hoá `Z` format. Cursor column `imported_at` của
+    // imported_files được sync_v9 capture/compare lex — mix `+00:00` với
+    // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
+    // bị xếp trước row có `Z` regardless of timestamp → cursor advance
+    // bypass row → next sync skip.
+    let now = crate::sync_v9::hlc::now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: reject mutation trong bootstrap snapshot restore window.
+    // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
+    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -434,9 +441,17 @@ pub fn import_shopee_orders(
     };
 
     let hash = compute_hash(&payload.raw_content);
-    let now = Utc::now().to_rfc3339();
+    // Bug F fix: chuẩn hoá `Z` format. Cursor column `imported_at` của
+    // imported_files được sync_v9 capture/compare lex — mix `+00:00` với
+    // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
+    // bị xếp trước row có `Z` regardless of timestamp → cursor advance
+    // bypass row → next sync skip.
+    let now = crate::sync_v9::hlc::now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: reject mutation trong bootstrap snapshot restore window.
+    // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
+    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -675,12 +690,33 @@ fn normalize_cpc(
     link.or(all).or(cost_per_result)
 }
 
+/// Validate tax_rate range: 0..=100. NaN/Infinity reject. Negative reject.
+/// Trả về giá trị hợp lệ hoặc CmdError. UI cũng có client-side check nhưng BE
+/// vẫn validate để chống payload nhân tạo / API call trực tiếp gửi sai.
+pub(super) fn validate_tax_rate(rate: f64) -> CmdResult<f64> {
+    if !rate.is_finite() {
+        return Err(CmdError::msg(
+            "tax_rate không hợp lệ (NaN/Infinity)",
+        ));
+    }
+    if !(0.0..=100.0).contains(&rate) {
+        return Err(CmdError::msg(format!(
+            "tax_rate phải trong khoảng 0..100, nhận {rate}"
+        )));
+    }
+    Ok(rate)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportFbAdGroupsPayload {
     pub filename: String,
     pub raw_content: String,
     pub rows: Vec<FbAdGroupRow>,
+    /// Thuế % gắn cho cả file (TK FB chịu VAT/business tax). 0..=100, 2 decimal.
+    /// Áp cho tất cả rows trong file. Default 0 nếu FE không gửi (backward compat).
+    #[serde(default)]
+    pub tax_rate: f64,
 }
 
 /// Validate FB: report_start == report_end và toàn bộ row cùng ngày.
@@ -722,11 +758,20 @@ pub fn import_fb_ad_groups(
             .map(|r| (r.report_start.clone(), r.report_end.clone())),
         "FB Ad Group",
     )?;
+    let tax_rate = validate_tax_rate(payload.tax_rate)?;
 
     let hash = compute_hash(&payload.raw_content);
-    let now = Utc::now().to_rfc3339();
+    // Bug F fix: chuẩn hoá `Z` format. Cursor column `imported_at` của
+    // imported_files được sync_v9 capture/compare lex — mix `+00:00` với
+    // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
+    // bị xếp trước row có `Z` regardless of timestamp → cursor advance
+    // bypass row → next sync skip.
+    let now = crate::sync_v9::hlc::now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: reject mutation trong bootstrap snapshot restore window.
+    // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
+    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -782,6 +827,7 @@ pub fn import_fb_ad_groups(
                     cpc,
                     r.impressions,
                     r.reach,
+                    tax_rate,
                     day_date,
                     source_file_id,
                 ],
@@ -831,9 +877,9 @@ const FB_ADS_UPSERT_SQL: &str = "
     (id, level, name,
      sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
      report_start, report_end, status,
-     spend, clicks, cpc, impressions, reach,
+     spend, clicks, cpc, impressions, reach, tax_rate,
      day_date, source_file_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(day_date, level, name) DO UPDATE SET
        sub_id1 = excluded.sub_id1, sub_id2 = excluded.sub_id2,
        sub_id3 = excluded.sub_id3, sub_id4 = excluded.sub_id4,
@@ -845,6 +891,7 @@ const FB_ADS_UPSERT_SQL: &str = "
        cpc         = CASE WHEN COALESCE(excluded.cpc, 0)         > 0 THEN excluded.cpc         ELSE cpc         END,
        impressions = CASE WHEN COALESCE(excluded.impressions, 0) > 0 THEN excluded.impressions ELSE impressions END,
        reach       = CASE WHEN COALESCE(excluded.reach, 0)       > 0 THEN excluded.reach       ELSE reach       END,
+       tax_rate    = excluded.tax_rate,
        source_file_id = excluded.source_file_id
     RETURNING id
 ";
@@ -882,6 +929,9 @@ pub struct ImportFbCampaignsPayload {
     pub filename: String,
     pub raw_content: String,
     pub rows: Vec<FbCampaignRow>,
+    /// Thuế % gắn cho cả file. Xem doc ở `ImportFbAdGroupsPayload::tax_rate`.
+    #[serde(default)]
+    pub tax_rate: f64,
 }
 
 #[tauri::command]
@@ -896,11 +946,20 @@ pub fn import_fb_campaigns(
             .map(|r| (r.report_start.clone(), r.report_end.clone())),
         "FB Campaign",
     )?;
+    let tax_rate = validate_tax_rate(payload.tax_rate)?;
 
     let hash = compute_hash(&payload.raw_content);
-    let now = Utc::now().to_rfc3339();
+    // Bug F fix: chuẩn hoá `Z` format. Cursor column `imported_at` của
+    // imported_files được sync_v9 capture/compare lex — mix `+00:00` với
+    // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
+    // bị xếp trước row có `Z` regardless of timestamp → cursor advance
+    // bypass row → next sync skip.
+    let now = crate::sync_v9::hlc::now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    // Bug E fix: reject mutation trong bootstrap snapshot restore window.
+    // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
+    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -956,6 +1015,7 @@ pub fn import_fb_campaigns(
                     cpc,
                     r.impressions,
                     r.reach,
+                    tax_rate,
                     day_date,
                     source_file_id,
                 ],
@@ -1064,6 +1124,17 @@ mod tests {
         spend: Option<f64>,
         clicks: Option<i64>,
     ) -> i64 {
+        upsert_fb_ad_with_tax(conn, name, spend, clicks, 0.0)
+    }
+
+    /// Variant cho phép set tax_rate. `upsert_fb_ad` wrap với tax=0 (legacy).
+    fn upsert_fb_ad_with_tax(
+        conn: &rusqlite::Connection,
+        name: &str,
+        spend: Option<f64>,
+        clicks: Option<i64>,
+        tax_rate: f64,
+    ) -> i64 {
         let file_id = crate::sync_v9::content_id::imported_file_id("hash_x");
         let id = crate::sync_v9::content_id::fb_ad_id("2026-04-17", "ad_group", name);
         conn.query_row(
@@ -1080,6 +1151,7 @@ mod tests {
                 Option::<f64>::None, // cpc
                 Option::<i64>::None, // impressions
                 Option::<i64>::None, // reach
+                tax_rate,            // tax_rate
                 "2026-04-17",        // day_date
                 file_id,             // source_file_id
             ],
@@ -1154,5 +1226,131 @@ mod tests {
         let (s, c) = read_fb_ad(&conn, "ad_E");
         assert_eq!(s, Some(1500.0), "spend > 0 replace");
         assert_eq!(c, Some(40), "clicks 0 không đè");
+    }
+
+    // ========================================================
+    // tax_rate (v2) — precision + UPSERT semantics
+    // ========================================================
+
+    /// Đọc tax_rate column riêng cho test verify.
+    fn read_tax_rate(conn: &rusqlite::Connection, name: &str) -> f64 {
+        conn.query_row(
+            "SELECT tax_rate FROM raw_fb_ads WHERE name = ? AND day_date = '2026-04-17'",
+            [name],
+            |r| r.get::<_, f64>(0),
+        )
+        .unwrap()
+    }
+
+    /// Đọc taxed spend qua expression giống query.rs (cents). Verify precision
+    /// end-to-end qua cùng SQL pipeline production dùng.
+    fn read_taxed_spend_cents(conn: &rusqlite::Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT CAST(ROUND(spend * (1.0 + tax_rate / 100.0) * 100) AS INTEGER)
+             FROM raw_fb_ads WHERE name = ? AND day_date = '2026-04-17'",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tax_default_zero_preserves_legacy_behavior() {
+        let conn = fresh_db();
+        // upsert_fb_ad (legacy) → tax=0 → taxed spend = raw spend.
+        upsert_fb_ad(&conn, "ad_T0", Some(1_000_000.0), Some(50));
+        assert_eq!(read_tax_rate(&conn, "ad_T0"), 0.0);
+        // 1,000,000 VND * 1.00 * 100 = 100,000,000 cents
+        assert_eq!(read_taxed_spend_cents(&conn, "ad_T0"), 100_000_000);
+    }
+
+    #[test]
+    fn tax_10pct_on_round_million_exact() {
+        let conn = fresh_db();
+        upsert_fb_ad_with_tax(&conn, "ad_T10", Some(1_000_000.0), Some(50), 10.0);
+        assert_eq!(read_tax_rate(&conn, "ad_T10"), 10.0);
+        // 1,000,000 * 1.10 * 100 = 110,000,000 cents = 1,100,000 VND exact
+        assert_eq!(read_taxed_spend_cents(&conn, "ad_T10"), 110_000_000);
+    }
+
+    #[test]
+    fn tax_8_25pct_no_drift() {
+        let conn = fresh_db();
+        upsert_fb_ad_with_tax(&conn, "ad_T825", Some(1_234_567.0), Some(100), 8.25);
+        let cents = read_taxed_spend_cents(&conn, "ad_T825");
+        // Manual: 1,234,567 × 0.0825 = 101,851.7775 (exact: 1234567×33/400)
+        //         taxed = 1,234,567 + 101,851.7775 = 1,336,418.7775
+        //         × 100 = 133,641,877.5; ROUND half-to-even (SQLite/IEEE 754) = 133,641,878
+        // f64 noise quanh 1.0825: relative err ~1e-15, sau ×100 vẫn < 0.5 → ROUND ổn định.
+        assert_eq!(cents, 133_641_878, "expected 133,641,878 (= 1,336,418.78 VND)");
+    }
+
+    #[test]
+    fn tax_re_import_overwrites_rate() {
+        let conn = fresh_db();
+        // Lần 1: tax 5%
+        upsert_fb_ad_with_tax(&conn, "ad_TR", Some(2_000_000.0), Some(80), 5.0);
+        assert_eq!(read_tax_rate(&conn, "ad_TR"), 5.0);
+        // Lần 2: re-import same file với tax 10% → đè (Q1 design = A)
+        upsert_fb_ad_with_tax(&conn, "ad_TR", Some(2_000_000.0), Some(80), 10.0);
+        assert_eq!(read_tax_rate(&conn, "ad_TR"), 10.0, "re-import phải đè tax");
+        // taxed spend = 2,000,000 * 1.10 * 100 = 220,000,000 cents
+        assert_eq!(read_taxed_spend_cents(&conn, "ad_TR"), 220_000_000);
+    }
+
+    #[test]
+    fn tax_re_import_overwrites_to_zero() {
+        let conn = fresh_db();
+        // User lỡ tay nhập 10%, rồi correct về 0% → re-import phải đè 0 (KHÔNG
+        // có guard "không đè bằng 0" cho tax_rate, khác spend/clicks).
+        upsert_fb_ad_with_tax(&conn, "ad_TZ", Some(500_000.0), Some(20), 10.0);
+        assert_eq!(read_tax_rate(&conn, "ad_TZ"), 10.0);
+        upsert_fb_ad_with_tax(&conn, "ad_TZ", Some(500_000.0), Some(20), 0.0);
+        assert_eq!(
+            read_tax_rate(&conn, "ad_TZ"),
+            0.0,
+            "tax 0% phải đè (correction case)"
+        );
+    }
+
+    #[test]
+    fn tax_aggregate_mixed_rates_per_row_correct() {
+        let conn = fresh_db();
+        // 3 ad: tax khác nhau. SUM(taxed) phải = SUM(per-row taxed), không phải
+        // SUM(spend) * (1 + avg_tax/100).
+        upsert_fb_ad_with_tax(&conn, "ad_M1", Some(1_000_000.0), Some(50), 0.0);
+        upsert_fb_ad_with_tax(&conn, "ad_M2", Some(1_000_000.0), Some(50), 5.0);
+        upsert_fb_ad_with_tax(&conn, "ad_M3", Some(1_000_000.0), Some(50), 10.0);
+        let total_cents: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(CAST(ROUND(spend * (1.0 + tax_rate / 100.0) * 100) AS INTEGER)), 0)
+                 FROM raw_fb_ads WHERE day_date = '2026-04-17'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // 1M*1.0 + 1M*1.05 + 1M*1.10 = 3,150,000 → 315,000,000 cents
+        assert_eq!(total_cents, 315_000_000);
+    }
+
+    #[test]
+    fn validate_tax_rate_range() {
+        assert!(validate_tax_rate(0.0).is_ok());
+        assert!(validate_tax_rate(10.0).is_ok());
+        assert!(validate_tax_rate(100.0).is_ok());
+        assert!(validate_tax_rate(8.25).is_ok());
+        assert!(validate_tax_rate(-0.01).is_err(), "âm reject");
+        assert!(validate_tax_rate(100.01).is_err(), "> 100 reject");
+        assert!(validate_tax_rate(f64::NAN).is_err(), "NaN reject");
+        assert!(validate_tax_rate(f64::INFINITY).is_err(), "Infinity reject");
+    }
+
+    #[test]
+    fn tax_full_range_no_overflow() {
+        let conn = fresh_db();
+        // Spend lớn (1 tỷ) + tax max 100% — vẫn phải fit i64 cents.
+        // 1,000,000,000 * 2.0 * 100 = 200,000,000,000 cents = 2*10^11 << i64::MAX (~9.2*10^18)
+        upsert_fb_ad_with_tax(&conn, "ad_BIG", Some(1_000_000_000.0), Some(1), 100.0);
+        assert_eq!(read_taxed_spend_cents(&conn, "ad_BIG"), 200_000_000_000);
     }
 }

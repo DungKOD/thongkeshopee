@@ -8,6 +8,9 @@ import {
   fmtInt,
   fmtPct,
   fmtVnd,
+  toneIconClass,
+  toneTextClass,
+  type Tone,
 } from "../formulas";
 import { sumFiltered, useSettings } from "../hooks/useSettings";
 import { invoke } from "../lib/tauri";
@@ -82,11 +85,23 @@ export function ProductDetailDialog({
       setItems([]);
       return;
     }
+    // FB chung row (accountId=null) thường không có Shopee order vì bucket
+    // null chỉ dành cho FB ad ≥2 owner. Tuy nhiên nếu Mặc định không seeded
+    // (edge case lỗi setup) → bucket_for_shopee có thể trả None cho legacy
+    // raw → skip nhầm sẽ giấu data. Chỉ skip khi CHẮC CHẮN không có Shopee.
+    if (row.accountId === null && !row.hasShopeeOrders) {
+      setItems([]);
+      setLoadingItems(false);
+      return;
+    }
     let cancelled = false;
     setLoadingItems(true);
     invoke<OrderItemDetail[]>("get_order_items_for_row", {
       dayDate: row.dayDate,
       subIds: row.subIds,
+      // accountId scope orders chỉ cho TK của row hiện tại — tránh lẫn data
+      // 2 acc cùng tuple khi filter=All. Null = aggregate cross-account.
+      accountId: row.accountId,
     })
       .then((data) => {
         if (!cancelled) setItems(data);
@@ -264,6 +279,7 @@ export function ProductDetailDialog({
               label="Số đơn"
               value={fmtInt(row.ordersCount)}
               sub={fmtVnd(row.commissionTotal) + " hoa hồng"}
+              tone="commission"
             />
             <KpiCard
               icon="payments"
@@ -276,7 +292,7 @@ export function ProductDetailDialog({
                     }`
                   : undefined
               }
-              tone="muted"
+              tone="spend"
             />
           </section>
 
@@ -705,22 +721,16 @@ function KpiCard({
   label: string;
   value: string;
   sub?: string;
-  tone?: "positive" | "negative" | "neutral" | "muted";
+  tone?: Tone;
   tooltip?: string;
 }) {
-  const toneMap: Record<string, string> = {
-    positive: "text-green-400",
-    negative: "text-red-400",
-    neutral: "text-white",
-    muted: "text-white/70",
-  };
   return (
     <div
       className="rounded-xl bg-surface-4 p-4 shadow-elev-2 transition-shadow hover:shadow-elev-4"
       title={tooltip}
     >
       <div className="flex items-center gap-1.5">
-        <span className="material-symbols-rounded text-base text-white/40">
+        <span className={`material-symbols-rounded text-base ${toneIconClass(tone)}`}>
           {icon}
         </span>
         <p className="text-[11px] font-medium uppercase tracking-wider text-white/55">
@@ -728,7 +738,7 @@ function KpiCard({
         </p>
       </div>
       <p
-        className={`num-glow mt-1.5 truncate text-2xl font-bold tabular-nums ${toneMap[tone]}`}
+        className={`num-glow mt-1.5 truncate text-2xl font-bold tabular-nums ${toneTextClass(tone)}`}
         title={value}
       >
         {value}

@@ -17,6 +17,7 @@ use rusqlite::{params, Connection};
 
 use super::apply::{apply_event, ApplyOutcome};
 use super::compress::zstd_decompress;
+use super::descriptors::{find_descriptor, CursorKind, TableDescriptor};
 use super::manifest;
 use super::types::{DeltaEvent, ManifestDeltaEntry};
 
@@ -154,6 +155,146 @@ pub fn advance_pulled_cursor(
         )?;
     }
     Ok(())
+}
+
+// =============================================================
+// Pull-side last_uploaded_cursor advance — Bug A fix.
+//
+// Vấn đề: sync_v9_get_state đếm rows WHERE cursor_col > last_uploaded_cursor.
+// Sau pull, rows từ remote được INSERT vào local table → cursor_col của chúng
+// > last_uploaded_cursor (push-side state). get_state báo pending → status
+// "dirty" mặc dù không có local mutation. Push pipeline sẽ re-upload chính
+// rows vừa pull về (tốn bandwidth + R2 ops).
+//
+// Fix: sau apply pull, advance last_uploaded_cursor cho table nếu — và CHỈ
+// nếu — không có local mutation pending trước pull. Invariant safety:
+// `pre_pull_max_cursor <= last_uploaded_cursor` ⇒ mọi row local đã push.
+// Pulled rows mới nhất sẽ có cursor > pre_pull_max → advance an toàn lên
+// post_pull_max mà không skip local work nào.
+//
+// Nếu có local pending (pre_pull_max > last_uploaded), GIỮ NGUYÊN cursor
+// để push pipeline normal capture cả local + pulled (re-upload pulled là
+// wasteful nhưng KHÔNG mất data — đảm bảo correctness trên tối ưu).
+// =============================================================
+
+/// Snapshot MAX(cursor_column) hiện tại của table. Trả "0" nếu rỗng.
+/// RowId case dùng cột `rowid` (SQLite alias). Caller giữ lock qua cả
+/// snapshot và apply để pre/post consistent.
+pub fn snapshot_table_max(
+    conn: &Connection,
+    descriptor: &TableDescriptor,
+) -> Result<String> {
+    let cursor_col = match descriptor.cursor_kind {
+        CursorKind::RowId => "rowid",
+        _ => descriptor.cursor_column,
+    };
+    let val: Option<rusqlite::types::Value> = conn
+        .query_row(
+            &format!("SELECT MAX({}) FROM {}", cursor_col, descriptor.name),
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("snapshot_table_max({})", descriptor.name))?;
+
+    Ok(match val {
+        Some(rusqlite::types::Value::Integer(n)) => n.to_string(),
+        Some(rusqlite::types::Value::Text(s)) => s,
+        Some(rusqlite::types::Value::Real(f)) => f.to_string(),
+        _ => "0".to_string(),
+    })
+}
+
+/// So sánh 2 cursor strings theo CursorKind. Numeric kind dùng i64 compare,
+/// timestamp kind dùng lex (RFC3339 chronological = lex order).
+///
+/// Return true nếu `a < b`. Chuẩn hoá: parse fail (RowId) → 0; missing/
+/// empty UpdatedAt → "" (lex < mọi RFC3339 string). Edge case "0" baseline:
+/// "0" < "2026-..." lex → true (chữ '0' < '2'), khớp expectation.
+pub fn cursor_lt(a: &str, b: &str, kind: CursorKind) -> bool {
+    match kind {
+        CursorKind::RowId | CursorKind::PrimaryKey => {
+            let na: i64 = a.parse().unwrap_or(0);
+            let nb: i64 = b.parse().unwrap_or(0);
+            na < nb
+        }
+        CursorKind::UpdatedAt | CursorKind::DeletedAt => a < b,
+    }
+}
+
+/// Wrapper: a > b.
+pub fn cursor_gt(a: &str, b: &str, kind: CursorKind) -> bool {
+    cursor_lt(b, a, kind)
+}
+
+/// Advance `last_uploaded_cursor` lên MAX(cursor_column) hiện tại — chỉ khi
+/// `pre_pull_max <= last_uploaded` (no local pending). Trả `Ok(true)` nếu
+/// đã advance, `Ok(false)` nếu skip (có local pending hoặc không có row mới).
+///
+/// **CRITICAL invariant** (rule giữ data #1):
+/// - Caller PHẢI hold cùng DB lock từ lúc snapshot pre_pull_max → apply
+///   events → gọi function này. Nếu lock bị release giữa, mutation race
+///   có thể chen vào → pre_pull_max stale → advance over local work →
+///   data loss.
+/// - Pre-condition `pre_pull_max <= last_uploaded` đảm bảo mọi row có
+///   cursor > last_uploaded sau apply ĐỀU là pulled (vì pre-pull không có
+///   row > last_uploaded).
+///
+/// Monotonic guard trong UPDATE SQL chống cursor tụt nếu race khác xảy ra.
+pub fn advance_uploaded_cursor_for_pulled_rows(
+    conn: &Connection,
+    table: &str,
+    pre_pull_max: &str,
+) -> Result<bool> {
+    let descriptor = match find_descriptor(table) {
+        Some(d) => d,
+        None => return Ok(false),
+    };
+
+    let last_uploaded: String = conn
+        .query_row(
+            "SELECT last_uploaded_cursor FROM sync_cursor_state WHERE table_name = ?",
+            [table],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("read last_uploaded_cursor for {table}"))?;
+
+    // Safety: nếu pre_pull_max > last_uploaded → có local pending row chưa
+    // push (vd user vừa save manual entry trước khi sync). Skip auto-advance,
+    // để push pipeline normal capture local pending + pulled rows.
+    if cursor_gt(pre_pull_max, &last_uploaded, descriptor.cursor_kind) {
+        return Ok(false);
+    }
+
+    let post_pull_max = snapshot_table_max(conn, descriptor)?;
+
+    // Skip nếu post_pull_max <= last_uploaded (không có row mới nào, hoặc
+    // pull áp dụng skip/dup chỉ — không insert thực).
+    if !cursor_gt(&post_pull_max, &last_uploaded, descriptor.cursor_kind) {
+        return Ok(false);
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let is_numeric =
+        !post_pull_max.is_empty() && post_pull_max.chars().all(|c| c.is_ascii_digit());
+    // Monotonic guard — cursor chỉ advance, không tụt. Race với mark_uploaded
+    // từ push concurrent (không nên xảy ra do lock, nhưng defensive).
+    let sql = if is_numeric {
+        "UPDATE sync_cursor_state
+         SET last_uploaded_cursor = ?, updated_at = ?
+         WHERE table_name = ?
+           AND CAST(? AS INTEGER) >= CAST(last_uploaded_cursor AS INTEGER)"
+    } else {
+        "UPDATE sync_cursor_state
+         SET last_uploaded_cursor = ?, updated_at = ?
+         WHERE table_name = ?
+           AND ? >= last_uploaded_cursor"
+    };
+    conn.execute(
+        sql,
+        params![post_pull_max, now, table, post_pull_max],
+    )
+    .with_context(|| format!("advance_uploaded_cursor_for_pulled_rows({table})"))?;
+    Ok(true)
 }
 
 /// Extract max `clock_ms` từ events (dùng cho absorb_remote_clock + manifest
@@ -551,6 +692,381 @@ mod tests {
     }
 
     // ---------- End-to-end sim ----------
+
+    // =============================================================
+    // Bug A fix: pull-side cursor advance regression tests
+    // =============================================================
+
+    use crate::sync_v9::descriptors::{find_descriptor, CursorKind};
+
+    #[test]
+    fn snapshot_table_max_empty_returns_zero() {
+        let conn = test_conn();
+        let desc = find_descriptor("manual_entries").unwrap();
+        let max = snapshot_table_max(&conn, desc).unwrap();
+        assert_eq!(max, "0");
+    }
+
+    #[test]
+    fn snapshot_table_max_rowid_table() {
+        let conn = test_conn();
+        let file_id = seed_file(&conn, "h1");
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        for cid in ["c1", "c2", "c3"] {
+            conn.execute(
+                "INSERT INTO raw_shopee_clicks
+                 (click_id, click_time, day_date, source_file_id)
+                 VALUES(?, 'now', '2026-04-20', ?)",
+                params![cid, file_id],
+            )
+            .unwrap();
+        }
+        let desc = find_descriptor("raw_shopee_clicks").unwrap();
+        let max = snapshot_table_max(&conn, desc).unwrap();
+        // 3 rows → MAX(rowid) = 3 (đếm từ 1).
+        assert_eq!(max, "3");
+    }
+
+    #[test]
+    fn snapshot_table_max_updated_at_table() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manual_entries
+             (sub_id1, day_date, override_clicks, created_at, updated_at)
+             VALUES('a', '2026-04-20', 1, 'now', '2026-04-26T08:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manual_entries
+             (sub_id1, day_date, override_clicks, created_at, updated_at)
+             VALUES('b', '2026-04-20', 2, 'now', '2026-04-26T09:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let desc = find_descriptor("manual_entries").unwrap();
+        let max = snapshot_table_max(&conn, desc).unwrap();
+        assert_eq!(max, "2026-04-26T09:00:00Z");
+    }
+
+    #[test]
+    fn cursor_lt_numeric_kind() {
+        // RowId — numeric compare. Lex sai cho "10" < "9" (true), numeric đúng (false).
+        assert!(cursor_lt("9", "10", CursorKind::RowId));
+        assert!(!cursor_lt("10", "9", CursorKind::RowId));
+        assert!(!cursor_lt("5", "5", CursorKind::RowId));
+        assert!(cursor_lt("0", "1", CursorKind::RowId));
+    }
+
+    #[test]
+    fn cursor_lt_timestamp_kind() {
+        assert!(cursor_lt(
+            "2026-04-26T08:00:00Z",
+            "2026-04-26T09:00:00Z",
+            CursorKind::UpdatedAt,
+        ));
+        assert!(!cursor_lt(
+            "2026-04-26T09:00:00Z",
+            "2026-04-26T08:00:00Z",
+            CursorKind::UpdatedAt,
+        ));
+        // Edge: seed "0" lex < mọi RFC3339 string.
+        assert!(cursor_lt("0", "2026-04-26T00:00:00Z", CursorKind::UpdatedAt));
+    }
+
+    #[test]
+    fn advance_uploaded_after_pull_advances_when_no_local_pending() {
+        // Setup: cursor = "0" (initial), no local rows. Pull adds 3 rows.
+        let conn = test_conn();
+        let file_id = seed_file(&conn, "h1");
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+
+        let desc = find_descriptor("raw_shopee_clicks").unwrap();
+        // Pre-pull snapshot: empty table → "0".
+        let pre = snapshot_table_max(&conn, desc).unwrap();
+        assert_eq!(pre, "0");
+
+        // Simulate pull apply: 3 inserts.
+        for cid in ["c1", "c2", "c3"] {
+            conn.execute(
+                "INSERT INTO raw_shopee_clicks
+                 (click_id, click_time, day_date, source_file_id)
+                 VALUES(?, 'now', '2026-04-20', ?)",
+                params![cid, file_id],
+            )
+            .unwrap();
+        }
+
+        // Advance: pre="0" <= last_uploaded="0" → safe, advance to "3".
+        let advanced =
+            advance_uploaded_cursor_for_pulled_rows(&conn, "raw_shopee_clicks", &pre)
+                .unwrap();
+        assert!(advanced, "phải advance vì không có local pending");
+
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_uploaded_cursor FROM sync_cursor_state WHERE table_name = 'raw_shopee_clicks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, "3", "cursor advance to MAX(rowid)");
+    }
+
+    /// CRITICAL: invariant phải bảo vệ chống data loss khi có local pending.
+    /// Local row 5 chưa push, pull về thêm 3 rows → MAX=8. Nếu blindly advance
+    /// cursor=8, push capture rowid > 8 = nothing → row 5 bị bỏ qua → mất data.
+    /// Fix phải skip advance trong case này.
+    #[test]
+    fn advance_uploaded_after_pull_skips_when_local_pending() {
+        let conn = test_conn();
+        let file_id = seed_file(&conn, "h1");
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+
+        // 5 rows local đã push (cursor = 5).
+        for cid in ["c1", "c2", "c3", "c4", "c5"] {
+            conn.execute(
+                "INSERT INTO raw_shopee_clicks
+                 (click_id, click_time, day_date, source_file_id)
+                 VALUES(?, 'now', '2026-04-20', ?)",
+                params![cid, file_id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE sync_cursor_state SET last_uploaded_cursor = '5' WHERE table_name = 'raw_shopee_clicks'",
+            [],
+        )
+        .unwrap();
+
+        // Local mutation: thêm row c6 (rowid=6) → CHƯA push.
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id)
+             VALUES('c6', 'now', '2026-04-20', ?)",
+            [file_id],
+        )
+        .unwrap();
+
+        let desc = find_descriptor("raw_shopee_clicks").unwrap();
+        // Pre-pull snapshot: MAX=6 (local pending). last_uploaded=5. pre > last → CÓ pending.
+        let pre = snapshot_table_max(&conn, desc).unwrap();
+        assert_eq!(pre, "6");
+
+        // Simulate pull apply: 3 inserts từ remote → rowid 7,8,9.
+        for cid in ["r1", "r2", "r3"] {
+            conn.execute(
+                "INSERT INTO raw_shopee_clicks
+                 (click_id, click_time, day_date, source_file_id)
+                 VALUES(?, 'now', '2026-04-20', ?)",
+                params![cid, file_id],
+            )
+            .unwrap();
+        }
+
+        let advanced =
+            advance_uploaded_cursor_for_pulled_rows(&conn, "raw_shopee_clicks", &pre)
+                .unwrap();
+        assert!(
+            !advanced,
+            "PHẢI skip vì local pending — advance sẽ bỏ qua row c6"
+        );
+
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_uploaded_cursor FROM sync_cursor_state WHERE table_name = 'raw_shopee_clicks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, "5", "cursor giữ nguyên — push pipeline sẽ capture c6 + pulled");
+    }
+
+    #[test]
+    fn advance_uploaded_after_pull_handles_updated_at_table() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+
+        // 1 row local đã push (cursor = T1).
+        conn.execute(
+            "INSERT INTO manual_entries
+             (sub_id1, day_date, override_clicks, created_at, updated_at)
+             VALUES('a', '2026-04-20', 1, 'now', '2026-04-26T08:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sync_cursor_state SET last_uploaded_cursor = '2026-04-26T08:00:00Z'
+             WHERE table_name = 'manual_entries'",
+            [],
+        )
+        .unwrap();
+
+        let desc = find_descriptor("manual_entries").unwrap();
+        let pre = snapshot_table_max(&conn, desc).unwrap();
+        assert_eq!(pre, "2026-04-26T08:00:00Z");
+
+        // Pull apply: row mới với updated_at = T2.
+        conn.execute(
+            "INSERT INTO manual_entries
+             (sub_id1, day_date, override_clicks, created_at, updated_at)
+             VALUES('b', '2026-04-20', 2, 'now', '2026-04-26T09:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let advanced =
+            advance_uploaded_cursor_for_pulled_rows(&conn, "manual_entries", &pre).unwrap();
+        assert!(advanced);
+
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_uploaded_cursor FROM sync_cursor_state WHERE table_name = 'manual_entries'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, "2026-04-26T09:00:00Z");
+    }
+
+    #[test]
+    fn advance_uploaded_after_pull_skips_when_no_new_rows() {
+        // Pull file rỗng / chỉ duplicate → MAX không đổi → skip advance.
+        let conn = test_conn();
+        let file_id = seed_file(&conn, "h1");
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id)
+             VALUES('c1', 'now', '2026-04-20', ?)",
+            [file_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sync_cursor_state SET last_uploaded_cursor = '1' WHERE table_name = 'raw_shopee_clicks'",
+            [],
+        )
+        .unwrap();
+
+        // Pre-pull: MAX=1, last_uploaded=1. Pull không insert gì (replay).
+        let pre = snapshot_table_max(
+            &conn,
+            find_descriptor("raw_shopee_clicks").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pre, "1");
+
+        let advanced =
+            advance_uploaded_cursor_for_pulled_rows(&conn, "raw_shopee_clicks", &pre)
+                .unwrap();
+        assert!(!advanced, "không có row mới → không cần advance");
+    }
+
+    #[test]
+    fn advance_uploaded_after_pull_unknown_table_no_op() {
+        let conn = test_conn();
+        let advanced = advance_uploaded_cursor_for_pulled_rows(
+            &conn,
+            "future_table_v99",
+            "0",
+        )
+        .unwrap();
+        assert!(!advanced);
+    }
+
+    /// E2E regression: simulate machine B nhận pull từ machine A. Sau pull
+    /// + auto-advance, pendingPushTables (qua MAX(rowid > last_uploaded))
+    /// phải = 0. Trước fix, sẽ báo pending → status dirty perpetual.
+    #[test]
+    fn e2e_pull_then_get_state_no_pending_when_no_local() {
+        let mut conn = test_conn();
+        let file_id = seed_file(&conn, "h_remote");
+
+        // Simulate pull events apply.
+        let events = vec![
+            DeltaEvent::Insert(InsertEvent {
+                sv: SV_CURRENT,
+                table: "raw_shopee_clicks".to_string(),
+                pk: json!({"click_id": "remote_c1"}),
+                row: json!({
+                    "click_id": "remote_c1",
+                    "click_time": "now",
+                    "day_date": "2026-04-20",
+                    "source_file_id": file_id,
+                }),
+                clock_ms: 1000,
+            }),
+            DeltaEvent::Insert(InsertEvent {
+                sv: SV_CURRENT,
+                table: "raw_shopee_clicks".to_string(),
+                pk: json!({"click_id": "remote_c2"}),
+                row: json!({
+                    "click_id": "remote_c2",
+                    "click_time": "now",
+                    "day_date": "2026-04-20",
+                    "source_file_id": file_id,
+                }),
+                clock_ms: 2000,
+            }),
+        ];
+
+        let desc = find_descriptor("raw_shopee_clicks").unwrap();
+        let pre_max = snapshot_table_max(&conn, desc).unwrap();
+
+        let stats = apply_events(&mut conn, &events).unwrap();
+        assert_eq!(stats.applied, 2);
+
+        let advanced =
+            advance_uploaded_cursor_for_pulled_rows(&conn, "raw_shopee_clicks", &pre_max)
+                .unwrap();
+        assert!(advanced, "no local pending → advance OK");
+
+        // Simulate sync_v9_get_state has_more check.
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_uploaded_cursor FROM sync_cursor_state WHERE table_name = 'raw_shopee_clicks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cursor_n: i64 = cursor.parse().unwrap();
+        let has_more: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE rowid > ?",
+                [cursor_n],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_more, 0,
+            "sau pull + auto-advance, get_state phải KHÔNG báo pending"
+        );
+    }
 
     #[test]
     fn end_to_end_capture_to_apply_roundtrip() {

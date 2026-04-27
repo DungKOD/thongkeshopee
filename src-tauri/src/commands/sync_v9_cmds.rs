@@ -11,8 +11,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::DbState;
 use crate::sync_v9::{
-    apply, bootstrap, capture, client, compaction, compress, descriptors, event_log, hlc, manifest,
-    pull, push, snapshot,
+    apply, bootstrap, capture, client, compaction, compress, dedup, descriptors, event_log, hlc,
+    manifest, pull, push, snapshot,
     types::{DeltaEvent, Manifest, ManifestDeltaEntry, SyncEventCtx},
     SV_CURRENT,
 };
@@ -129,6 +129,12 @@ pub async fn sync_v9_push_all(
         if bootstrap::is_bootstrap_pending(&conn).map_err(|e| CmdError::msg(format!("{e:#}")))? {
             return Ok(PushReport::default());
         }
+        // Pre-flush full-hash dedup: cho 4 bảng nhỏ (app_settings, manual_entries,
+        // imported_files, shopee_accounts), nếu state hiện tại = state đã upload
+        // (revert detected) → advance cursor để capture skip table này. Bảng to
+        // raw_* không hash full vì O(N) chậm; vẫn dùng skip-identical bundle hash.
+        let _skipped_revert = dedup::apply_full_hash_dedup(&conn)
+            .map_err(|e| CmdError::msg(format!("apply_full_hash_dedup: {e:#}")))?;
         let clock = hlc::next_hlc_ms(&conn)?;
         let fp = machine_fingerprint_stable();
         let bundle = push::plan_push_bundle_default(&conn, clock)
@@ -181,6 +187,14 @@ pub async fn sync_v9_push_all(
         for range in &bundle.table_ranges {
             push::mark_uploaded(&conn, &range.table, &range.cursor_hi, &range.content_hash)
                 .map_err(|e| CmdError::msg(format!("{e:#}")))?;
+            // Race-safe baseline: dùng hash đã PRECOMPUTED tại lúc capture
+            // (cùng DB lock với capture), KHÔNG re-hash từ DB hiện tại. Re-hash
+            // có thể bao gồm mutation race xảy ra giữa upload + mark_uploaded
+            // → baseline lệch + dedup skip mất row chưa upload.
+            if let Some(hash) = &range.full_hash_snapshot {
+                dedup::set_full_hash_baseline(&conn, &range.table, hash)
+                    .map_err(|e| CmdError::msg(format!("set_full_hash_baseline: {e:#}")))?;
+            }
             new_entries.push(ManifestDeltaEntry {
                 table: range.table.clone(),
                 // All entries share cùng r2_key — pull side dedup theo key.
@@ -560,16 +574,52 @@ pub async fn sync_v9_pull_all(
         // Apply trong TX (lock held qua apply — tiny vs network).
         // Bundle file chứa events nhiều tables — apply_events dispatch qua
         // event.table field, xử lý tự động theo descriptor per-event.
+        //
+        // Bug A fix: snapshot pre_pull_max TRƯỚC apply để post-apply có thể
+        // safely advance last_uploaded_cursor cho rows vừa pull (chúng đã
+        // có trên R2). Lock giữ qua cả snapshot+apply+advance — pre/post
+        // consistent, không có race với mutation local.
         let stats = {
             let mut conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+
+            // Snapshot pre-pull MAX cho mỗi table trong bundle. Skip table
+            // không có descriptor (forward compat, future tables).
+            let mut pre_pull_max: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for entry in entries {
+                if let Some(desc) =
+                    crate::sync_v9::descriptors::find_descriptor(&entry.table)
+                {
+                    let max = pull::snapshot_table_max(&conn, desc)
+                        .map_err(|e| CmdError::msg(format!("{e:#}")))?;
+                    pre_pull_max.insert(entry.table.clone(), max);
+                }
+            }
+
             let stats = pull::apply_events(&mut conn, &events)
                 .map_err(|e| CmdError::msg(format!("{e:#}")))?;
 
-            // Advance cursor cho MỖI table trong bundle.
+            // Advance pulled cursor cho MỖI table trong bundle.
             for entry in entries {
                 pull::advance_pulled_cursor(&conn, &entry.table, &entry.cursor_hi)
                     .map_err(|e| CmdError::msg(format!("{e:#}")))?;
             }
+
+            // Bug A fix: advance last_uploaded_cursor cho table vừa pull,
+            // gated bởi safety invariant (pre_pull_max <= last_uploaded =
+            // không có local pending). Sai invariant → skip, để push pipeline
+            // normal handle (re-upload an toàn nhưng wasteful).
+            for entry in entries {
+                if let Some(pre) = pre_pull_max.get(&entry.table) {
+                    pull::advance_uploaded_cursor_for_pulled_rows(
+                        &conn,
+                        &entry.table,
+                        pre,
+                    )
+                    .map_err(|e| CmdError::msg(format!("{e:#}")))?;
+                }
+            }
+
             hlc::absorb_remote_clock(&conn, max_clock)?;
             stats
         };
@@ -748,15 +798,26 @@ async fn cas_put_full_manifest_retry(
     new_manifest: &Manifest,
     mut expected_etag: Option<String>,
 ) -> CmdResult<u32> {
+    // Bug C fix: dùng local mutable clone. Trước đây merged manifest tính trong
+    // CAS-conflict branch bị `let _ = merged` discard → next iter lặp put với
+    // `new_manifest` original (deltas=[]) → CAS thành công sẽ XÓA delta máy
+    // khác push xen vào sau snapshot → mất data trên R2 manifest pointer.
+    let mut current_manifest: Manifest = new_manifest.clone();
     let mut retries = 0u32;
     for attempt in 0..=CAS_MAX_RETRY {
-        match client::put_manifest(base_url, id_token, new_manifest, expected_etag.as_deref()).await
+        match client::put_manifest(
+            base_url,
+            id_token,
+            &current_manifest,
+            expected_etag.as_deref(),
+        )
+        .await
         {
             Ok(new_etag) => {
                 let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
                 manifest::set_etag(&conn, &new_etag).map_err(|e| CmdError::msg(format!("{e:#}")))?;
                 // Compaction = full replace → cache với manifest mới + etag mới.
-                crate::sync_v9::manifest_cache::cache_put(new_manifest.clone(), new_etag);
+                crate::sync_v9::manifest_cache::cache_put(current_manifest.clone(), new_etag);
                 return Ok(retries);
             }
             Err(e) if e.to_string().starts_with(client::CAS_CONFLICT) => {
@@ -768,31 +829,41 @@ async fn cas_put_full_manifest_retry(
                         "CAS exhausted after {CAS_MAX_RETRY} retries (compaction)"
                     )));
                 }
-                // Re-fetch để get new etag. Lưu ý: manifest content của compaction
-                // thì keep as-is (không re-merge với delta appends của máy khác —
-                // compaction là operation "chốt state", nếu remote có delta mới
-                // phải giữ). Reload + re-merge remote deltas.
+                // Re-fetch để get new etag + re-merge remote deltas mới sau snapshot.
+                // Compaction là operation "chốt state": nếu remote có delta xen
+                // (clock > snap_clock) → giữ trong manifest mới để pull-side
+                // không miss.
                 let fetched = client::get_manifest(base_url, id_token)
                     .await
                     .map_err(|e| CmdError::msg(format!("get_manifest retry: {e:#}")))?;
                 expected_etag = fetched.etag;
-                // Nếu remote có delta mới → đưa lại vào manifest mới sau snapshot
-                // (những delta này có clock_ms > snapshot.clock_ms).
                 if let Some(remote) = fetched.manifest {
-                    // Re-merge deltas có clock > snapshot clock.
-                    let snap_clock = new_manifest
+                    let snap_clock = current_manifest
                         .latest_snapshot
                         .as_ref()
                         .map(|s| s.clock_ms)
                         .unwrap_or(0);
-                    let mut merged = new_manifest.clone();
+                    // Reset deltas về post-snapshot only, sau đó merge remote.
+                    // Caller setup current_manifest với deltas=[] (compact); ta
+                    // restore deltas từ remote có clock > snap_clock + giữ
+                    // những delta đã merge trước đó (idempotent dedup theo key).
+                    let mut new_deltas = current_manifest.deltas.clone();
                     for d in remote.deltas.into_iter().filter(|d| d.clock_ms > snap_clock) {
-                        merged.deltas.push(d);
+                        if !new_deltas.iter().any(|e| e.key == d.key) {
+                            new_deltas.push(d);
+                        }
                     }
-                    // Sort deltas theo clock_ms ASC.
-                    merged.deltas.sort_by_key(|d| d.clock_ms);
-                    // Retry với merged — next loop iter.
-                    let _ = merged; // future iter hit Ok branch
+                    new_deltas.sort_by_key(|d| d.clock_ms);
+                    current_manifest.deltas = new_deltas;
+                    // updated_at_ms bump để remote thấy state đổi
+                    // (defensive — server có thể compare).
+                    if let Some(remote_updated) = remote
+                        .updated_at_ms
+                        .checked_add(1)
+                    {
+                        current_manifest.updated_at_ms =
+                            current_manifest.updated_at_ms.max(remote_updated);
+                    }
                 }
                 continue;
             }

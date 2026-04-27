@@ -12,6 +12,9 @@ interface SyncBadgeProps {
   hasRemoteChangePending: boolean;
   error: string | null;
   onForce: () => Promise<void>;
+  /// User toggle (Settings) — false thì mutation không tự push, badge hiển
+  /// thị thêm hint "AUTO OFF" để user biết phải bấm force sync thủ công.
+  autoSyncEnabled: boolean;
 }
 
 interface Display {
@@ -92,6 +95,7 @@ export function SyncBadge({
   hasRemoteChangePending,
   error,
   onForce,
+  autoSyncEnabled,
 }: SyncBadgeProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
@@ -137,12 +141,16 @@ export function SyncBadge({
         title={
           error ??
           (isDirty
-            ? "Có thay đổi local — sẽ tự đồng bộ sau 45s (reset khi có thao tác mới)"
+            ? autoSyncEnabled
+              ? "Có thay đổi local — sẽ tự đồng bộ sau 45s (reset khi có thao tác mới)"
+              : "Có thay đổi local — AUTO SYNC đang TẮT, bấm để đồng bộ thủ công"
             : hasRemote
               ? "Máy khác vừa cập nhật dữ liệu — click để pull về"
-              : lastSyncAt
-                ? `Sync lần cuối: ${lastSyncAt.toLocaleString("vi-VN")}`
-                : "")
+              : !autoSyncEnabled
+                ? "Auto-sync đang tắt (Cài đặt → Đồng bộ tự động). Pull vẫn hoạt động."
+                : lastSyncAt
+                  ? `Sync lần cuối: ${lastSyncAt.toLocaleString("vi-VN")}`
+                  : "")
         }
       >
         {/* Pulsing dot indicator ở góc trên-phải cho dirty/error/hasRemote */}
@@ -182,6 +190,18 @@ export function SyncBadge({
         <span className={`truncate ${display.color}`} title={display.label}>
           {display.label}
         </span>
+        {/* Luôn render để badge có width cố định — tránh layout shift khi user
+            toggle auto-sync trong Settings. `invisible` ẩn pill nhưng giữ
+            không gian. `whitespace-nowrap` ép "Auto Off" trên 1 dòng. */}
+        <span
+          className={`shrink-0 whitespace-nowrap rounded-full bg-amber-500/25 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-200 ${
+            autoSyncEnabled ? "invisible" : ""
+          }`}
+          title="Auto-sync đang tắt"
+          aria-hidden={autoSyncEnabled}
+        >
+          Auto Off
+        </span>
       </button>
 
       {showMenu && (
@@ -191,8 +211,13 @@ export function SyncBadge({
             onClick={() => setShowMenu(false)}
           />
           <div className="absolute right-0 top-full z-40 mt-1 w-64 rounded-lg border border-surface-8 bg-surface-2 shadow-elev-16">
-            <div className="border-b border-surface-8 px-3 py-2 text-xs text-white/50">
-              Đồng bộ lên R2
+            <div className="flex items-center justify-between border-b border-surface-8 px-3 py-2 text-xs text-white/50">
+              <span>Đồng bộ lên R2</span>
+              {!autoSyncEnabled && (
+                <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-300">
+                  Auto Off
+                </span>
+              )}
             </div>
             <div className="px-3 py-2 text-xs">
               <div className="flex items-center gap-2">
@@ -260,6 +285,12 @@ export function SyncBadge({
                 </div>
               )}
             </div>
+            {!autoSyncEnabled && (
+              <div className="border-t border-surface-8 bg-amber-950/20 px-3 py-2 text-[11px] text-amber-200">
+                Auto-sync tắt — thay đổi chỉ đẩy khi bấm nút bên dưới hoặc bật
+                lại trong <b>Cài đặt</b>.
+              </div>
+            )}
             <div className="flex flex-col gap-1 border-t border-surface-8 p-2">
               <button
                 type="button"

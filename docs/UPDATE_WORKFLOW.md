@@ -276,8 +276,13 @@ git tag v0.4.4
 git push origin v0.4.4
 
 # 4. CI build → Edit Draft → Publish ngay (không cần waiting beta)
+#    Hoặc CLI 1 lệnh:
+#    gh release edit v0.4.4 --draft=false --latest
 
 # 5. Tổng thời gian từ commit fix → user nhận update ≈ 30 phút
+
+# ⚠️ Nếu skip step 4 (để Draft) → endpoint /releases/latest vẫn trỏ về bản cũ,
+#    user mở app sẽ thấy "Mới nhất" mặc dù v0.4.4 đã build. Xem Section 7.
 ```
 
 ### Case 3: Đang refactor lớn, không muốn user upgrade
@@ -358,6 +363,36 @@ git push origin v0.4.3
 3. Check `latest.json` artifact có trong release
 4. Check version trong `latest.json` > version cài
 5. Open Settings → log net_log → xem có request tới `releases/latest/download/latest.json` không (404 hoặc 200)
+
+### App báo "Mới nhất" nhưng version đã cài cao hơn release "Latest"
+
+**Triệu chứng**: app hiển thị "Mới nhất → v0.4.1" trong khi local đang chạy v0.4.3 và đã có v0.4.4 build xong.
+
+**Nguyên nhân**: nhiều Draft chồng nhau, GitHub `releases/latest` chỉ trỏ về release **đã publish gần nhất** — nếu các bản mới đều còn Draft, endpoint stuck ở release cũ:
+
+```
+v0.4.4 → Draft     ← CI vừa build xong
+v0.4.3 → Draft
+v0.4.2 → Draft
+v0.4.1 → Latest    ← updater fetch latest.json từ đây
+```
+
+Updater so v0.4.1 < v0.4.3 (đang cài) → "không có update mới".
+
+**Fix**: publish Draft target làm Latest.
+
+CLI 1 lệnh (nhanh nhất):
+```bash
+gh release edit v0.4.4 --draft=false --latest
+```
+
+Hoặc browser:
+1. Releases → click vào Draft v0.4.4
+2. Edit (icon bút chì)
+3. Verify "Set as latest release" ✓
+4. Publish release
+
+**Phòng ngừa**: sau khi CI build xong, đừng để Draft pile up — publish ngay (Section 6 Case 1 step 5). Nếu là beta cố ý không publish, tag dạng `v*-beta.*` để tự skip nhầm với release thật.
 
 ### Update download fail / signature mismatch
 

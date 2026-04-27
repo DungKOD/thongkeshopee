@@ -10,6 +10,12 @@ interface CampaignRowProps {
   onToggleDelete: () => void;
   onViewDetail: () => void;
   readOnly?: boolean;
+  /** Render cột "TK Shopee" giữa "Sản phẩm" và "Click ADS". DayBlock truyền
+   *  true khi filter=All (nhiều acc). Mặc định false → giữ layout cũ. */
+  showAccount?: boolean;
+  /** Disable nút delete + tooltip giải thích — DayBlock pass true khi tuple
+   *  hiện cùng lúc trên ≥2 TK (BE delete theo tuple sẽ wipe cả các TK khác). */
+  deleteBlocked?: boolean;
 }
 
 const cellCls = "px-3 py-2.5 text-center";
@@ -32,6 +38,8 @@ export function VideoRow({
   onToggleDelete,
   onViewDetail,
   readOnly = false,
+  showAccount = false,
+  deleteBlocked = false,
 }: CampaignRowProps) {
   const { settings } = useSettings();
   const shopeeClicks = sumFiltered(
@@ -89,6 +97,25 @@ export function VideoRow({
           </span>
         )}
       </td>
+      {showAccount && (
+        <td className={`${cellCls} ${dataCellPending}`}>
+          {row.accountName ? (
+            <span
+              className="inline-block max-w-[140px] truncate rounded-md bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-200"
+              title={row.accountName}
+            >
+              {row.accountName}
+            </span>
+          ) : (
+            <span
+              className="inline-block rounded-md bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300"
+              title="FB ad có ≥2 TK Shopee cùng tuple sub_id trong ngày — không quy được duy nhất 1 TK"
+            >
+              FB chung
+            </span>
+          )}
+        </td>
+      )}
       <td
         className={`${cellCls} tabular-nums ${clicksCell.cls} ${dataCellPending}`}
       >
@@ -103,7 +130,9 @@ export function VideoRow({
         {cpcCell.text}
       </td>
       <td
-        className={`${cellCls} tabular-nums ${spendCell.cls} ${dataCellPending}`}
+        className={`${cellCls} tabular-nums ${
+          spendCell.cls === "" ? "text-blue-400" : spendCell.cls
+        } ${dataCellPending}`}
       >
         {spendCell.text}
       </td>
@@ -129,7 +158,7 @@ export function VideoRow({
       >
         {row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
       </td>
-      <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
+      <td className={`${cellCls} tabular-nums text-shopee-400 ${dataCellPending}`}>
         {fmtVnd(row.commissionTotal)}
       </td>
       <td
@@ -179,14 +208,24 @@ export function VideoRow({
             <button
               onClick={(e) => {
                 e.stopPropagation();
+                if (deleteBlocked && !pending) return;
                 onToggleDelete();
               }}
+              disabled={deleteBlocked && !pending}
               className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-                pending
+                deleteBlocked && !pending
+                  ? "cursor-not-allowed text-white/20"
+                  : pending
                   ? "text-amber-400 hover:bg-amber-500/10"
                   : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
               }`}
-              title={pending ? "Khôi phục" : "Đánh dấu xóa"}
+              title={
+                deleteBlocked && !pending
+                  ? "Sub_id này có data ở ≥2 TK Shopee — chuyển dropdown TK sang TK cụ thể trước khi xóa (BE hiện xóa theo tuple sẽ wipe cả TK khác)"
+                  : pending
+                  ? "Khôi phục"
+                  : "Đánh dấu xóa"
+              }
               aria-label={pending ? "Khôi phục" : "Đánh dấu xóa"}
             >
               <span className="material-symbols-rounded text-lg">

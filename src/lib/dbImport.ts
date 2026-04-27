@@ -333,14 +333,28 @@ export interface ImportPreview {
   /** File này trùng nội dung với file khác trong CÙNG batch này (FE detect
    *  client-side, tránh commit 2 file giống nhau → UNIQUE constraint fail). */
   batchDuplicate: boolean;
+  /** File bị reject ở FE parse stage (unknown kind, no valid rows, missing
+   *  required column...). FE synthesize preview này không call Rust; commit
+   *  skip. Dialog hiển thị reason để user thấy file nào bị bỏ + lý do. */
+  rejected?: boolean;
+  /** Lý do reject — hiện trong dialog. Set khi rejected=true. */
+  rejectReason?: string;
 }
 
-/** Parsed + typed payload của 1 file, giữ trong RAM để commit sau preview. */
+/** Parsed + typed payload của 1 file, giữ trong RAM để commit sau preview.
+ *  Variant `rejected` giữ file bị loại ở parse stage — không có payload để
+ *  commit, chỉ giữ reason để dialog hiển thị.
+ *
+ *  FB payload (ad_group / campaign) có field `taxRate` (0..100) — % thuế TK
+ *  FB chịu (VAT, business tax). Default 0 lúc parse, UI override per-file
+ *  trong ImportPreviewDialog trước khi commit. Rust nhân (1 + tax/100) ở
+ *  query time → spend hiển thị/aggregate là chi phí thật. */
 export type ParsedFile =
   | { kind: "shopee_clicks"; file: File; payload: { filename: string; rawContent: string; rows: ShopeeClickRow[] } }
   | { kind: "shopee_commission"; file: File; payload: { filename: string; rawContent: string; rows: ShopeeOrderRow[] } }
-  | { kind: "fb_ad_group"; file: File; payload: { filename: string; rawContent: string; rows: FbAdGroupRow[] } }
-  | { kind: "fb_campaign"; file: File; payload: { filename: string; rawContent: string; rows: FbCampaignRow[] } };
+  | { kind: "fb_ad_group"; file: File; payload: { filename: string; rawContent: string; rows: FbAdGroupRow[]; taxRate: number } }
+  | { kind: "fb_campaign"; file: File; payload: { filename: string; rawContent: string; rows: FbCampaignRow[]; taxRate: number } }
+  | { kind: "rejected"; file: File; detectedKind: DetectedKind; reason: string };
 
 export interface PreviewBatch {
   /** Ngày chung duy nhất của batch. */
@@ -387,6 +401,16 @@ function dedupShopeeOrders(rows: ShopeeOrderRow[]): ShopeeOrderRow[] {
   return Array.from(byKey.values());
 }
 
+/** Tạo rejected ParsedFile thay vì throw — caller (previewCsvBatch) đưa vào
+ *  PreviewBatch để dialog hiển thị file + reason, không abort cả batch. */
+function rejectedFile(
+  file: File,
+  detectedKind: DetectedKind,
+  reason: string,
+): ParsedFile {
+  return { kind: "rejected", file, detectedKind, reason };
+}
+
 async function parseFile(file: File): Promise<ParsedFile> {
   const text = await file.text();
   const parsed = Papa.parse<Record<string, string>>(text, {
@@ -397,8 +421,10 @@ async function parseFile(file: File): Promise<ParsedFile> {
   const kind = detectKind(headers);
 
   if (kind === "unknown") {
-    throw new Error(
-      `Không nhận diện được loại file '${file.name}'. File phải là WebsiteClickReport, AffiliateCommissionReport, FB Ad Group hoặc FB Campaign.`,
+    return rejectedFile(
+      file,
+      "unknown",
+      `Không nhận diện được loại file. File phải là WebsiteClickReport, AffiliateCommissionReport, FB Ad Group hoặc FB Campaign.`,
     );
   }
 
@@ -408,7 +434,7 @@ async function parseFile(file: File): Promise<ParsedFile> {
         .map(toShopeeClickRow)
         .filter((r): r is ShopeeClickRow => r !== null);
       if (rows.length === 0)
-        throw new Error(`File '${file.name}' không có click hợp lệ`);
+        return rejectedFile(file, kind, "Không có click hợp lệ trong file");
       return {
         kind,
         file,
@@ -425,9 +451,10 @@ async function parseFile(file: File): Promise<ParsedFile> {
         (h) => (h ?? "").trim().toLowerCase() === "id model",
       );
       if (!hasModelIdCol) {
-        throw new Error(
-          `File '${file.name}' thiếu cột "ID Model". Export lại từ Shopee ` +
-            `với đủ cột, nếu không các item cùng order sẽ bị gộp sai.`,
+        return rejectedFile(
+          file,
+          kind,
+          `Thiếu cột "ID Model". Export lại từ Shopee với đủ cột, nếu không các item cùng order sẽ bị gộp sai.`,
         );
       }
       const parsedRows = parsed.data
@@ -435,7 +462,7 @@ async function parseFile(file: File): Promise<ParsedFile> {
         .filter((r): r is ShopeeOrderRow => r !== null);
       const rows = dedupShopeeOrders(parsedRows);
       if (rows.length === 0)
-        throw new Error(`File '${file.name}' không có đơn hàng hợp lệ`);
+        return rejectedFile(file, kind, "Không có đơn hàng hợp lệ trong file");
       return {
         kind,
         file,
@@ -447,13 +474,15 @@ async function parseFile(file: File): Promise<ParsedFile> {
         .map(toFbAdGroupRow)
         .filter((r): r is FbAdGroupRow => r !== null && isFbValuable(r));
       if (rows.length === 0)
-        throw new Error(
-          `File '${file.name}' không có ad group nào chạy (spend 0, clicks 0)`,
+        return rejectedFile(
+          file,
+          kind,
+          "Không có ad group nào chạy (spend 0, clicks 0)",
         );
       return {
         kind,
         file,
-        payload: { filename: file.name, rawContent: text, rows },
+        payload: { filename: file.name, rawContent: text, rows, taxRate: 0 },
       };
     }
     case "fb_campaign": {
@@ -461,13 +490,15 @@ async function parseFile(file: File): Promise<ParsedFile> {
         .map(toFbCampaignRow)
         .filter((r): r is FbCampaignRow => r !== null && isFbValuable(r));
       if (rows.length === 0)
-        throw new Error(
-          `File '${file.name}' không có campaign nào chạy (spend 0, clicks 0)`,
+        return rejectedFile(
+          file,
+          kind,
+          "Không có campaign nào chạy (spend 0, clicks 0)",
         );
       return {
         kind,
         file,
-        payload: { filename: file.name, rawContent: text, rows },
+        payload: { filename: file.name, rawContent: text, rows, taxRate: 0 },
       };
     }
   }
@@ -487,13 +518,46 @@ const IMPORT_CMD: Record<CsvKind, string> = {
   fb_campaign: "import_fb_campaigns",
 };
 
+/** Synthesize ImportPreview cho file rejected (không call Rust). Counts = 0,
+ *  date trống — dialog check cờ `rejected` để render khác. `kind` dùng làm
+ *  type-narrowing key cho UI; nếu detectedKind="unknown" thì fallback
+ *  "fb_campaign" (dialog không show kind label cho rejected nên giá trị
+ *  này không user-visible). */
+function synthRejectedPreview(
+  p: Extract<ParsedFile, { kind: "rejected" }>,
+): ImportPreview {
+  return {
+    kind: p.detectedKind === "unknown" ? "fb_campaign" : p.detectedKind,
+    filename: p.file.name,
+    dayDate: "",
+    dayDateFrom: "",
+    dayDateTo: "",
+    totalRows: 0,
+    newRows: 0,
+    replaceRows: 0,
+    sampleReplace: [],
+    dayHasData: false,
+    alreadyImported: false,
+    hashMatch: false,
+    existingDayDate: null,
+    skipped: 0,
+    emptyRows: 0,
+    mostlyEmpty: false,
+    batchDuplicate: false,
+    rejected: true,
+    rejectReason: p.reason,
+  };
+}
+
 /**
- * Parse + preview tất cả file, validate ngày đồng nhất giữa các file.
- * Throw Error nếu:
- * - File không nhận diện được kind
- * - File có >1 ngày (lỗi từ Rust)
- * - Các file cùng batch khác ngày nhau
- * - File đã import trước đó (hash trùng)
+ * Parse + preview tất cả file. Throw Error CHỈ khi không có file (0 input).
+ * Lỗi per-file (unknown kind, no valid rows, FB all-zero...) wrap thành
+ * ParsedFile kind="rejected" + ImportPreview rejected=true → dialog hiển thị
+ * file + reason, không abort cả batch.
+ *
+ * Multi-day batch OK: mỗi file đã single-day (Rust validate riêng), commit
+ * loop per-file transaction. Cross-file date check trước đây đã bị bỏ —
+ * invariant duy nhất là 1 CSV = 1 ngày, không phải 1 batch = 1 ngày.
  */
 export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
   if (files.length === 0) throw new Error("Chưa chọn file nào");
@@ -507,11 +571,13 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
   // Detect batch-local duplicate hash TRƯỚC khi preview — nếu user lỡ pick
   // cùng 1 file 2 lần (drag-drop + OS picker, hoặc clone tên khác), commit
   // sẽ fail UNIQUE(file_hash) ở file thứ 2. Mark flag để dialog hiện rõ +
-  // commit skip.
+  // commit skip. Rejected files không có rawContent nên skip.
   const hashSeen = new Set<string>();
   const batchDupIndices = new Set<number>();
   for (let i = 0; i < parsed.length; i++) {
-    const hash = await hashSha256(parsed[i].payload.rawContent);
+    const p = parsed[i];
+    if (p.kind === "rejected") continue;
+    const hash = await hashSha256(p.payload.rawContent);
     if (hashSeen.has(hash)) {
       batchDupIndices.add(i);
     } else {
@@ -519,10 +585,12 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
     }
   }
 
-  // Preview song song (mỗi file gọi 1 command khác nhau).
+  // Preview song song. Rejected files không call Rust — synthesize local.
   const previews = await Promise.all(
     parsed.map((p) =>
-      invoke<ImportPreview>(PREVIEW_CMD[p.kind], { payload: p.payload }),
+      p.kind === "rejected"
+        ? Promise.resolve(synthRejectedPreview(p))
+        : invoke<ImportPreview>(PREVIEW_CMD[p.kind], { payload: p.payload }),
     ),
   );
 
@@ -531,28 +599,13 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
     (p as ImportPreview).batchDuplicate = batchDupIndices.has(i);
   });
 
-  // Validate cross-date CHỈ cho FB (single-date). Shopee multi-day OK.
-  // Mỗi FB file phải share cùng ngày với các FB file khác nếu có nhiều; và
-  // cùng ngày với Shopee files. Thực tế 1 batch thường 1 ngày FB → check nhẹ.
-  const fbFiles = previews.filter(
-    (p) => p.kind === "fb_ad_group" || p.kind === "fb_campaign",
-  );
-  if (fbFiles.length > 0) {
-    const fbDates = Array.from(new Set(fbFiles.map((p) => p.dayDate))).sort();
-    if (fbDates.length > 1) {
-      const summary = fbFiles
-        .map((p) => `  • ${p.filename}: ${p.dayDate} (${kindLabel(p.kind)})`)
-        .join("\n");
-      throw new Error(
-        `File FB phải cùng 1 ngày:\n${summary}\n\nImport từng ngày FB riêng lẻ.`,
-      );
-    }
-  }
-
-  // Representative date cho batch: earliest của day_date_from của mọi file.
-  const representative = previews
-    .map((p) => p.dayDateFrom)
-    .sort()[0];
+  // Representative date cho batch: earliest của day_date_from. Bỏ qua
+  // rejected (date trống) — nếu mọi file rejected, representative="".
+  const representative =
+    previews
+      .filter((p) => !p.rejected)
+      .map((p) => p.dayDateFrom)
+      .sort()[0] ?? "";
 
   return {
     dayDate: representative,
@@ -565,27 +618,61 @@ export async function previewCsvBatch(files: File[]): Promise<PreviewBatch> {
  * Gọi tuần tự để nếu 1 file fail thì dừng (data partial là OK vì
  * mỗi file là 1 transaction riêng).
  *
+ * Sort theo dayDate ASC trước khi commit → nếu fail giữa chừng, user biết
+ * chắc các ngày trước đã vào DB, các ngày sau chưa. Predictable cho retry.
+ *
  * `shopeeAccountId`: TK user chọn trong ImportAccountPickerDialog TRƯỚC khi pick
  * file. Gắn cho mọi Shopee file (clicks + commission) trong batch. FB
  * (ad_group/campaign) không dùng account_id — attribution derive qua JOIN
  * sub_ids + day_date ở query time.
+ *
+ * `fbTaxRates`: map index file trong `batch.files` → % thuế (0..100). FB file
+ * có entry sẽ override `payload.taxRate` (mặc định 0 từ parser). Shopee/rejected
+ * key bị bỏ qua. Index dùng làm key vì batch.files giữ nguyên thứ tự pick file
+ * suốt vòng đời preview → dialog state đồng bộ với key.
  */
 export async function commitCsvBatch(
   batch: PreviewBatch,
   shopeeAccountId: string,
+  fbTaxRates: Record<number, number> = {},
 ): Promise<ImportResult[]> {
+  // Lookup tax rate via index in original batch.files BEFORE sort. Sort changes
+  // iteration order nhưng index gốc trong batch.files giữ nguyên → map đúng key.
+  const indexByItem = new Map(
+    batch.files.map((item, idx) => [item, idx] as const),
+  );
+  const sorted = [...batch.files].sort((a, b) => {
+    const dateCmp = a.preview.dayDate.localeCompare(b.preview.dayDate);
+    if (dateCmp !== 0) return dateCmp;
+    return a.preview.filename.localeCompare(b.preview.filename);
+  });
   const results: ImportResult[] = [];
-  for (const { parsed, preview } of batch.files) {
-    // Chỉ skip file duplicate trong CÙNG batch (FE detect) — commit cả 2 sẽ
+  for (const item of sorted) {
+    const { parsed, preview } = item;
+    // Skip rejected (parse-stage failure: unknown kind, no valid rows, FB
+    // all-zero...) — không có payload để commit.
+    if (parsed.kind === "rejected") continue;
+    // Skip file duplicate trong CÙNG batch (FE detect) — commit cả 2 sẽ
     // redundant. File hash match với DB vẫn commit: Rust reuse imported_files
     // entry cũ + UPSERT raw rows (idempotent). Cho phép user re-import để
     // refresh data (vd Shopee update trạng thái đơn trong file mới) hoặc
     // backfill rows đã bị xóa.
     if (preview.batchDuplicate) continue;
-    const payload =
-      parsed.kind === "shopee_clicks" || parsed.kind === "shopee_commission"
-        ? { ...parsed.payload, shopeeAccountId }
-        : parsed.payload;
+    const origIdx = indexByItem.get(item) ?? -1;
+    let payload: unknown;
+    if (parsed.kind === "shopee_clicks" || parsed.kind === "shopee_commission") {
+      payload = { ...parsed.payload, shopeeAccountId };
+    } else {
+      // FB: override taxRate từ user input (dialog state) nếu có; default = 0
+      // từ parser. clamp 0..100 để chống invalid (NaN, âm, > 100) — Rust validate
+      // lần nữa nhưng FE early-fail tốt hơn là round-trip.
+      const userTax = fbTaxRates[origIdx];
+      const taxRate =
+        typeof userTax === "number" && Number.isFinite(userTax)
+          ? Math.min(100, Math.max(0, userTax))
+          : parsed.payload.taxRate;
+      payload = { ...parsed.payload, taxRate };
+    }
     const r = await invoke<ImportResult>(IMPORT_CMD[parsed.kind], { payload });
     results.push(r);
   }

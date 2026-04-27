@@ -14,9 +14,10 @@
 //! **Rule giữ data C2:** Guard fresh_install_pending = 1 suốt process. Nếu
 //! crash giữa → next start detect + continue (bootstrap idempotent).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use super::descriptors::{CursorKind, SYNC_TABLES};
 use super::manifest;
 
 /// Check local DB có "empty" theo semantic bootstrap: không có raw data, không
@@ -118,24 +119,57 @@ pub fn seed_cursor_after_restore(
     conn: &Connection,
     snapshot_clock_ms: i64,
 ) -> Result<()> {
-    // Snapshot đã copy nguyên sync_cursor_state của máy tạo snapshot. Nhưng
-    // last_uploaded_cursor không apply cho máy mới (máy mới chưa upload gì).
-    // Reset last_uploaded_cursor = last_pulled_cursor (coi như đã upload
-    // tới mức snapshot) — tránh re-push toàn bộ rows vừa restore.
+    // Bug D fix: last_uploaded_cursor PHẢI = MAX(cursor_column) of LOCAL table
+    // sau restore, KHÔNG phải = last_pulled_cursor.
     //
-    // Flow: A tạo snapshot → B restore. B đã có data của A. Nếu B push,
-    // chỉ push rows > cursor đã có trong snapshot. Set
-    // last_uploaded_cursor = max cursor trong mỗi table sau restore.
+    // Lý do: cursor space khác nhau giữa 2 column.
+    // - RowId tables: cursor = local rowid. Snapshot preserve A's rowids →
+    //   B inherit cùng rowids. MAX(rowid) sau restore = A's max rowid.
+    //   `last_pulled_cursor` của A là remote cursor (manifest entry's cursor_hi
+    //   reference máy nguồn) — NOT cùng space với local rowid. Nếu copy
+    //   last_pulled → last_uploaded, B's push sẽ thấy mọi rowid > last_pulled
+    //   pending → re-upload toàn bộ snapshot rows = data flood, hệt Bug A.
+    // - UpdatedAt/DeletedAt tables: cursor = RFC3339 string preserve qua
+    //   serialize, A's last_pulled = max(updated_at) đã pull. Sau restore,
+    //   MAX(local updated_at) bao gồm cả rows máy A push lẫn pull về →
+    //   ≥ last_pulled. Dùng MAX cũng đúng cho kind này.
     //
-    // Since we don't know per-table max easily, conservative approach:
-    // copy last_pulled_cursor → last_uploaded_cursor.
-    conn.execute(
-        "UPDATE sync_cursor_state
-         SET last_uploaded_cursor = last_pulled_cursor,
-             last_uploaded_hash = NULL,
-             updated_at = ?",
-        [chrono::Utc::now().to_rfc3339()],
-    )?;
+    // Per-table MAX(cursor_column): chính xác cho mọi CursorKind. Idempotent.
+    let now = chrono::Utc::now().to_rfc3339();
+    for desc in SYNC_TABLES {
+        let cursor_col = match desc.cursor_kind {
+            CursorKind::RowId => "rowid",
+            _ => desc.cursor_column,
+        };
+        let max_val: Option<rusqlite::types::Value> = conn
+            .query_row(
+                &format!("SELECT MAX({}) FROM {}", cursor_col, desc.name),
+                [],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("seed_cursor MAX cho {}", desc.name))?;
+        let max_str = match max_val {
+            Some(rusqlite::types::Value::Integer(n)) => n.to_string(),
+            Some(rusqlite::types::Value::Text(s)) => s,
+            Some(rusqlite::types::Value::Real(f)) => f.to_string(),
+            // Bảng rỗng → giữ "0" (initial). KHÔNG copy last_pulled_cursor
+            // vì có thể trong remote-cursor space (RowId tables).
+            _ => "0".to_string(),
+        };
+        // Reset last_uploaded_hash = NULL → next push compute hash mới (skip-
+        // identical sẽ re-baseline). Reset last_full_hash = NULL → 4 bảng nhỏ
+        // dedup chạy lại baseline lần đầu.
+        conn.execute(
+            "UPDATE sync_cursor_state
+             SET last_uploaded_cursor = ?,
+                 last_uploaded_hash = NULL,
+                 last_full_hash = NULL,
+                 updated_at = ?
+             WHERE table_name = ?",
+            rusqlite::params![max_str, now, desc.name],
+        )
+        .with_context(|| format!("seed_cursor UPDATE cho {}", desc.name))?;
+    }
 
     // Advance manifest clock để pull không duplicate events đã trong snapshot.
     manifest::advance_pulled_clock(conn, snapshot_clock_ms)?;
@@ -319,10 +353,15 @@ mod tests {
         assert_eq!(state.last_pulled_manifest_clock_ms, 500);
     }
 
+    /// Bug D regression: post-fix, last_uploaded_cursor = MAX(cursor_column)
+    /// LOCAL, không phải last_pulled_cursor. Cho RowId tables (raw_*),
+    /// last_pulled là remote-cursor space → copy sai → push sẽ flood
+    /// re-upload toàn bộ snapshot rows.
     #[test]
-    fn seed_cursor_copies_pulled_to_uploaded() {
+    fn seed_cursor_uses_local_max_not_pulled_cursor() {
         let conn = test_conn();
-        // Simulate snapshot có cursor advance (pulled=100 for raw_shopee_clicks).
+        // Snapshot từ máy A: A's last_pulled_cursor = 100 (REMOTE rowid space,
+        // không relevant cho B's local rowid). raw_shopee_clicks rỗng.
         conn.execute(
             "UPDATE sync_cursor_state
              SET last_pulled_cursor = '100'
@@ -332,6 +371,7 @@ mod tests {
         .unwrap();
 
         seed_cursor_after_restore(&conn, 0).unwrap();
+
         let uploaded: String = conn
             .query_row(
                 "SELECT last_uploaded_cursor FROM sync_cursor_state
@@ -340,7 +380,112 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(uploaded, "100", "last_uploaded_cursor = last_pulled_cursor");
+        // Table rỗng → "0" (KHÔNG phải "100"). Nếu = "100", push pipeline sẽ
+        // capture rowid > 100 (mà rowid bắt đầu từ 1) → flood không cần thiết.
+        assert_eq!(
+            uploaded, "0",
+            "last_uploaded = MAX(rowid) = 0 vì table rỗng, KHÔNG phải last_pulled"
+        );
+    }
+
+    #[test]
+    fn seed_cursor_uses_max_rowid_when_table_has_rows() {
+        let conn = test_conn();
+        // Simulate snapshot restore: rows trong raw_shopee_clicks (rowid 1-3).
+        let file_id = seed_file(&conn, "h1");
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        for cid in ["c1", "c2", "c3"] {
+            conn.execute(
+                "INSERT INTO raw_shopee_clicks
+                 (click_id, click_time, day_date, source_file_id)
+                 VALUES(?, 'now', '2026-04-20', ?)",
+                rusqlite::params![cid, file_id],
+            )
+            .unwrap();
+        }
+        // last_pulled từ A = 999 (irrelevant remote space).
+        conn.execute(
+            "UPDATE sync_cursor_state SET last_pulled_cursor = '999' WHERE table_name = 'raw_shopee_clicks'",
+            [],
+        )
+        .unwrap();
+
+        seed_cursor_after_restore(&conn, 0).unwrap();
+
+        let uploaded: String = conn
+            .query_row(
+                "SELECT last_uploaded_cursor FROM sync_cursor_state WHERE table_name = 'raw_shopee_clicks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uploaded, "3", "MAX(rowid) = 3, không phải 999 (remote space)");
+    }
+
+    #[test]
+    fn seed_cursor_handles_updated_at_table() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manual_entries
+             (sub_id1, day_date, created_at, updated_at)
+             VALUES('a', '2026-04-20', 'now', '2026-04-26T08:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manual_entries
+             (sub_id1, day_date, created_at, updated_at)
+             VALUES('b', '2026-04-20', 'now', '2026-04-26T09:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        seed_cursor_after_restore(&conn, 0).unwrap();
+
+        let uploaded: String = conn
+            .query_row(
+                "SELECT last_uploaded_cursor FROM sync_cursor_state WHERE table_name = 'manual_entries'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uploaded, "2026-04-26T09:00:00Z");
+    }
+
+    #[test]
+    fn seed_cursor_resets_full_hash_baseline() {
+        // Bug D fix side effect: last_full_hash NULL sau restore. Reason:
+        // 4 bảng nhỏ dedup so hash full vs baseline. Snapshot bao gồm A's
+        // last_full_hash → B inherit = hash của A's state. Nhưng B's content
+        // = A's content sau restore → hash match → dedup skip lần đầu.
+        // Nguy hiểm: B chưa upload bất kỳ delta nào, dedup advance cursor mà
+        // không upload → nếu user mutate ngay sau restore, cursor đã quá xa
+        // → mất data nếu state mới != baseline. Reset NULL ép baseline init lại.
+        let conn = test_conn();
+        conn.execute(
+            "UPDATE sync_cursor_state SET last_full_hash = 'inherited_from_A'
+             WHERE table_name = 'app_settings'",
+            [],
+        )
+        .unwrap();
+        seed_cursor_after_restore(&conn, 0).unwrap();
+        let h: Option<String> = conn
+            .query_row(
+                "SELECT last_full_hash FROM sync_cursor_state WHERE table_name = 'app_settings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(h.is_none(), "last_full_hash phải reset NULL sau restore");
     }
 
     #[test]

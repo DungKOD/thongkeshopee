@@ -25,6 +25,12 @@ interface SubIdTimelineBlockProps {
 
 const HEADERS: Array<{ label: string; tooltip?: string }> = [
   { label: "Ngày" },
+  {
+    label: "TK Shopee",
+    tooltip:
+      "Tài khoản Shopee mà dòng này thuộc về. 'FB chung' = quảng cáo FB " +
+      "có ≥2 TK Shopee cùng tuple sub_id trong ngày.",
+  },
   { label: "Click ADS", tooltip: "Tổng click quảng cáo FB (link_clicks)" },
   {
     label: "Click Shopee",
@@ -75,8 +81,24 @@ export function SubIdTimelineBlock({
   const { settings } = useSettings();
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
 
-  // Flatten: each day có đúng 1 row match (đã filter từ App). Giữ thứ tự days (DESC).
+  // Flatten rows giữ thứ tự days (DESC). Sau v0.4.5+ aggregate split per-acc:
+  // 1 day có thể có nhiều row cùng tuple — tab này hiện hết, mỗi row 1 acc.
   const flatRows = useMemo(() => days.flatMap((d) => d.rows), [days]);
+
+  // Cột TK Shopee chỉ render khi filter=All (giống DayBlock).
+  const showAccount = !accountFilter || accountFilter.kind === "all";
+  const headers = useMemo(
+    () =>
+      showAccount ? HEADERS : HEADERS.filter((h) => h.label !== "TK Shopee"),
+    [showAccount],
+  );
+
+  // Đếm distinct dayDate cho label "X ngày có data" (rows.length over-count
+  // khi multi-acc same day).
+  const distinctDays = useMemo(
+    () => new Set(flatRows.map((r) => r.dayDate)).size,
+    [flatRows],
+  );
 
   const totals = useMemo(() => {
     return flatRows.reduce(
@@ -88,6 +110,7 @@ export function SubIdTimelineBlock({
         );
         acc.totalSpend += r.totalSpend ?? 0;
         acc.orders += r.ordersCount;
+        acc.orderValueTotal += r.orderValueTotal;
         acc.commission += r.commissionTotal;
         const net = computeNetCommission(
           r.commissionTotal,
@@ -102,6 +125,7 @@ export function SubIdTimelineBlock({
         shopeeClicks: 0,
         totalSpend: 0,
         orders: 0,
+        orderValueTotal: 0,
         commission: 0,
         profit: 0,
       },
@@ -135,7 +159,7 @@ export function SubIdTimelineBlock({
           </div>
           <div className="ml-4 inline-flex items-center gap-1 rounded-full bg-shopee-900/40 px-3 py-1 text-xs font-medium text-shopee-300">
             <span className="material-symbols-rounded text-sm">timeline</span>
-            {flatRows.length} ngày có data
+            {distinctDays} ngày có data
           </div>
         </div>
       </header>
@@ -144,7 +168,7 @@ export function SubIdTimelineBlock({
         <table className="w-full border-collapse text-sm">
           <thead>
             <tr className="border-b-2 border-shopee-500/50 bg-gradient-to-b from-shopee-900/35 to-shopee-900/15 text-shopee-100">
-              {HEADERS.map((h, i) => (
+              {headers.map((h, i) => (
                 <th
                   key={i}
                   title={h.tooltip}
@@ -167,10 +191,11 @@ export function SubIdTimelineBlock({
           <tbody>
             {flatRows.map((r) => (
               <TimelineRow
-                key={uiRowKey(r.dayDate, r.subIds)}
+                key={uiRowKey(r.dayDate, r.subIds, r.accountId)}
                 row={r}
+                showAccount={showAccount}
                 pending={pendingRowDeletes.has(
-                  uiRowKey(r.dayDate, r.subIds),
+                  uiRowKey(r.dayDate, r.subIds, r.accountId),
                 )}
                 onEdit={() => onEditRow(r)}
                 onToggleDelete={() => onToggleRowDelete(r)}
@@ -191,15 +216,33 @@ export function SubIdTimelineBlock({
                 {fmtInt(totals.shopeeClicks)}
               </td>
               <td />
-              <td className="px-3 py-4 text-center tabular-nums">
+              <td className="px-3 py-4 text-center tabular-nums text-blue-400">
                 {fmtVnd(totals.totalSpend)}
               </td>
               <td className="px-3 py-4 text-center tabular-nums">
                 {fmtInt(totals.orders)}
               </td>
-              <td />
-              <td />
-              <td className="px-3 py-4 text-center tabular-nums">
+              <td
+                className="px-3 py-4 text-center tabular-nums"
+                title={
+                  totals.shopeeClicks === 0
+                    ? "Không có Click Shopee → không tính được CR"
+                    : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
+                }
+              >
+                {totals.shopeeClicks > 0
+                  ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
+                  : "—"}
+              </td>
+              <td
+                className="px-3 py-4 text-center tabular-nums"
+                title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
+              >
+                {totals.orders > 0
+                  ? fmtVnd(totals.orderValueTotal / totals.orders)
+                  : "—"}
+              </td>
+              <td className="px-3 py-4 text-center tabular-nums text-shopee-400">
                 {fmtVnd(totals.commission)}
               </td>
               <td
@@ -231,6 +274,7 @@ interface TimelineRowProps {
   onToggleDelete: () => void;
   onViewDetail: () => void;
   readOnly?: boolean;
+  showAccount?: boolean;
 }
 
 function TimelineRow({
@@ -240,6 +284,7 @@ function TimelineRow({
   onToggleDelete,
   onViewDetail,
   readOnly = false,
+  showAccount = false,
 }: TimelineRowProps) {
   const { settings } = useSettings();
   const shopeeClicks = sumFiltered(
@@ -281,6 +326,25 @@ function TimelineRow({
       <td className={`${cellCls} tabular-nums font-medium ${dataCellPending}`}>
         {fmtDate(row.dayDate)}
       </td>
+      {showAccount && (
+        <td className={`${cellCls} ${dataCellPending}`}>
+          {row.accountName ? (
+            <span
+              className="inline-block max-w-[140px] truncate rounded-md bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-200"
+              title={row.accountName}
+            >
+              {row.accountName}
+            </span>
+          ) : (
+            <span
+              className="inline-block rounded-md bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300"
+              title="FB ad có ≥2 TK Shopee cùng tuple sub_id trong ngày — không quy được duy nhất 1 TK"
+            >
+              FB chung
+            </span>
+          )}
+        </td>
+      )}
       <td
         className={`${cellCls} tabular-nums ${dataCellPending} ${
           clicksCell?.cls ?? ""
@@ -298,7 +362,7 @@ function TimelineRow({
       </td>
       <td
         className={`${cellCls} tabular-nums ${dataCellPending} ${
-          spendCell?.cls ?? ""
+          spendCell?.cls ?? "text-blue-400"
         }`}
       >
         {spendCell ? spendCell.text : fmtVnd(row.totalSpend ?? 0)}
@@ -320,7 +384,7 @@ function TimelineRow({
       >
         {row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
       </td>
-      <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
+      <td className={`${cellCls} tabular-nums text-shopee-400 ${dataCellPending}`}>
         {fmtVnd(row.commissionTotal)}
       </td>
       <td

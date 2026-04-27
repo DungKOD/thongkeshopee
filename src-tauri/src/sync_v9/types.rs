@@ -164,6 +164,11 @@ pub struct CursorState {
     /// Hash của last uploaded delta content. Skip-identical: nếu content mới
     /// hash trùng → skip upload (tiết kiệm Class A op).
     pub last_uploaded_hash: Option<String>,
+    /// SHA-256 hash của FULL TABLE content tại lần upload gần nhất. Dùng cho
+    /// revert detection ở 4 bảng nhỏ — pre-flush hash hiện tại == giá trị này
+    /// → skip upload (mọi mutation trong window đã revert về baseline). Bảng
+    /// to (raw_*) luôn `None` vì hash O(N) tốn CPU.
+    pub last_full_hash: Option<String>,
     /// Timestamp update row này (local clock, không HLC — không sync-critical).
     pub updated_at: String,
 }

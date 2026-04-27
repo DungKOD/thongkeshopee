@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { ProfitFees, Settings } from "../hooks/useSettings";
+import { useIsAdmin } from "../hooks/usePremium";
+import { AdminDeviceManagement } from "./AdminDeviceManagement";
 import { ImportHistorySection } from "./ImportHistorySection";
 import { invoke } from "../lib/tauri";
 
@@ -18,6 +20,7 @@ interface SettingsDialogProps {
   productsCount: number;
   onToggleClickSource: (source: string, enabled: boolean) => void;
   onSetProfitFee: (key: keyof ProfitFees, value: number) => void;
+  onSetAutoSyncEnabled: (enabled: boolean) => void;
   onClose: () => void;
   /** Trigger reload lịch sử import ngoài (bump khi có import/delete). */
   importHistoryReloadKey?: number;
@@ -32,6 +35,7 @@ export function SettingsDialog({
   productsCount,
   onToggleClickSource,
   onSetProfitFee,
+  onSetAutoSyncEnabled,
   onClose,
   importHistoryReloadKey,
   onImportReverted,
@@ -70,6 +74,21 @@ export function SettingsDialog({
       cancelled = true;
     };
   }, [isOpen]);
+
+  // Lock guard cho 2 section nhạy cảm — sửa nhầm có hệ quả lớn (recompute
+  // toàn bộ profit / filter click). Default LOCKED mỗi lần mở dialog. User
+  // phải bấm 🔒 → 🔓 để sửa, sau đó nên bấm lại để khoá. State per-section
+  // (user thường chỉ sửa 1 trong 2). Reset về locked khi dialog đóng.
+  const [feesLocked, setFeesLocked] = useState(true);
+  const [sourcesLocked, setSourcesLocked] = useState(true);
+  useEffect(() => {
+    if (!isOpen) {
+      setFeesLocked(true);
+      setSourcesLocked(true);
+    }
+  }, [isOpen]);
+
+  const isAdmin = useIsAdmin();
 
   if (!isOpen) return null;
 
@@ -138,12 +157,18 @@ export function SettingsDialog({
           </section>
 
           <section>
-            <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
-              <span className="material-symbols-rounded text-base">
-                payments
-              </span>
-              Phí khấu trừ lợi nhuận
-            </h3>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+                <span className="material-symbols-rounded text-base">
+                  payments
+                </span>
+                Phí khấu trừ lợi nhuận
+              </h3>
+              <LockButton
+                locked={feesLocked}
+                onToggle={() => setFeesLocked((v) => !v)}
+              />
+            </div>
             <p className="mb-3 text-xs text-white/50">
               Net = Hoa hồng × (1 − Thuế) − Hoa hồng <i>pending</i> × Dự phòng
             </p>
@@ -152,11 +177,13 @@ export function SettingsDialog({
                 label="Thuế + phí sàn"
                 value={settings.profitFees.taxAndPlatformRate}
                 onChange={(v) => onSetProfitFee("taxAndPlatformRate", v)}
+                disabled={feesLocked}
               />
               <FeeInput
                 label="Dự phòng hoàn/hủy"
                 value={settings.profitFees.returnReserveRate}
                 onChange={(v) => onSetProfitFee("returnReserveRate", v)}
+                disabled={feesLocked}
               />
             </div>
             <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
@@ -179,10 +206,70 @@ export function SettingsDialog({
           <section>
             <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
               <span className="material-symbols-rounded text-base">
-                filter_list
+                cloud_sync
               </span>
-              Nguồn Click Shopee
+              Đồng bộ tự động
             </h3>
+            <p className="mb-3 text-xs text-white/50">
+              Bật để tự động đẩy thay đổi (import/sửa/xóa) lên R2 sau 45 giây.
+              Tắt thì phải bấm <b>"Đồng bộ ngay"</b> trong icon đám mây.
+            </p>
+            <label className="flex cursor-pointer items-center gap-3 rounded-xl bg-surface-6 px-4 py-3 text-sm text-white/85 shadow-elev-1 transition-colors hover:bg-white/5">
+              <input
+                type="checkbox"
+                checked={settings.autoSyncEnabled}
+                onChange={(e) =>
+                  onSetAutoSyncEnabled(e.currentTarget.checked)
+                }
+                className="h-4 w-4 accent-shopee-500"
+              />
+              <span className="flex-1">
+                <span className="font-medium">
+                  Tự động sync sau mỗi thao tác
+                </span>
+                <span className="ml-2 text-xs text-white/50">
+                  (debounce 45s, gom batch lên R2)
+                </span>
+              </span>
+              {settings.autoSyncEnabled ? (
+                <span className="rounded-full bg-green-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-green-300">
+                  ON
+                </span>
+              ) : (
+                <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+                  OFF
+                </span>
+              )}
+            </label>
+            {!settings.autoSyncEnabled && (
+              <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
+                <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
+                  warning
+                </span>
+                <div>
+                  Auto-sync đang tắt. Thay đổi local <b>không tự đẩy lên R2</b>{" "}
+                  — nếu mở app trên máy khác (hoặc app crash), data mới có thể
+                  chưa được backup. Pull từ R2 và RTDB notify vẫn hoạt động.
+                </div>
+              </div>
+            )}
+          </section>
+
+          {isAdmin && <AdminDeviceManagement />}
+
+          <section>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+                <span className="material-symbols-rounded text-base">
+                  filter_list
+                </span>
+                Nguồn Click Shopee
+              </h3>
+              <LockButton
+                locked={sourcesLocked}
+                onToggle={() => setSourcesLocked((v) => !v)}
+              />
+            </div>
             <p className="mb-3 text-xs text-white/50">
               Chọn loại referrer (cột "Người giới thiệu") sẽ được tính vào ô
               Click Shopee. Danh sách tự cập nhật sau mỗi lần Import.
@@ -195,17 +282,29 @@ export function SettingsDialog({
                 referrer.
               </div>
             ) : (
-              <ul className="divide-y divide-surface-8 overflow-hidden rounded-xl bg-surface-6">
+              <ul
+                className={`divide-y divide-surface-8 overflow-hidden rounded-xl bg-surface-6 ${
+                  sourcesLocked ? "opacity-60" : ""
+                }`}
+              >
                 {sources.map(([source, enabled]) => (
                   <li key={source}>
-                    <label className="flex cursor-pointer items-center gap-3 px-4 py-3 text-sm text-white/85 transition-colors hover:bg-white/5">
+                    <label
+                      className={`flex items-center gap-3 px-4 py-3 text-sm text-white/85 transition-colors ${
+                        sourcesLocked
+                          ? "cursor-not-allowed"
+                          : "cursor-pointer hover:bg-white/5"
+                      }`}
+                      title={sourcesLocked ? "Đã khoá — bấm 🔒 ở header để mở" : undefined}
+                    >
                       <input
                         type="checkbox"
                         checked={enabled}
+                        disabled={sourcesLocked}
                         onChange={(e) =>
                           onToggleClickSource(source, e.currentTarget.checked)
                         }
-                        className="h-4 w-4 accent-shopee-500"
+                        className="h-4 w-4 accent-shopee-500 disabled:cursor-not-allowed"
                       />
                       <span className="flex-1">{source}</span>
                       {enabled ? (
@@ -385,11 +484,17 @@ interface FeeInputProps {
   label: string;
   value: number;
   onChange: (v: number) => void;
+  disabled?: boolean;
 }
 
-function FeeInput({ label, value, onChange }: FeeInputProps) {
+function FeeInput({ label, value, onChange, disabled = false }: FeeInputProps) {
   return (
-    <label className="flex flex-col gap-1 rounded-xl bg-surface-6 px-3 py-2 shadow-elev-1">
+    <label
+      className={`flex flex-col gap-1 rounded-xl bg-surface-6 px-3 py-2 shadow-elev-1 ${
+        disabled ? "opacity-60" : ""
+      }`}
+      title={disabled ? "Đã khoá — bấm 🔒 ở header để mở" : undefined}
+    >
       <span className="text-xs text-white/55">{label}</span>
       <div className="flex items-center gap-1">
         <input
@@ -399,15 +504,49 @@ function FeeInput({ label, value, onChange }: FeeInputProps) {
           min="0"
           max="100"
           value={value}
+          disabled={disabled}
+          // Wheel scroll mặc định tăng/giảm number input — dễ tai nạn khi user
+          // scroll dialog. Blur input khi wheel → mất focus → wheel không sửa.
+          onWheel={(e) => (e.target as HTMLInputElement).blur()}
           onChange={(e) => {
             const raw = e.currentTarget.value;
             const n = raw === "" ? 0 : Number(raw);
             onChange(Number.isFinite(n) ? n : 0);
           }}
-          className="w-full rounded-md border border-surface-8 bg-surface-1 px-2 py-1 text-right text-lg font-semibold tabular-nums text-shopee-300 focus:border-shopee-500 focus:outline-none focus:ring-1 focus:ring-shopee-500"
+          className="w-full rounded-md border border-surface-8 bg-surface-1 px-2 py-1 text-right text-lg font-semibold tabular-nums text-shopee-300 focus:border-shopee-500 focus:outline-none focus:ring-1 focus:ring-shopee-500 disabled:cursor-not-allowed"
         />
         <span className="text-sm text-white/60">%</span>
       </div>
     </label>
+  );
+}
+
+/// Lock toggle cho section nhạy cảm — bảo vệ khỏi click nhầm. Default LOCKED
+/// mỗi lần dialog mở; user phải bấm chủ động để mở khoá. State quản lý ở
+/// parent (SettingsDialog).
+function LockButton({
+  locked,
+  onToggle,
+}: {
+  locked: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className={`btn-ripple flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider transition-colors ${
+        locked
+          ? "bg-amber-500/15 text-amber-300 hover:bg-amber-500/25"
+          : "bg-green-500/20 text-green-300 hover:bg-green-500/30"
+      }`}
+      title={locked ? "Bấm để mở khoá sửa" : "Bấm để khoá lại"}
+      aria-pressed={!locked}
+    >
+      <span className="material-symbols-rounded text-sm">
+        {locked ? "lock" : "lock_open"}
+      </span>
+      {locked ? "Đã khoá" : "Đang sửa"}
+    </button>
   );
 }

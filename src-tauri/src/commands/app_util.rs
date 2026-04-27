@@ -39,6 +39,32 @@ pub fn machine_fingerprint() -> String {
     machine_fingerprint_raw()
 }
 
+/// Thông tin device hiển thị cho admin trong "Quản lý thiết bị user".
+/// `fingerprint` là key (ổn định qua reinstall same machine);
+/// `hostname` + `os` chỉ phục vụ admin nhận biết "máy nào của user".
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceInfo {
+    pub fingerprint: String,
+    pub hostname: String,
+    pub os: String,
+}
+
+/// Tauri command — FE lấy thông tin device hiện tại để register vào RTDB
+/// `/user_devices/{uid}/{fingerprint}` sau khi login.
+#[tauri::command]
+pub fn get_device_info() -> DeviceInfo {
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    DeviceInfo {
+        fingerprint: machine_fingerprint_raw(),
+        hostname,
+        os: std::env::consts::OS.to_string(),
+    }
+}
+
 // =============================================================
 // App data paths (UI debug / support)
 // =============================================================

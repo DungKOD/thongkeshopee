@@ -70,6 +70,10 @@ pub fn run() {
             commands::manual::save_manual_entry,
             commands::manual::delete_manual_entry,
             commands::manual::has_manual_entry,
+            commands::app_settings::get_app_setting,
+            commands::app_settings::list_app_settings,
+            commands::app_settings::set_app_setting,
+            commands::app_settings::set_app_settings_bulk,
             commands::batch::batch_commit_deletes,
             commands::batch::revert_import,
             commands::video::get_video_info,
@@ -86,6 +90,7 @@ pub fn run() {
             // App utilities (P8b: relocated từ v8 commands::sync).
             commands::app_util::restart_app,
             commands::app_util::machine_fingerprint,
+            commands::app_util::get_device_info,
             commands::app_util::switch_db_to_user,
             commands::app_util::admin_list_users,
             commands::app_util::get_app_data_paths,

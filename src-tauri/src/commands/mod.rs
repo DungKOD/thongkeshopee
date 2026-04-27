@@ -8,6 +8,7 @@
 
 pub mod accounts;
 pub mod admin_view;
+pub mod app_settings;
 pub mod app_util;
 pub mod batch;
 pub mod imports;

@@ -79,7 +79,8 @@ pub fn build_push_payload(batch: CaptureBatch) -> Result<PushPayload> {
 /// Đọc cursor state cho 1 table. Trả row từ `sync_cursor_state`.
 pub fn read_cursor(conn: &Connection, table: &str) -> Result<CursorState> {
     conn.query_row(
-        "SELECT table_name, last_uploaded_cursor, last_pulled_cursor, last_uploaded_hash, updated_at
+        "SELECT table_name, last_uploaded_cursor, last_pulled_cursor,
+                last_uploaded_hash, last_full_hash, updated_at
          FROM sync_cursor_state WHERE table_name = ?",
         [table],
         |r| {
@@ -88,7 +89,8 @@ pub fn read_cursor(conn: &Connection, table: &str) -> Result<CursorState> {
                 last_uploaded_cursor: r.get(1)?,
                 last_pulled_cursor: r.get(2)?,
                 last_uploaded_hash: r.get(3)?,
-                updated_at: r.get(4)?,
+                last_full_hash: r.get(4)?,
+                updated_at: r.get(5)?,
             })
         },
     )
@@ -238,6 +240,12 @@ pub struct TableBundleRange {
     /// Hash riêng cho content NDJSON của table này (pre-merge). Dùng
     /// skip-identical check ở mark_uploaded. KHÔNG phải hash bundle.
     pub content_hash: String,
+    /// SHA-256 full table content (chỉ set cho `dedup::FULL_HASH_DEDUP_TABLES`).
+    /// PRECOMPUTED ngay sau capture trong cùng DB lock — caller dùng làm
+    /// baseline `last_full_hash` post-upload, tránh race: nếu hash sau khi
+    /// release lock + reacquire, mutation race có thể đã xảy ra → baseline
+    /// bao gồm row chưa upload → lần dedup tiếp theo skip nhầm row đó.
+    pub full_hash_snapshot: Option<String>,
 }
 
 /// Bundle push payload — 1 file R2 chứa events nhiều tables.
@@ -316,12 +324,22 @@ pub fn plan_push_bundle(
         // Merge vào all_ndjson — NDJSON append-safe (mỗi event 1 line).
         all_ndjson.extend_from_slice(&batch.ndjson);
 
+        // Precompute full-table hash cho bảng eligible (đang còn trong DB lock).
+        // Race-safe baseline: caller dùng giá trị này set last_full_hash sau
+        // upload OK, KHÔNG re-hash từ DB (có thể đã có race mutation).
+        let full_hash_snapshot = if super::dedup::is_full_hash_eligible(descriptor.name) {
+            Some(super::dedup::compute_table_full_hash(conn, descriptor)?)
+        } else {
+            None
+        };
+
         ranges.push(TableBundleRange {
             table: batch.table,
             cursor_lo: batch.cursor_lo,
             cursor_hi: batch.cursor_hi,
             row_count,
             content_hash,
+            full_hash_snapshot,
         });
     }
 
