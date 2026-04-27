@@ -192,10 +192,14 @@ export function useCloudSync({
   /// Timestamp mutation ĐẦU TIÊN sau lần sync gần nhất. Dùng MAX_WAIT_MS cap.
   /// 0 = chưa có mutation pending.
   const firstMutationAtRef = useRef(0);
-  /// mutationVersion đã được effect dưới xử lý lần cuối. Dùng phân biệt
-  /// "mutation thật" với "effect re-run do dep khác đổi" (autoSyncEnabled /
-  /// pausedByForm). Toggle setting KHÔNG được mark dirty khi mutationVersion
-  /// chưa tăng — nếu không user tắt/bật auto-sync sẽ thấy "Chờ đồng bộ" giả.
+  /// mutationVersion đã được effect dưới "swallow" (xử lý hoặc bail vì status).
+  /// Dùng phân biệt "mutation thật" với "effect re-run do dep khác đổi"
+  /// (autoSyncEnabled / pausedByForm). Toggle setting KHÔNG được mark dirty
+  /// khi mutationVersion chưa tăng — nếu không user tắt/bật auto-sync sẽ thấy
+  /// "Chờ đồng bộ" giả. CRITICAL: ref phải update CẢ trên path bail vì status
+  /// (checking/syncing/offline/bootstrap) — doSync chịu trách nhiệm gọi
+  /// setStatus("dirty") qua pendingPushTables post-sync; effect không tự
+  /// re-run khi status đổi (không trong dep array).
   const lastSeenMutationRef = useRef(0);
   const statusRef = useRef<SyncStatus>(status);
   useEffect(() => {
@@ -577,6 +581,14 @@ export function useCloudSync({
       status === "offline" ||
       status === "bootstrap"
     ) {
+      // Swallow mutation version ngay cả khi bail. doSync (đang/sắp chạy)
+      // sẽ đọc pendingPushTables post-sync → tự setStatus("dirty") +
+      // scheduleDebounce nếu có row thật chưa upload. Không swallow ở đây
+      // → mutation phát sinh trong "syncing" sẽ "stranded": status không
+      // có trong dep array nên effect không tự re-run khi status quay về
+      // "idle"; toggle autoSyncEnabled/pausedByForm sau đó sẽ trigger
+      // setStatus("dirty") giả dù pendingPushTables rỗng.
+      lastSeenMutationRef.current = mutationVersion;
       return;
     }
     if (mutationVersion === 0) return;
