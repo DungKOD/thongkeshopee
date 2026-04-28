@@ -710,7 +710,7 @@ pub async fn sync_v9_compact_if_needed(
     // 1. Ưu tiên đọc manifest từ cache — sync_v9_push_all vừa chạy trước
     //    compact_if_needed (FE sequence) sẽ cache_put manifest mới nhất.
     //    Tiết kiệm 1 R2 GET/sync cycle khi compact chưa đủ threshold (case
-    //    chiếm đa số — threshold ~100 deltas, mutation thông thường <20/ngày).
+    //    chiếm đa số — threshold 30 deltas, mutation thông thường <20/ngày).
     //    Cache TTL 60s → stale detection vẫn hoạt động nếu flow chậm.
     let (manifest, cached_etag) = match crate::sync_v9::manifest_cache::cache_get() {
         Some((m, e)) => (m, Some(e)),

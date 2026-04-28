@@ -24,9 +24,24 @@ use super::snapshot::{create_snapshot, SnapshotArtifact};
 use super::types::{Manifest, ManifestSnapshot};
 use super::COMPACTION_DELTA_THRESHOLD;
 
-/// Check có nên chạy compaction không. Đơn giản theo `manifest.deltas.len()`.
+/// Check có nên chạy compaction không.
+///
+/// Hai trigger:
+/// 1. **Threshold-based** (steady-state): `manifest.deltas.len() > COMPACTION_DELTA_THRESHOLD`.
+///    Light user dồn deltas lâu → compact periodic (~1 lần/tháng với threshold 30).
+/// 2. **Eager initial snapshot**: `latest_snapshot is None && !deltas.is_empty()`.
+///    User chưa từng compact + đã có ít nhất 1 push → ép compact ngay.
+///    Lý do: admin view (`/v9/admin/snapshot`) trả 404 nếu user chưa có snapshot.
+///    Eager trigger đảm bảo snapshot tồn tại từ push đầu tiên → admin luôn xem
+///    được mọi user đã sync ít nhất 1 lần.
 pub fn should_compact(manifest: &Manifest) -> bool {
-    manifest.deltas.len() > COMPACTION_DELTA_THRESHOLD
+    if manifest.deltas.len() > COMPACTION_DELTA_THRESHOLD {
+        return true;
+    }
+    if manifest.latest_snapshot.is_none() && !manifest.deltas.is_empty() {
+        return true;
+    }
+    false
 }
 
 /// Kết quả compaction cho FE/logging.
@@ -113,21 +128,47 @@ mod tests {
     }
 
     #[test]
-    fn should_compact_below_threshold() {
+    fn should_compact_below_threshold_with_existing_snapshot() {
         let mut m = Manifest::empty("uid".to_string());
-        for i in 0..100 {
-            m.deltas.push(entry(&format!("k{i}"), i));
+        m.latest_snapshot = Some(crate::sync_v9::types::ManifestSnapshot {
+            key: "snapshots/snap_1.db.zst".to_string(),
+            clock_ms: 1,
+            size_bytes: 100,
+        });
+        for i in 0..COMPACTION_DELTA_THRESHOLD {
+            m.deltas.push(entry(&format!("k{i}"), i as i64));
         }
-        assert!(!should_compact(&m), "100 deltas chưa trigger (threshold > 100)");
+        assert!(
+            !should_compact(&m),
+            "≤ threshold + đã có snapshot → không trigger"
+        );
     }
 
     #[test]
     fn should_compact_above_threshold() {
         let mut m = Manifest::empty("uid".to_string());
-        for i in 0..101 {
-            m.deltas.push(entry(&format!("k{i}"), i));
+        for i in 0..=COMPACTION_DELTA_THRESHOLD {
+            m.deltas.push(entry(&format!("k{i}"), i as i64));
         }
-        assert!(should_compact(&m), "101 deltas → trigger");
+        assert!(should_compact(&m), "> threshold → trigger");
+    }
+
+    #[test]
+    fn should_compact_eager_initial_snapshot() {
+        // User chưa từng compact (latest_snapshot=None) + có ít nhất 1 delta
+        // → trigger ngay, kể cả deltas << threshold. Cần thiết để admin view
+        // work cho mọi user đã sync 1 lần (Worker /v9/admin/snapshot 404
+        // nếu latest_snapshot is None).
+        let mut m = Manifest::empty("uid".to_string());
+        m.deltas.push(entry("k0", 0));
+        assert_eq!(m.latest_snapshot, None);
+        assert!(should_compact(&m), "no snapshot + 1 delta → eager compact");
+    }
+
+    #[test]
+    fn should_not_compact_empty_manifest() {
+        let m = Manifest::empty("uid".to_string());
+        assert!(!should_compact(&m), "no snapshot + no deltas → no-op");
     }
 
     #[test]

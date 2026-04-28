@@ -283,12 +283,16 @@ function UserRow({ user, presence, onClose, onOpenSyncLog }: UserRowProps) {
   const createdAt = parseTs(user.createdAt);
   const isExpired =
     user.premium && expiredAt && expiredAt.getTime() < Date.now();
-  // v9: chỉ user có snapshot mới view được (admin fetch qua
-  // /v9/admin/snapshot — 404 nếu chưa compact).
+  // v9: admin xem được mọi user có manifest.json (đã sync ≥ 1 lần). Snapshot
+  // fast-path (đã compact) hoặc delta-replay (chưa compact, fetch deltas +
+  // apply). Cả 2 đều đi qua `admin_view_user_db` Tauri cmd.
+  // CRITICAL: dùng `hasManifest` (manifest.json tồn tại) chứ KHÔNG phải
+  // `user.sync !== null` — sau cleanup edge case có thể có snapshot/ orphan
+  // mà manifest.json mất → admin_view sẽ fail 404.
+  const hasManifest = user.sync?.hasManifest ?? false;
   const hasSnapshot = user.sync?.hasSnapshot ?? false;
-  const hasManifest = user.sync !== null;
   const isSelf = auth.currentUser?.uid === user.uid;
-  const canView = hasSnapshot && !!user.localPart && !isSelf;
+  const canView = hasManifest && !!user.localPart && !isSelf;
 
   const { enter, busy, view } = useAdminView();
   const isCurrent = view?.uid === user.uid;
@@ -315,13 +319,13 @@ function UserRow({ user, presence, onClose, onOpenSyncLog }: UserRowProps) {
       ? "Đây là tài khoản của bạn — đang xem DB của chính mình rồi"
       : !hasManifest
         ? "User chưa sync lần nào"
-        : !hasSnapshot
-          ? "User chưa có snapshot (cần compact P10) — chưa xem được"
-          : !user.localPart
-            ? "Thiếu local-part (email không hợp lệ)"
-            : busy
-              ? "Đang tải..."
-              : "Xem DB user này (read-only)";
+        : !user.localPart
+          ? "Thiếu local-part (email không hợp lệ)"
+          : busy
+            ? "Đang tải..."
+            : hasSnapshot
+              ? "Xem DB user này (read-only, từ snapshot)"
+              : "Xem DB user này (read-only, replay từ deltas — có thể chậm hơn snapshot)";
 
   return (
     <tr

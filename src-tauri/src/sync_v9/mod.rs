@@ -51,4 +51,12 @@ pub const EVENT_LOG_MAX: u32 = 5000;
 
 /// Compaction trigger threshold. Manifest có nhiều hơn số delta entries này
 /// → client tự động compact thành snapshot mới. Per plan Q3.
-pub const COMPACTION_DELTA_THRESHOLD: usize = 100;
+///
+/// Hạ từ 100 → 30: light user (~1 push/ngày) cần ~1 tháng để hit threshold
+/// thay vì ~3 tháng. Lý do: admin view chỉ work khi target user CÓ snapshot
+/// (Worker `/v9/admin/snapshot` 404 nếu `latest_snapshot is None`); threshold
+/// 100 nghĩa là phần lớn user dùng nhẹ KHÔNG BAO GIỜ admin xem được. Combo
+/// với eager initial snapshot (`should_compact` thêm điều kiện latest_snapshot
+/// is None && deltas non-empty) → mọi user có snapshot từ push đầu tiên.
+/// Cost: +1 R2 PUT/tuần/user (~1-5MB compressed full DB).
+pub const COMPACTION_DELTA_THRESHOLD: usize = 30;

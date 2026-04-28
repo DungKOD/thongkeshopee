@@ -155,6 +155,73 @@ export async function adminSnapshotFetchRoute(
 }
 
 /**
+ * GET /v9/admin/manifest?uid=xxx
+ * Response: manifest JSON | 404
+ *
+ * Trả manifest.json của target user. Dùng cho admin-view delta replay path
+ * (khi target user chưa compact → admin fetch tất cả deltas + apply locally).
+ */
+export async function adminManifestFetchRoute(
+  req: Request,
+  auth: AuthContext,
+  env: Env,
+): Promise<Response> {
+  if (!auth.isAdmin) return jsonError(403, 'Admin only');
+  const uid = new URL(req.url).searchParams.get('uid');
+  if (!uid) return jsonError(400, 'Missing ?uid=');
+
+  const obj = await env.DB_BUCKET.get(`users/${uid}/manifest.json`);
+  if (!obj) return jsonError(404, 'Target user chưa có manifest (chưa sync v9)');
+
+  return new Response(obj.body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json',
+      ETag: obj.etag,
+    },
+  });
+}
+
+/**
+ * GET /v9/admin/delta-fetch?uid=xxx&key=deltas/...
+ * Response: raw zstd bytes | 404
+ *
+ * Admin fetch 1 delta file của target user. Key phải bắt đầu "deltas/" —
+ * không cho admin truy cập object ngoài deltas (snapshot dùng route riêng,
+ * sync_logs dùng `/admin/sync-log-file`).
+ */
+export async function adminDeltaFetchRoute(
+  req: Request,
+  auth: AuthContext,
+  env: Env,
+): Promise<Response> {
+  if (!auth.isAdmin) return jsonError(403, 'Admin only');
+  const url = new URL(req.url);
+  const uid = url.searchParams.get('uid');
+  const subKey = url.searchParams.get('key');
+  if (!uid) return jsonError(400, 'Missing ?uid=');
+  if (!subKey) return jsonError(400, 'Missing ?key=');
+  if (!subKey.startsWith('deltas/')) {
+    return jsonError(400, 'key phải bắt đầu bằng "deltas/"');
+  }
+  if (subKey.includes('..')) {
+    return jsonError(400, 'key không hợp lệ (path traversal)');
+  }
+
+  const obj = await env.DB_BUCKET.get(`users/${uid}/${subKey}`);
+  if (!obj) return jsonError(404, 'Delta file không tồn tại');
+
+  return new Response(obj.body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Size-Bytes': String(obj.size),
+      ETag: obj.etag,
+    },
+  });
+}
+
+/**
  * POST /v9/admin/cleanup?uid=xxx
  * Response: { ok: true, archived: N, deleted: 0 }
  *

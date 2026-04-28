@@ -13,6 +13,8 @@ import {
 import {
   adminUsersRoute,
   adminSnapshotFetchRoute,
+  adminManifestFetchRoute,
+  adminDeltaFetchRoute,
   adminCleanupRoute,
   adminSyncLogRoute,
   adminSyncLogFileRoute,
@@ -59,6 +61,8 @@ export default {
       // Admin-scope endpoints — auth.isAdmin check inside.
       if (req.method === 'POST' && path === '/v9/admin/users') return adminUsersRoute(req, auth, env);
       if (req.method === 'GET' && path === '/v9/admin/snapshot') return adminSnapshotFetchRoute(req, auth, env);
+      if (req.method === 'GET' && path === '/v9/admin/manifest') return adminManifestFetchRoute(req, auth, env);
+      if (req.method === 'GET' && path === '/v9/admin/delta-fetch') return adminDeltaFetchRoute(req, auth, env);
       if (req.method === 'POST' && path === '/v9/admin/cleanup') return adminCleanupRoute(req, auth, env);
       if (req.method === 'GET' && path === '/v9/admin/sync-log') return adminSyncLogRoute(req, auth, env);
       if (req.method === 'GET' && path === '/v9/admin/sync-log-file') return adminSyncLogFileRoute(req, auth, env);
