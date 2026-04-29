@@ -15,7 +15,8 @@ use tauri::State;
 
 use super::query::{is_prefix, to_canonical, Canonical};
 use super::{assert_not_bootstrapping, CmdError, CmdResult};
-use crate::db::DbState;
+use crate::db::{tombstone_key_sub, DbState};
+use crate::sync_v9::hlc::next_hlc_rfc3339;
 
 /// Tên reserved cho account "Mặc định" — catch-all cho sub_id chưa gán TK.
 /// Sau v13 migration id là content_id hash (không còn = 1), nên check bằng
@@ -140,12 +141,16 @@ pub fn create_shopee_account(
 }
 
 /// Rename account. Không đụng FK data. Fail nếu name trùng với account khác.
+/// Trả `true` nếu name khác cũ (DB thay đổi), `false` nếu trùng tên hiện có.
+/// Caller dùng flag để bỏ qua mutation event → tránh "Chờ đồng bộ" khi user
+/// blur/Enter mà không sửa gì.
 #[tauri::command]
 pub fn rename_shopee_account(
     state: State<'_, DbState>,
     id: String,
     new_name: String,
-) -> CmdResult<()> {
+) -> CmdResult<bool> {
+    use rusqlite::OptionalExtension;
     let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Bug E fix: bootstrap restore window guard.
@@ -161,6 +166,19 @@ pub fn rename_shopee_account(
         return Err(CmdError::msg("Tên account không được để trống"));
     }
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT name FROM shopee_accounts WHERE id = ?",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(current_name) = current else {
+        return Err(CmdError::msg(format!("Account id={id} không tồn tại")));
+    };
+    if current_name == trimmed {
+        return Ok(false);
+    }
     let affected = conn
         .execute(
             "UPDATE shopee_accounts SET name = ?1 WHERE id = ?2",
@@ -176,25 +194,40 @@ pub fn rename_shopee_account(
     if affected == 0 {
         return Err(CmdError::msg(format!("Account id={id} không tồn tại")));
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Đổi màu badge UI. Không ảnh hưởng data/query.
+/// Đổi màu badge UI. Không ảnh hưởng data/query. Trả `true` nếu color khác
+/// cũ, `false` nếu trùng → caller skip mutation event.
 #[tauri::command]
 pub fn update_shopee_account_color(
     state: State<'_, DbState>,
     id: String,
     color: Option<String>,
-) -> CmdResult<()> {
+) -> CmdResult<bool> {
+    use rusqlite::OptionalExtension;
     let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Bug E fix: bootstrap restore window guard.
     assert_not_bootstrapping(&conn)?;
+    let current: Option<Option<String>> = conn
+        .query_row(
+            "SELECT color FROM shopee_accounts WHERE id = ?",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(current_color) = current else {
+        return Err(CmdError::msg(format!("Account id={id} không tồn tại")));
+    };
+    if current_color == color {
+        return Ok(false);
+    }
     conn.execute(
         "UPDATE shopee_accounts SET color = ?1 WHERE id = ?2",
         params![color, id],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// Load map `day_date → HashSet<Canonical>` từ 3 bảng Shopee filter theo predicate.
@@ -358,6 +391,9 @@ pub fn delete_shopee_account(
     };
 
     let tx = conn.transaction()?;
+    // HLC-monotonic deleted_at — để apply_tombstones bên peer so đúng vs HLC
+    // updated_at của manual_entries.
+    let now = next_hlc_rfc3339(&tx)?;
 
     // DELETE FB ads đã xác định (exact match theo day + 5 sub_ids).
     if !fb_to_delete.is_empty() {
@@ -415,6 +451,29 @@ pub fn delete_shopee_account(
          )",
         [],
     )?;
+
+    // Tombstone 'shopee_account' — sync v9 propagate deletion sang máy khác.
+    // Thiếu tombstone này: capture skip (cursor created_at unchanged), DELETE
+    // không emit event → wipe local + login lại thấy account + raw rows hồi
+    // sinh. apply layer trên B mirror cleanup logic + bảo vệ default account.
+    tx.execute(
+        "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+         VALUES ('shopee_account', ?, ?)",
+        params![id.to_string(), now],
+    )?;
+
+    // Tombstones 'ui_row' cho mỗi FB ad row đã xóa qua also_delete_fb. Apply
+    // layer dùng prefix matching trên tuple → B sẽ DELETE đúng FB rows ngay
+    // cả khi FB data state khác máy A (defensive — pre-computed list không
+    // sync được vì depends on local state lúc xóa).
+    for (day, tuple) in &fb_to_delete {
+        tx.execute(
+            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+             VALUES ('ui_row', ?, ?)",
+            params![tombstone_key_sub(day, tuple), now],
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
 }

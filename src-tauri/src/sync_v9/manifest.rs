@@ -467,6 +467,56 @@ mod tests {
         );
     }
 
+    /// REGRESSION: sau khi compact, local PHẢI advance pulled_clock +
+    /// set_snapshot. Nếu thiếu, lần pull sau sẽ thấy snap.clock_ms > last_pulled
+    /// → trigger restore → wipe local DB → mất tombstones user vừa tạo
+    /// (vd xóa ngày → đồng bộ → ngày hồi sinh).
+    #[test]
+    fn post_compact_local_state_prevents_restore() {
+        let conn = test_conn();
+
+        // Pre-compact state: local đã pull tới T_old.
+        advance_pulled_clock(&conn, 1_000).unwrap();
+
+        // Simulate compact: local code path PHẢI gọi set_snapshot +
+        // advance_pulled_clock với clock_ms compact.
+        let compact_clock = 5_000;
+        set_snapshot(&conn, "snapshots/snap_5000.db.zst", compact_clock).unwrap();
+        advance_pulled_clock(&conn, compact_clock).unwrap();
+
+        // Manifest remote: snapshot pointer = compact_clock.
+        let mut m = Manifest::empty("uid".to_string());
+        m.latest_snapshot = Some(mk_snapshot(compact_clock, "snapshots/snap_5000.db.zst"));
+
+        let state = read_state(&conn).unwrap();
+        assert!(
+            needs_snapshot_restore(&m, &state).is_none(),
+            "post-compact local đã catch up → KHÔNG được trigger restore"
+        );
+    }
+
+    /// Anti-test: nếu BỎ advance_pulled_clock sau compact, restore SẼ trigger.
+    /// Document bug behavior để test fix above có ý nghĩa.
+    #[test]
+    fn missing_post_compact_advance_triggers_restore_bug() {
+        let conn = test_conn();
+
+        // Pre-compact: local pulled to T_old.
+        advance_pulled_clock(&conn, 1_000).unwrap();
+        // ❌ Buggy: chỉ set_snapshot, KHÔNG advance pulled_clock.
+        // (Hoặc bỏ qua hoàn toàn cả 2 — tương đương production bug trước fix.)
+
+        let compact_clock = 5_000;
+        let mut m = Manifest::empty("uid".to_string());
+        m.latest_snapshot = Some(mk_snapshot(compact_clock, "snapshots/snap_5000.db.zst"));
+
+        let state = read_state(&conn).unwrap();
+        assert!(
+            needs_snapshot_restore(&m, &state).is_some(),
+            "thiếu advance → snap > local → trigger restore (= bug)"
+        );
+    }
+
     #[test]
     fn needs_restore_idempotent_across_calls() {
         // Gọi 2 lần cùng state → cùng kết quả.

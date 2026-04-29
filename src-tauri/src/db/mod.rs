@@ -160,9 +160,56 @@ pub fn init_db_at(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA_SQL)
         .context("không apply được schema")?;
 
+    migrate_tombstones_check(&conn)
+        .context("migrate tombstones CHECK thất bại")?;
+
     seed_default_account(&conn).context("seed default account thất bại")?;
 
     Ok(conn)
+}
+
+/// v0.5.1 migration: extend CHECK constraint của tombstones để hỗ trợ
+/// `'imported_file'` (revert_import) + `'shopee_account'` (delete account).
+/// SQLite không ALTER được CHECK → rebuild table preserve rows. Idempotent
+/// qua kiểm tra DDL hiện tại có ĐỦ cả 2 entity_type mới không.
+///
+/// Lý do: 2 deletion path này (revert file, xóa account) phải emit tombstone
+/// để propagate cross-device. DB cũ chưa có entity_type → INSERT fail CHECK
+/// → deletion sync silently broken → wipe local + login lại thấy data hồi sinh.
+fn migrate_tombstones_check(conn: &Connection) -> Result<()> {
+    let existing_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tombstones'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let sql = match existing_sql {
+        Some(s) => s,
+        None => return Ok(()), // bảng chưa tồn tại (impossible vì SCHEMA_SQL chạy trước)
+    };
+    let needs_migration =
+        !sql.contains("imported_file") || !sql.contains("shopee_account");
+    if !needs_migration {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE tombstones_new (
+             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+             entity_type  TEXT NOT NULL CHECK (entity_type IN ('day', 'ui_row', 'manual_entry', 'imported_file', 'shopee_account')),
+             entity_key   TEXT NOT NULL,
+             deleted_at   TEXT NOT NULL,
+             UNIQUE(entity_type, entity_key)
+         );
+         INSERT INTO tombstones_new (id, entity_type, entity_key, deleted_at)
+             SELECT id, entity_type, entity_key, deleted_at FROM tombstones;
+         DROP TABLE tombstones;
+         ALTER TABLE tombstones_new RENAME TO tombstones;
+         CREATE INDEX IF NOT EXISTS idx_tombstones_type ON tombstones(entity_type);",
+    )?;
+
+    Ok(())
 }
 
 /// Seed account "Mặc định" với id = content_id(name). Idempotent qua
@@ -200,6 +247,7 @@ pub fn setup(app: &AppHandle) -> Result<()> {
 pub fn migrate_for_tests(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA_SQL)?;
+    migrate_tombstones_check(conn)?;
     seed_default_account(conn)?;
     Ok(())
 }
@@ -337,6 +385,109 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM imported_files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(file_count, 1, "imported_files KHÔNG cascade từ day");
+    }
+
+    #[test]
+    fn migrate_tombstones_check_upgrades_old_constraint() {
+        // Simulate DB cũ: tombstones với CHECK chỉ có 3 entity_types ban đầu.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tombstones (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type  TEXT NOT NULL CHECK (entity_type IN ('day', 'ui_row', 'manual_entry')),
+                entity_key   TEXT NOT NULL,
+                deleted_at   TEXT NOT NULL,
+                UNIQUE(entity_type, entity_key)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('day', '2026-04-20', '2026-04-20T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-migration: cả 2 entity_type mới đều bị reject.
+        assert!(conn
+            .execute(
+                "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+                 VALUES('imported_file', '123', 'now')",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+                 VALUES('shopee_account', '456', 'now')",
+                [],
+            )
+            .is_err());
+
+        migrate_tombstones_check(&conn).unwrap();
+
+        // Row cũ preserved.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "row cũ giữ nguyên qua migration");
+
+        // CHECK mới chấp nhận cả 2 entity_type mới.
+        conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('imported_file', '123', '2026-04-25T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('shopee_account', '456', '2026-04-25T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Migration idempotent — chạy lần 2 không phá data, không re-rebuild.
+        migrate_tombstones_check(&conn).unwrap();
+        let n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 3);
+    }
+
+    #[test]
+    fn migrate_tombstones_check_partial_upgrade_v0_5_1_to_next() {
+        // DB đã có 'imported_file' (từ v0.5.1) nhưng chưa có 'shopee_account'
+        // → migration phải detect missing và upgrade tiếp.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tombstones (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type  TEXT NOT NULL CHECK (entity_type IN ('day', 'ui_row', 'manual_entry', 'imported_file')),
+                entity_key   TEXT NOT NULL,
+                deleted_at   TEXT NOT NULL,
+                UNIQUE(entity_type, entity_key)
+             );",
+        )
+        .unwrap();
+
+        assert!(conn
+            .execute(
+                "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+                 VALUES('shopee_account', '1', 'now')",
+                [],
+            )
+            .is_err(), "pre-migration reject shopee_account");
+
+        migrate_tombstones_check(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('shopee_account', '1', 'now')",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

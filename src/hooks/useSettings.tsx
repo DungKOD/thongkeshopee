@@ -224,14 +224,18 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
 
   /// Helper persist 1 key → DB. Bỏ qua nếu chưa hydrate (initial load chưa
   /// xong) — tránh race ghi default value đè data DB chưa load.
+  ///
+  /// BE trả `false` khi value trùng row hiện có → no-op, KHÔNG dispatch
+  /// mutation event để tránh SyncBadge "Chờ đồng bộ" khi user set lại cùng
+  /// giá trị (vd toggle click source rồi toggle lại).
   const persistKey = useCallback(async (key: string, value: unknown) => {
     if (!hydratedRef.current) return;
     try {
-      await invoke("set_app_setting", {
+      const changed = await invoke<boolean>("set_app_setting", {
         key,
         value: JSON.stringify(value),
       });
-      dispatchMutation();
+      if (changed) dispatchMutation();
     } catch (err) {
       console.warn(`[useSettings] persist ${key} failed:`, err);
     }

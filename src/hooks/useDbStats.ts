@@ -175,8 +175,12 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
 
   const saveManualEntry = useCallback(
     async (input: ManualEntryInput) => {
-      await invoke<void>("save_manual_entry", { input });
-      markMutation();
+      // BE trả `false` khi input trùng row hiện có → no-op, KHÔNG gọi
+      // markMutation để SyncBadge không hiện "Chờ đồng bộ" lúc user mở
+      // dialog rồi bấm Lưu mà không sửa gì. Vẫn refetch để UI nhất quán
+      // nếu cùng lúc có pull về thay đổi cùng tuple.
+      const changed = await invoke<boolean>("save_manual_entry", { input });
+      if (changed) markMutation();
       await refetch();
     },
     [refetch, markMutation],

@@ -6,9 +6,9 @@
 //! Invariants (rule giữ data #1):
 //! - Insert = INSERT OR IGNORE (PK conflict = idempotent replay, không mất local state)
 //! - Upsert = INSERT OR REPLACE CHỈ khi `local.updated_at <= event.updated_at` (HLC wins)
-//! - Tombstone day = CASCADE delete unconditional (user intent)
-//! - Tombstone manual_entry / ui_row = DELETE CHỈ nếu `target.updated_at <= tombstone.deleted_at`
-//!   (resurrect rule — edit sau delete → row survive)
+//! - Tombstone day / manual_entry / ui_row = resurrect rule (v0.5.2):
+//!   delete CHỈ data có timestamp ≤ deleted_at; data add SAU deletion (vd user
+//!   xóa day rồi modify lại) survive. Day row tự xóa nếu không còn data ref.
 //!
 //! Re-use từ v8:
 //! - `commands::query::{to_canonical, is_prefix}` — sub_id prefix matching
@@ -248,9 +248,11 @@ fn apply_tombstone(tx: &Transaction, ev: &TombstoneEvent) -> Result<ApplyOutcome
     .context("insert tombstone audit row")?;
 
     let deleted = match ev.entity_type.as_str() {
-        "day" => apply_day_tombstone(tx, &ev.entity_key)?,
+        "day" => apply_day_tombstone(tx, &ev.entity_key, &ev.deleted_at)?,
         "manual_entry" => apply_manual_entry_tombstone(tx, &ev.entity_key, &ev.deleted_at)?,
         "ui_row" => apply_ui_row_tombstone(tx, &ev.entity_key, &ev.deleted_at)?,
+        "imported_file" => apply_imported_file_tombstone(tx, &ev.entity_key, &ev.deleted_at)?,
+        "shopee_account" => apply_shopee_account_tombstone(tx, &ev.entity_key)?,
         other => anyhow::bail!("unknown tombstone entity_type: {other}"),
     };
     Ok(if deleted > 0 {
@@ -262,11 +264,85 @@ fn apply_tombstone(tx: &Transaction, ev: &TombstoneEvent) -> Result<ApplyOutcome
     })
 }
 
-/// Day tombstone = CASCADE unconditional (plan B5 locked).
-fn apply_day_tombstone(tx: &Transaction, day_date: &str) -> Result<u64> {
-    let n = tx.execute("DELETE FROM days WHERE date = ?", [day_date])
-        .context("delete day")?;
-    Ok(n as u64)
+/// Day tombstone — resurrect-aware delete (v0.5.2).
+///
+/// Trước đây UNCONDITIONAL CASCADE (`DELETE FROM days WHERE date=?` rồi FK
+/// cascade kéo theo raw + manual). Vấn đề: nếu user xóa day rồi MODIFY day đó
+/// (vd add manual entry mới), lúc apply tombstone replay (cùng máy hoặc máy
+/// khác), modification cũng bị cascade xóa → mất data.
+///
+/// Semantic mới: "delete day = remove data EXISTING tại deleted_at; data ADDED
+/// SAU survive". Implement bằng resurrect rule:
+/// - manual_entries: xóa nếu `updated_at <= deleted_at`.
+/// - raw_*: xóa nếu KHÔNG có mapping link tới file `imported_at > deleted_at`
+///   AND `reverted_at IS NULL` (= file mới import sau deletion). Mapping-based
+///   để cover case re-import file: PK conflict trong raw_* INSERT giữ
+///   source_file_id cũ nhưng mapping mới → mapping decides "freshness".
+/// - days: xóa nếu không còn raw/manual nào reference.
+///
+/// Idempotent: replay → DELETE same conditions → 0 rows.
+fn apply_day_tombstone(tx: &Transaction, day_date: &str, deleted_at: &str) -> Result<u64> {
+    let mut total: u64 = 0;
+
+    // 1. Xóa manual_entries cũ (resurrect rule).
+    total += tx.execute(
+        "DELETE FROM manual_entries
+         WHERE day_date = ? AND updated_at <= ?",
+        params![day_date, deleted_at],
+    )
+    .context("delete old manual_entries")? as u64;
+
+    // 2. Xóa raw rows cũ — không có mapping link tới file post-delete active.
+    total += tx.execute(
+        "DELETE FROM raw_shopee_clicks
+         WHERE day_date = ?
+           AND click_id NOT IN (
+             SELECT cf.click_id FROM clicks_to_file cf
+             JOIN imported_files f ON cf.file_id = f.id
+             WHERE f.imported_at > ? AND f.reverted_at IS NULL
+           )",
+        params![day_date, deleted_at],
+    )
+    .context("delete old raw_shopee_clicks")? as u64;
+
+    total += tx.execute(
+        "DELETE FROM raw_shopee_order_items
+         WHERE day_date = ?
+           AND id NOT IN (
+             SELECT of2.order_item_id FROM orders_to_file of2
+             JOIN imported_files f ON of2.file_id = f.id
+             WHERE f.imported_at > ? AND f.reverted_at IS NULL
+           )",
+        params![day_date, deleted_at],
+    )
+    .context("delete old raw_shopee_order_items")? as u64;
+
+    total += tx.execute(
+        "DELETE FROM raw_fb_ads
+         WHERE day_date = ?
+           AND id NOT IN (
+             SELECT ff.fb_ad_id FROM fb_ads_to_file ff
+             JOIN imported_files f ON ff.file_id = f.id
+             WHERE f.imported_at > ? AND f.reverted_at IS NULL
+           )",
+        params![day_date, deleted_at],
+    )
+    .context("delete old raw_fb_ads")? as u64;
+
+    // 3. Xóa day NẾU không còn data nào reference (raw hoặc manual).
+    total += tx.execute(
+        "DELETE FROM days WHERE date = ?
+           AND date NOT IN (
+             SELECT day_date FROM raw_shopee_clicks UNION
+             SELECT day_date FROM raw_shopee_order_items UNION
+             SELECT day_date FROM raw_fb_ads UNION
+             SELECT day_date FROM manual_entries
+           )",
+        params![day_date],
+    )
+    .context("delete day if orphan")? as u64;
+
+    Ok(total)
 }
 
 /// Manual entry tombstone — chỉ xóa nếu row.updated_at <= tombstone.deleted_at.
@@ -354,6 +430,157 @@ fn apply_ui_row_tombstone(tx: &Transaction, key: &str, deleted_at: &str) -> Resu
                 .with_context(|| format!("ui_row delete {table}"))? as u64;
         }
     }
+    Ok(total)
+}
+
+/// Imported_file tombstone — máy A revert 1 file → A push tombstone → B apply
+/// xóa mappings + raw_* orphan + soft-mark imported_files row, mirror logic
+/// `commands::batch::revert_import` (DB side only — không chạm disk).
+///
+/// `entity_key` = `str(file_id)`. file_id = content_id(file_hash) deterministic
+/// cross-machine → A's id == B's id cho cùng file.
+///
+/// Idempotent: máy A pull lại tombstone của chính mình → mappings đã rỗng,
+/// raw orphan đã clean, UPDATE reverted_at có guard `IS NULL` → no-op.
+/// Preserves history (giữ row imported_files với reverted_at marker — UI hiển
+/// thị file đã revert).
+fn apply_imported_file_tombstone(
+    tx: &Transaction,
+    key: &str,
+    deleted_at: &str,
+) -> Result<u64> {
+    let file_id: i64 = match key.parse() {
+        Ok(n) => n,
+        Err(_) => return Ok(0), // key sai format → no-op (defensive)
+    };
+
+    let mut total: u64 = 0;
+
+    // 1. Xóa mappings — raw_* nào chỉ link qua file này giờ orphan.
+    total += tx.execute("DELETE FROM clicks_to_file WHERE file_id = ?", params![file_id])? as u64;
+    total += tx.execute("DELETE FROM orders_to_file WHERE file_id = ?", params![file_id])? as u64;
+    total += tx.execute("DELETE FROM fb_ads_to_file WHERE file_id = ?", params![file_id])? as u64;
+
+    // 2. Xóa raw rows orphan — không còn file active nào link.
+    total += tx.execute(
+        "DELETE FROM raw_shopee_clicks
+         WHERE click_id NOT IN (SELECT click_id FROM clicks_to_file)",
+        [],
+    )? as u64;
+    total += tx.execute(
+        "DELETE FROM raw_shopee_order_items
+         WHERE id NOT IN (SELECT order_item_id FROM orders_to_file)",
+        [],
+    )? as u64;
+    total += tx.execute(
+        "DELETE FROM raw_fb_ads
+         WHERE id NOT IN (SELECT fb_ad_id FROM fb_ads_to_file)",
+        [],
+    )? as u64;
+
+    // 3. Soft-mark imported_files row (giữ history). Guard `reverted_at IS NULL`
+    // → idempotent + KHÔNG đè reverted_at cũ nếu A đã revert ngày khác trước đó.
+    // Nếu B chưa có row (delta chưa pull) → 0 rows updated, không sao —
+    // cleanup downstream trên đã chạy.
+    total += tx.execute(
+        "UPDATE imported_files
+         SET reverted_at = ?, stored_path = NULL
+         WHERE id = ? AND reverted_at IS NULL",
+        params![deleted_at, file_id],
+    )? as u64;
+
+    // 4. Cleanup days orphan.
+    total += tx.execute(
+        "DELETE FROM days WHERE date NOT IN (
+            SELECT day_date FROM raw_shopee_clicks UNION
+            SELECT day_date FROM raw_shopee_order_items UNION
+            SELECT day_date FROM raw_fb_ads UNION
+            SELECT day_date FROM manual_entries
+         )",
+        [],
+    )? as u64;
+
+    Ok(total)
+}
+
+/// Shopee_account tombstone — máy A xóa 1 account → A push tombstone → B
+/// apply mirror logic `commands::accounts::delete_shopee_account` (DB side).
+///
+/// `entity_key` = `str(account_id)`. account_id = content_id(name)
+/// deterministic cross-machine.
+///
+/// **CRITICAL — default account protection**: id của "Mặc định" KHÔNG BAO GIỜ
+/// được xóa. Nếu tombstone trỏ tới default → no-op. Lý do: orphan rows
+/// (chưa gán account) reassign về default → mất default = mất data.
+/// commands::accounts cũng có guard này ở mutation site, nên defensive ở
+/// apply layer cho sync path (nếu phía A buggy gửi tombstone default).
+///
+/// Idempotent: replay → DELETE no-op (rows đã xóa), shopee_accounts row đã
+/// xóa hoặc chưa từng có → 0 rows affected.
+fn apply_shopee_account_tombstone(tx: &Transaction, key: &str) -> Result<u64> {
+    use crate::sync_v9::content_id;
+
+    let id: i64 = match key.parse() {
+        Ok(n) => n,
+        Err(_) => return Ok(0),
+    };
+
+    // Default account protection — không bao giờ xóa, kể cả tombstone từ peer.
+    let default_id = content_id::shopee_account_id(crate::db::DEFAULT_ACCOUNT_NAME);
+    if id == default_id {
+        return Ok(0);
+    }
+
+    let mut total: u64 = 0;
+
+    // Xóa raw rows + manual entries gắn với account này.
+    total += tx.execute(
+        "DELETE FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+        params![id],
+    )? as u64;
+    total += tx.execute(
+        "DELETE FROM raw_shopee_order_items WHERE shopee_account_id = ?",
+        params![id],
+    )? as u64;
+    total += tx.execute(
+        "DELETE FROM manual_entries WHERE shopee_account_id = ?",
+        params![id],
+    )? as u64;
+
+    // Xóa account row.
+    total += tx.execute(
+        "DELETE FROM shopee_accounts WHERE id = ?",
+        params![id],
+    )? as u64;
+
+    // Cleanup orphan mappings — clicks_to_file/orders_to_file/fb_ads_to_file
+    // có thể còn link tới raw rows vừa xóa (mapping không có FK tới raw).
+    // Mirror behavior production: delete_shopee_account KHÔNG cleanup mappings,
+    // chỉ cleanup orphan imported_files. Để đồng bộ A/B, ta cũng skip mapping
+    // cleanup ở đây (mappings sẽ bị kill khi imported_file orphan cleanup).
+    //
+    // Cleanup orphan imported_files (không còn raw row nào reference).
+    total += tx.execute(
+        "DELETE FROM imported_files
+         WHERE id NOT IN (
+             SELECT source_file_id FROM raw_shopee_clicks UNION
+             SELECT source_file_id FROM raw_shopee_order_items UNION
+             SELECT source_file_id FROM raw_fb_ads
+         )",
+        [],
+    )? as u64;
+
+    // Cleanup orphan days.
+    total += tx.execute(
+        "DELETE FROM days WHERE date NOT IN (
+            SELECT day_date FROM raw_shopee_clicks UNION
+            SELECT day_date FROM raw_shopee_order_items UNION
+            SELECT day_date FROM raw_fb_ads UNION
+            SELECT day_date FROM manual_entries
+         )",
+        [],
+    )? as u64;
+
     Ok(total)
 }
 
@@ -791,6 +1018,437 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM manual_entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ---------- imported_file tombstone ----------
+
+    /// Setup helper: máy B nhận được F1 (1 click + 1 mapping) từ delta replay.
+    fn seed_file_with_click(conn: &Connection, hash: &str, click_id: &str) -> i64 {
+        use crate::sync_v9::content_id;
+        let file_id = content_id::imported_file_id(hash);
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+             VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00Z', ?, '2026-04-20')",
+            params![file_id, hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id)
+             VALUES(?, '2026-04-20T10:00:00Z', '2026-04-20', ?)",
+            params![click_id, file_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clicks_to_file(click_id, file_id) VALUES(?, ?)",
+            params![click_id, file_id],
+        )
+        .unwrap();
+        file_id
+    }
+
+    #[test]
+    fn apply_imported_file_tombstone_cleans_orphan_raw_and_marks_reverted() {
+        let mut conn = test_conn();
+        let file_id = seed_file_with_click(&conn, "h-revert", "c1");
+
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "imported_file".to_string(),
+            entity_key: file_id.to_string(),
+            deleted_at: "2026-04-24T10:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        let outcome = apply_event(&tx, &ev).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::TombstoneApplied { .. }));
+
+        // Mapping + raw orphan + day cleanup.
+        let map_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM clicks_to_file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(map_count, 0, "mapping bị xóa");
+        let raw_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM raw_shopee_clicks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_count, 0, "raw click orphan bị xóa");
+        let day_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM days", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(day_count, 0, "day orphan bị xóa");
+
+        // imported_files row vẫn tồn tại với reverted_at set (history preserved).
+        let reverted_at: Option<String> = tx
+            .query_row(
+                "SELECT reverted_at FROM imported_files WHERE id = ?",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reverted_at.as_deref(), Some("2026-04-24T10:00:00Z"));
+    }
+
+    #[test]
+    fn apply_imported_file_tombstone_preserves_shared_raw_rows() {
+        // 2 file F1, F2 cùng hash khác nhau, cùng reference click "c-shared"
+        // qua mapping. Revert F1 → click vẫn còn vì F2 mapping vẫn link.
+        let mut conn = test_conn();
+        let f1 = seed_file_with_click(&conn, "h1", "c-shared");
+        let f2 = {
+            use crate::sync_v9::content_id;
+            let id = content_id::imported_file_id("h2");
+            conn.execute(
+                "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+                 VALUES(?, 'f2.csv', 'shopee_clicks', '2026-04-20T00:00:00Z', 'h2', '2026-04-20')",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c-shared', ?)",
+                [id],
+            )
+            .unwrap();
+            id
+        };
+
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "imported_file".to_string(),
+            entity_key: f1.to_string(),
+            deleted_at: "2026-04-24T10:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        apply_event(&tx, &ev).unwrap();
+
+        // Click vẫn sống vì F2 mapping còn link.
+        let raw_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM raw_shopee_clicks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_count, 1, "raw row giữ nguyên vì file khác còn link");
+
+        // F1 mapping bị xóa, F2 mapping còn.
+        let f2_maps: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM clicks_to_file WHERE file_id = ?",
+                [f2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(f2_maps, 1);
+    }
+
+    #[test]
+    fn apply_imported_file_tombstone_idempotent() {
+        // Replay tombstone 2 lần (case A pull lại tombstone của chính mình)
+        // → không lỗi, reverted_at không bị đè timestamp mới hơn.
+        let mut conn = test_conn();
+        let file_id = seed_file_with_click(&conn, "h-idem", "c1");
+
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "imported_file".to_string(),
+            entity_key: file_id.to_string(),
+            deleted_at: "2026-04-24T10:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        let tx = conn.transaction().unwrap();
+        apply_event(&tx, &ev).unwrap();
+        let outcome2 = apply_event(&tx, &ev).unwrap();
+        // Replay 2: mọi DELETE no-op + UPDATE guard `IS NULL` skip.
+        assert_eq!(outcome2, ApplyOutcome::TombstoneNoOp);
+
+        let reverted_at: String = tx
+            .query_row(
+                "SELECT reverted_at FROM imported_files WHERE id = ?",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            reverted_at, "2026-04-24T10:00:00Z",
+            "reverted_at không bị thay đổi trên replay"
+        );
+    }
+
+    // ---------- shopee_account tombstone ----------
+
+    /// Setup: tạo account "Shop A" + raw click + manual_entry gắn về account đó.
+    fn seed_account_with_data(conn: &Connection, name: &str, click_id: &str) -> i64 {
+        use crate::sync_v9::content_id;
+        let acc_id = content_id::shopee_account_id(name);
+        conn.execute(
+            "INSERT OR IGNORE INTO shopee_accounts (id, name, color, created_at)
+             VALUES (?, ?, '#000', '2026-04-20T00:00:00Z')",
+            params![acc_id, name],
+        )
+        .unwrap();
+        let file_id = content_id::imported_file_id(&format!("h-{name}"));
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date, shopee_account_id)
+             VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00Z', ?, '2026-04-20', ?)",
+            params![file_id, format!("h-{name}"), acc_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id, shopee_account_id)
+             VALUES(?, '2026-04-20T10:00:00Z', '2026-04-20', ?, ?)",
+            params![click_id, file_id, acc_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manual_entries
+             (sub_id1, day_date, override_clicks, created_at, updated_at, shopee_account_id)
+             VALUES(?, '2026-04-20', 5, 'now', '2026-04-24T08:00:00Z', ?)",
+            params![format!("sub-{name}"), acc_id],
+        )
+        .unwrap();
+        acc_id
+    }
+
+    #[test]
+    fn apply_shopee_account_tombstone_deletes_data_and_account() {
+        let mut conn = test_conn();
+        let acc_id = seed_account_with_data(&conn, "Shop A", "c1");
+
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "shopee_account".to_string(),
+            entity_key: acc_id.to_string(),
+            deleted_at: "2026-04-25T08:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        let outcome = apply_event(&tx, &ev).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::TombstoneApplied { .. }));
+
+        // Account + data downstream xóa hết.
+        let acc_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM shopee_accounts WHERE id = ?",
+                [acc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(acc_count, 0, "account row deleted");
+
+        let raw_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+                [acc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_count, 0, "raw rows of account deleted");
+
+        let manual_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM manual_entries WHERE shopee_account_id = ?",
+                [acc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(manual_count, 0, "manual_entries of account deleted");
+
+        // Orphan imported_files (chỉ refer tới deleted raw rows) cũng deleted.
+        let file_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM imported_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(file_count, 0, "orphan file deleted");
+
+        // Day cleanup.
+        let day_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM days", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(day_count, 0, "orphan day deleted");
+    }
+
+    #[test]
+    fn apply_shopee_account_tombstone_protects_default_account() {
+        // CRITICAL: tombstone trỏ tới default account → no-op, KHÔNG xóa.
+        // Kể cả phía A buggy gửi tombstone default, B phải bảo vệ.
+        use crate::sync_v9::content_id;
+        let mut conn = test_conn();
+        let default_id = content_id::shopee_account_id(crate::db::DEFAULT_ACCOUNT_NAME);
+
+        // Seed data gắn về default account để test không bị xóa nhầm.
+        conn.execute(
+            "INSERT OR IGNORE INTO days(date, created_at) VALUES('2026-04-20', 'now')",
+            [],
+        )
+        .unwrap();
+        let file_id = content_id::imported_file_id("h-default");
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date, shopee_account_id)
+             VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00Z', 'h-default', '2026-04-20', ?)",
+            params![file_id, default_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id, shopee_account_id)
+             VALUES('c1', '2026-04-20T10:00:00Z', '2026-04-20', ?, ?)",
+            params![file_id, default_id],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "shopee_account".to_string(),
+            entity_key: default_id.to_string(),
+            deleted_at: "2026-04-25T08:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        let outcome = apply_event(&tx, &ev).unwrap();
+        assert_eq!(outcome, ApplyOutcome::TombstoneNoOp, "default protected");
+
+        // Default account row + data preserved.
+        let acc_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM shopee_accounts WHERE id = ?",
+                [default_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(acc_count, 1, "default account row preserved");
+        let raw_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM raw_shopee_clicks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_count, 1, "default account raw data preserved");
+    }
+
+    #[test]
+    fn apply_shopee_account_tombstone_preserves_other_accounts() {
+        // Xóa Shop A → KHÔNG ảnh hưởng default + Shop B + data của họ.
+        let mut conn = test_conn();
+        let _shop_a = seed_account_with_data(&conn, "Shop A", "c-a");
+        let shop_b = seed_account_with_data(&conn, "Shop B", "c-b");
+
+        // Default account đã seed sẵn từ migrate_for_tests, thêm 1 raw row default.
+        use crate::sync_v9::content_id;
+        let default_id = content_id::shopee_account_id(crate::db::DEFAULT_ACCOUNT_NAME);
+        let file_default = content_id::imported_file_id("h-default");
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date, shopee_account_id)
+             VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00Z', 'h-default', '2026-04-20', ?)",
+            params![file_default, default_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id, shopee_account_id)
+             VALUES('c-default', '2026-04-20T10:00:00Z', '2026-04-20', ?, ?)",
+            params![file_default, default_id],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let shop_a_id = content_id::shopee_account_id("Shop A");
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "shopee_account".to_string(),
+            entity_key: shop_a_id.to_string(),
+            deleted_at: "2026-04-25T08:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        apply_event(&tx, &ev).unwrap();
+
+        // Shop A's data gone.
+        let a_raw: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+                [shop_a_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_raw, 0);
+
+        // Shop B's data preserved.
+        let b_raw: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+                [shop_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_raw, 1, "Shop B raw preserved");
+        let b_acc: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM shopee_accounts WHERE id = ?",
+                [shop_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_acc, 1, "Shop B account preserved");
+
+        // Default account's data preserved.
+        let d_raw: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+                [default_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(d_raw, 1, "default raw preserved");
+    }
+
+    #[test]
+    fn apply_shopee_account_tombstone_idempotent() {
+        let mut conn = test_conn();
+        let acc_id = seed_account_with_data(&conn, "Shop A", "c1");
+
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "shopee_account".to_string(),
+            entity_key: acc_id.to_string(),
+            deleted_at: "2026-04-25T08:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        let tx = conn.transaction().unwrap();
+        apply_event(&tx, &ev).unwrap();
+        let outcome2 = apply_event(&tx, &ev).unwrap();
+        assert_eq!(outcome2, ApplyOutcome::TombstoneNoOp, "replay no-op");
+    }
+
+    #[test]
+    fn apply_shopee_account_tombstone_invalid_key_no_op() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "shopee_account".to_string(),
+            entity_key: "not-a-number".to_string(),
+            deleted_at: "2026-04-25T08:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        assert_eq!(apply_event(&tx, &ev).unwrap(), ApplyOutcome::TombstoneNoOp);
+    }
+
+    #[test]
+    fn apply_imported_file_tombstone_invalid_key_no_op() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "imported_file".to_string(),
+            entity_key: "not-a-number".to_string(),
+            deleted_at: "2026-04-24T10:00:00Z".to_string(),
+            clock_ms: 1000,
+        });
+        let outcome = apply_event(&tx, &ev).unwrap();
+        assert_eq!(outcome, ApplyOutcome::TombstoneNoOp);
     }
 
     #[test]

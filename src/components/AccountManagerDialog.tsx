@@ -81,13 +81,15 @@ export function AccountManagerDialog({
     async (id: string) => {
       const name = editName.trim();
       if (!name) return;
+      // No-op detection: blur/Enter mà tên không đổi → BE trả false, FE
+      // skip onDataChanged để không kích "Chờ đồng bộ".
       setSaving(true);
       setError(null);
       try {
-        await renameShopeeAccount(id, name);
+        const changed = await renameShopeeAccount(id, name);
         setEditingId(null);
         await refresh();
-        onDataChanged?.();
+        if (changed) onDataChanged?.();
       } catch (e) {
         setError((e as Error).message);
       } finally {

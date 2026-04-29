@@ -16,14 +16,91 @@ use crate::db::{tombstone_key_sub, DbState};
 use crate::sync_v9::hlc::next_hlc_rfc3339;
 use super::{assert_not_bootstrapping, CmdError, CmdResult};
 
+/// Trả `true` nếu có thay đổi DB thực sự, `false` nếu input trùng row hiện
+/// có (no-op). Caller (FE) dùng flag để gate `markMutation` — tránh "Chờ đồng
+/// bộ" khi user mở dialog rồi bấm Lưu mà không sửa giá trị nào.
 #[tauri::command]
 pub fn save_manual_entry(
     state: State<'_, DbState>,
     input: ManualEntryInput,
-) -> CmdResult<()> {
+) -> CmdResult<bool> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     assert_not_bootstrapping(&conn)?;
     let tx = conn.transaction()?;
+
+    let key = tombstone_key_sub(&input.day_date, &input.sub_ids);
+
+    // No-op detection: row hiện có khớp toàn bộ input field VÀ không có
+    // tombstone nào cần huỷ → bỏ qua write để cursor `updated_at` không
+    // advance → push delta không trigger.
+    let has_tombstone: bool = tx
+        .query_row(
+            "SELECT 1 FROM tombstones
+             WHERE (entity_type IN ('ui_row', 'manual_entry') AND entity_key = ?1)
+                OR (entity_type = 'day' AND entity_key = ?2)
+             LIMIT 1",
+            params![key, input.day_date],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    type ExistingRow = (
+        Option<String>,
+        Option<i64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i64>,
+        Option<f64>,
+        Option<String>,
+        Option<i64>,
+    );
+    let existing: Option<ExistingRow> = tx
+        .query_row(
+            "SELECT display_name, override_clicks, override_spend, override_cpc,
+                    override_orders, override_commission, notes, shopee_account_id
+             FROM manual_entries
+             WHERE sub_id1 = ?1 AND sub_id2 = ?2 AND sub_id3 = ?3
+               AND sub_id4 = ?4 AND sub_id5 = ?5 AND day_date = ?6",
+            params![
+                input.sub_ids[0],
+                input.sub_ids[1],
+                input.sub_ids[2],
+                input.sub_ids[3],
+                input.sub_ids[4],
+                input.day_date,
+            ],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    if !has_tombstone {
+        if let Some((dn, oc, os, occ, oo, ocom, n, sa)) = &existing {
+            if dn == &input.display_name
+                && oc == &input.override_clicks
+                && os == &input.override_spend
+                && occ == &input.override_cpc
+                && oo == &input.override_orders
+                && ocom == &input.override_commission
+                && n == &input.notes
+                && *sa == Some(input.shopee_account_id)
+            {
+                return Ok(false);
+            }
+        }
+    }
+
     // HLC-lite: ensure updated_at monotonic across machines. Thay `Utc::now`
     // bằng `next_hlc_rfc3339` để clock drift của máy local không làm edit này
     // "trông như" sớm hơn edit đã thấy từ remote.
@@ -37,7 +114,6 @@ pub fn save_manual_entry(
     // Resurrect: nếu trước đó user đã xóa tuple này (tombstone 'ui_row' hoặc 'manual_entry')
     // thì save = huỷ tombstone — tránh merge cross-device xoá mất entry vừa tạo.
     // Cũng huỷ tombstone 'day' nếu có (save manual entry trên 1 ngày đã bị xóa).
-    let key = tombstone_key_sub(&input.day_date, &input.sub_ids);
     tx.execute(
         "DELETE FROM tombstones
          WHERE (entity_type IN ('ui_row', 'manual_entry') AND entity_key = ?)
@@ -84,7 +160,7 @@ pub fn save_manual_entry(
     )?;
 
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Xóa 1 manual entry theo key. Không ảnh hưởng raw tables.

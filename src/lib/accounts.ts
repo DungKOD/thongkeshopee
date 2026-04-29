@@ -25,15 +25,21 @@ export function createShopeeAccount(
   return invoke<string>("create_shopee_account", { name, color: color ?? null });
 }
 
-export function renameShopeeAccount(id: string, newName: string): Promise<void> {
-  return invoke<void>("rename_shopee_account", { id, newName });
+/// Trả `true` nếu tên thực sự khác → caller báo cho sync layer. `false` =
+/// trùng tên hiện có (no-op), caller skip mutation event.
+export function renameShopeeAccount(
+  id: string,
+  newName: string,
+): Promise<boolean> {
+  return invoke<boolean>("rename_shopee_account", { id, newName });
 }
 
+/// Trả `true` nếu color thực sự khác (xem `renameShopeeAccount`).
 export function updateShopeeAccountColor(
   id: string,
   color: string | null,
-): Promise<void> {
-  return invoke<void>("update_shopee_account_color", { id, color });
+): Promise<boolean> {
+  return invoke<boolean>("update_shopee_account_color", { id, color });
 }
 
 export function deleteShopeeAccount(

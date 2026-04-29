@@ -183,19 +183,26 @@ fn b4_concurrent_edit_hlc_higher_wins() {
     );
 }
 
-/// B5: Day tombstone UNCONDITIONAL cascade.
+/// B5 (v0.5.2): Day tombstone tôn trọng resurrect rule.
+///
+/// Trước đây UNCONDITIONAL cascade — manual edit sau tombstone bị xóa nhầm
+/// (bug: user xóa day rồi modify lại, sync replay lại wipe modification).
+/// Giờ resurrect-aware: data updated_at > deleted_at survive; raw rows linked
+/// tới file imported BEFORE deleted_at thì xóa, file imported sau survive;
+/// day row tự xóa nếu không còn data ref.
 #[test]
-fn b5_day_tombstone_cascades_unconditionally() {
+fn b5_day_tombstone_respects_resurrect_rule() {
     let mut target = new_db("uid-shared");
 
     let fid = insert_file(&target, "h1", "shopee_clicks");
     insert_raw_click(&target, "2026-04-20", fid, "c1");
+    // Manual edit với updated_at NEWER than upcoming tombstone (T20 > T05).
     insert_manual(&target, "2026-04-20", "m1", "2026-04-20T20:00:00.000Z", 50.0);
 
     assert_eq!(count_rows(&target, "raw_shopee_clicks"), 1);
     assert_eq!(count_rows(&target, "manual_entries"), 1);
 
-    // Simulate remote xóa day với deleted_at sớm hơn manual edit trên target.
+    // Remote xóa day với deleted_at sớm hơn manual edit trên target.
     let a = new_db("uid-shared");
     insert_day(&a, "2026-04-20");
     a.execute(
@@ -207,13 +214,566 @@ fn b5_day_tombstone_cascades_unconditionally() {
 
     roundtrip_capture_apply(&a, &mut target, "tombstones");
 
-    assert_eq!(count_rows(&target, "days"), 0, "day bị xóa");
-    assert_eq!(count_rows(&target, "raw_shopee_clicks"), 0, "raw cascade");
+    // Manual edit T20 > T05 → SURVIVE (resurrect rule).
     assert_eq!(
         count_rows(&target, "manual_entries"),
-        0,
-        "manual cascade dù edit mới hơn tombstone"
+        1,
+        "manual edit newer than tombstone phải survive (không bị wipe)"
     );
+    // Raw row imported tại T00 < T05 và không có mapping post-delete → DELETE.
+    assert_eq!(
+        count_rows(&target, "raw_shopee_clicks"),
+        0,
+        "raw cũ (file imported trước deleted_at) bị xóa"
+    );
+    // Day row vẫn tồn tại vì còn manual_entries reference.
+    assert_eq!(
+        count_rows(&target, "days"),
+        1,
+        "day SURVIVE vì manual_entries còn reference"
+    );
+}
+
+/// B10 (regression v0.5.2): user xóa day → modify same day → wipe local +
+/// reopen → restore từ snapshot CŨ + replay bundle. Modification phải SURVIVE
+/// dù tombstone replay sau manual_entries INSERT trong bundle order.
+///
+/// Đây là user's exact bug: "xóa ngày 24 → thay đổi 1 chỉ số ngày 24 → clear
+/// data → mở lại app → data cũ vẫn hiện".
+#[test]
+fn b10_delete_then_modify_day_modification_survives_replay() {
+    use crate::sync_v9::content_id;
+    let mut b = new_db("uid-shared"); // simulate B sau wipe + bootstrap
+
+    // Stage 1: B restore từ snapshot S1 (state initial — day 24, 25 với raw từ F1).
+    let f1 = content_id::imported_file_id("h-f1");
+    b.execute(
+        "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+         VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00.000Z', 'h-f1', '2026-04-24')",
+        params![f1],
+    )
+    .unwrap();
+    insert_day(&b, "2026-04-24");
+    insert_day(&b, "2026-04-25");
+    b.execute(
+        "INSERT INTO raw_shopee_clicks
+         (click_id, click_time, day_date, source_file_id, sub_id1)
+         VALUES('c-old-24', '2026-04-24T10:00:00Z', '2026-04-24', ?, 'old')",
+        params![f1],
+    )
+    .unwrap();
+    b.execute(
+        "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c-old-24', ?)",
+        params![f1],
+    )
+    .unwrap();
+    b.execute(
+        "INSERT INTO raw_shopee_clicks
+         (click_id, click_time, day_date, source_file_id, sub_id1)
+         VALUES('c-old-25', '2026-04-25T10:00:00Z', '2026-04-25', ?, 'old')",
+        params![f1],
+    )
+    .unwrap();
+    b.execute(
+        "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c-old-25', ?)",
+        params![f1],
+    )
+    .unwrap();
+
+    // Stage 2: A's bundle (delete + modify day 24) cần apply lên B.
+    // - Tombstone 'day' '2026-04-24' deleted_at = T1
+    // - manual_entries INSERT day 24 updated_at = T2 > T1 (modification AFTER delete)
+    let a = new_db("uid-shared");
+    insert_day(&a, "2026-04-24");
+    a.execute(
+        "INSERT INTO manual_entries
+         (sub_id1, day_date, override_clicks, created_at, updated_at, override_spend)
+         VALUES('user-edit', '2026-04-24', 100, 'now', '2026-04-26T12:00:00.000Z', 7.5)",
+        [],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+         VALUES('day', '2026-04-24', '2026-04-26T08:00:00.000Z')",
+        [],
+    )
+    .unwrap();
+
+    // Apply bundle: manual_entries TRƯỚC tombstones (NDJSON SYNC_TABLES order).
+    // Đây là điểm kiểm chứng resurrect rule — tombstone applied sau cùng KHÔNG
+    // được wipe manual entry vừa insert.
+    roundtrip_capture_apply(&a, &mut b, "manual_entries");
+    roundtrip_capture_apply(&a, &mut b, "tombstones");
+
+    // Day 24 raw cũ bị xóa (file imported_at='2026-04-20' < deleted_at='2026-04-26').
+    let raw_24: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE day_date = '2026-04-24'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_24, 0, "raw cũ ngày 24 bị xóa đúng intent");
+
+    // Manual edit (T2 > T1) SURVIVE.
+    let manual_24: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM manual_entries WHERE day_date = '2026-04-24'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        manual_24, 1,
+        "manual edit POST-delete phải survive (resurrect rule)"
+    );
+
+    // Day 24 vẫn còn vì có manual reference.
+    let day_24: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM days WHERE date = '2026-04-24'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(day_24, 1, "day 24 survive vì có manual_entries");
+
+    // Day 25 không bị động (user không xóa day 25).
+    let day_25: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM days WHERE date = '2026-04-25'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(day_25, 1, "day 25 không bị động");
+    let raw_25: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE day_date = '2026-04-25'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_25, 1, "raw day 25 preserved");
+}
+
+/// B11 (regression v0.5.2): user xóa day → re-import file MỚI cho day đó.
+/// File post-delete có imported_at > deleted_at → raw rows survive.
+#[test]
+fn b11_day_tombstone_preserves_post_delete_reimport() {
+    use crate::sync_v9::content_id;
+    let mut b = new_db("uid-shared");
+
+    // Stage 1: snapshot has F1 (old) + raw cho day 24.
+    let f1 = content_id::imported_file_id("h-f1");
+    b.execute(
+        "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+         VALUES(?, 'f1.csv', 'shopee_clicks', '2026-04-20T00:00:00.000Z', 'h-f1', '2026-04-24')",
+        params![f1],
+    )
+    .unwrap();
+    insert_day(&b, "2026-04-24");
+    b.execute(
+        "INSERT INTO raw_shopee_clicks
+         (click_id, click_time, day_date, source_file_id, sub_id1)
+         VALUES('c-shared', '2026-04-24T10:00:00Z', '2026-04-24', ?, 'old')",
+        params![f1],
+    )
+    .unwrap();
+    b.execute(
+        "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c-shared', ?)",
+        params![f1],
+    )
+    .unwrap();
+
+    // Stage 2: A xóa day 24 lúc T1, sau đó re-import file F2 (imported_at=T2 > T1)
+    // chứa cùng click_id "c-shared" + click mới "c-new".
+    let a = new_db("uid-shared");
+    insert_day(&a, "2026-04-24");
+    let f2 = content_id::imported_file_id("h-f2");
+    a.execute(
+        "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+         VALUES(?, 'f2.csv', 'shopee_clicks', '2026-04-26T10:00:00.000Z', 'h-f2', '2026-04-24')",
+        params![f2],
+    )
+    .unwrap();
+    // F2 mappings: cả c-shared (re-import) và c-new (mới).
+    a.execute(
+        "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c-shared', ?), ('c-new', ?)",
+        params![f2, f2],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO raw_shopee_clicks
+         (click_id, click_time, day_date, source_file_id, sub_id1)
+         VALUES('c-new', '2026-04-24T11:00:00Z', '2026-04-24', ?, 'new')",
+        params![f2],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+         VALUES('day', '2026-04-24', '2026-04-26T08:00:00.000Z')",
+        [],
+    )
+    .unwrap();
+
+    // Apply bundle: imported_files → raw → mappings → tombstone.
+    for table in [
+        "imported_files",
+        "raw_shopee_clicks",
+        "clicks_to_file",
+        "tombstones",
+    ] {
+        roundtrip_capture_apply(&a, &mut b, table);
+    }
+
+    // c-shared SURVIVE (có mapping link tới F2 imported AFTER deleted_at).
+    let shared: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE click_id = 'c-shared'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared, 1, "c-shared survive vì có mapping post-delete");
+
+    // c-new SURVIVE (chỉ link F2 post-delete).
+    let new_click: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE click_id = 'c-new'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(new_click, 1, "c-new survive (post-delete import)");
+}
+
+/// B6: manual_entry tombstone resurrect rule — local updated_at > deleted_at
+/// của tombstone → row KHÔNG bị xóa (edit-wins-over-delete).
+
+/// B7 (regression v0.5.1): revert_import phải emit `'imported_file'` tombstone,
+/// thiếu thì máy khác (hoặc same máy sau wipe + bootstrap) sẽ replay raw rows
+/// gốc → "data cũ trước khi xóa bảng" hồi sinh.
+///
+/// Scenario: A import F1 → push → B nhận. A revert F1 + push tombstone → B apply.
+/// Verify B's raw_* + mappings + day cleanup giống A. imported_files row vẫn
+/// tồn tại trên cả 2 máy với reverted_at marker (history preserved).
+#[test]
+fn b7_revert_import_tombstone_propagates_deletion() {
+    let a = new_db("uid-shared");
+    let mut b = new_db("uid-shared");
+
+    // Step 1: A import F1 với 2 clicks.
+    let f1 = insert_file(&a, "h-revert", "shopee_clicks");
+    insert_raw_click(&a, "2026-04-20", f1, "c1");
+    insert_raw_click(&a, "2026-04-20", f1, "c2");
+    a.execute(
+        "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c1', ?), ('c2', ?)",
+        params![f1, f1],
+    )
+    .unwrap();
+
+    // Step 2: Sync sang B (initial state).
+    for table in ["imported_files", "raw_shopee_clicks", "clicks_to_file"] {
+        roundtrip_capture_apply(&a, &mut b, table);
+    }
+    assert_eq!(count_rows(&b, "raw_shopee_clicks"), 2, "B nhận 2 clicks");
+    assert_eq!(count_rows(&b, "clicks_to_file"), 2);
+
+    // Step 3: A revert F1 — mirror commands::batch::revert_import logic.
+    a.execute("DELETE FROM clicks_to_file WHERE file_id = ?", [f1])
+        .unwrap();
+    a.execute(
+        "DELETE FROM raw_shopee_clicks
+         WHERE click_id NOT IN (SELECT click_id FROM clicks_to_file)",
+        [],
+    )
+    .unwrap();
+    a.execute(
+        "UPDATE imported_files SET reverted_at = ?, stored_path = NULL WHERE id = ?",
+        params!["2026-04-25T08:00:00.000Z", f1],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+         VALUES('imported_file', ?, '2026-04-25T08:00:00.000Z')",
+        [f1.to_string()],
+    )
+    .unwrap();
+    a.execute(
+        "DELETE FROM days WHERE date NOT IN (
+            SELECT day_date FROM raw_shopee_clicks UNION
+            SELECT day_date FROM raw_shopee_order_items UNION
+            SELECT day_date FROM raw_fb_ads UNION
+            SELECT day_date FROM manual_entries
+         )",
+        [],
+    )
+    .unwrap();
+
+    // A's local state post-revert: clean.
+    assert_eq!(count_rows(&a, "raw_shopee_clicks"), 0);
+    assert_eq!(count_rows(&a, "days"), 0);
+
+    // Step 4: A push tombstones (chỉ tombstones cần propagate — raw_* DELETE
+    // không tự sinh event; tombstone là cơ chế duy nhất báo deletion).
+    roundtrip_capture_apply(&a, &mut b, "tombstones");
+
+    // Step 5: B post-apply phải có state giống A.
+    assert_eq!(
+        count_rows(&b, "raw_shopee_clicks"),
+        0,
+        "B's raw clicks bị xóa qua tombstone — bug cũ: vẫn còn 2 rows"
+    );
+    assert_eq!(count_rows(&b, "clicks_to_file"), 0, "B's mapping cũng xóa");
+    assert_eq!(count_rows(&b, "days"), 0, "day orphan cleanup");
+
+    // imported_files row vẫn tồn tại với reverted_at (history).
+    let reverted_at: Option<String> = b
+        .query_row(
+            "SELECT reverted_at FROM imported_files WHERE id = ?",
+            [f1],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reverted_at.as_deref(),
+        Some("2026-04-25T08:00:00.000Z"),
+        "B's file row marked reverted (history preserved)"
+    );
+}
+
+/// B8 (regression v0.5.1): delete_shopee_account phải emit `'shopee_account'`
+/// tombstone. Thiếu thì sau wipe + login, account + raw rows hồi sinh từ
+/// delta replay.
+///
+/// Verify: (1) Shop A's data xóa cross-device, (2) default account + Shop B
+/// data PRESERVED (không over-delete).
+#[test]
+fn b8_delete_shopee_account_tombstone_propagates_without_collateral() {
+    use crate::sync_v9::content_id;
+    let a = new_db("uid-shared");
+    let mut b = new_db("uid-shared");
+
+    // Setup: 3 accounts trên A.
+    let shop_a_id = content_id::shopee_account_id("Shop A");
+    let shop_b_id = content_id::shopee_account_id("Shop B");
+    let default_id = content_id::shopee_account_id(crate::db::DEFAULT_ACCOUNT_NAME);
+
+    for (id, name) in [(shop_a_id, "Shop A"), (shop_b_id, "Shop B")] {
+        a.execute(
+            "INSERT INTO shopee_accounts (id, name, color, created_at)
+             VALUES (?, ?, '#000', '2026-04-20T08:00:00Z')",
+            params![id, name],
+        )
+        .unwrap();
+    }
+
+    // Files + raw rows cho từng account trên A.
+    let f_default = content_id::imported_file_id("h-default");
+    let f_a = content_id::imported_file_id("h-a");
+    let f_b = content_id::imported_file_id("h-b");
+    for (fid, acc_id, click_id, hash) in [
+        (f_default, default_id, "c-default", "h-default"),
+        (f_a, shop_a_id, "c-a", "h-a"),
+        (f_b, shop_b_id, "c-b", "h-b"),
+    ] {
+        a.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date, shopee_account_id)
+             VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00Z', ?, '2026-04-20', ?)",
+            params![fid, hash, acc_id],
+        )
+        .unwrap();
+        insert_day(&a, "2026-04-20");
+        a.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id, shopee_account_id)
+             VALUES(?, '2026-04-20T10:00:00Z', '2026-04-20', ?, ?)",
+            params![click_id, fid, acc_id],
+        )
+        .unwrap();
+        a.execute(
+            "INSERT INTO clicks_to_file(click_id, file_id) VALUES(?, ?)",
+            params![click_id, fid],
+        )
+        .unwrap();
+    }
+
+    // Sync sang B: 3 raw clicks + 3 files + 3 accounts (default đã seed cả 2 máy
+    // qua migrate_for_tests, INSERT OR IGNORE skip on B).
+    for table in [
+        "shopee_accounts",
+        "imported_files",
+        "raw_shopee_clicks",
+        "clicks_to_file",
+    ] {
+        roundtrip_capture_apply(&a, &mut b, table);
+    }
+    assert_eq!(count_rows(&b, "raw_shopee_clicks"), 3);
+
+    // A xóa Shop A → DELETE raw + manual + account, cleanup orphan files.
+    a.execute(
+        "DELETE FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+        [shop_a_id],
+    )
+    .unwrap();
+    a.execute(
+        "DELETE FROM shopee_accounts WHERE id = ?",
+        [shop_a_id],
+    )
+    .unwrap();
+    a.execute(
+        "DELETE FROM imported_files
+         WHERE id NOT IN (
+             SELECT source_file_id FROM raw_shopee_clicks UNION
+             SELECT source_file_id FROM raw_shopee_order_items UNION
+             SELECT source_file_id FROM raw_fb_ads
+         )",
+        [],
+    )
+    .unwrap();
+    // Tombstone (mirror commands::accounts::delete_shopee_account fix).
+    a.execute(
+        "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+         VALUES('shopee_account', ?, '2026-04-25T08:00:00.000Z')",
+        [shop_a_id.to_string()],
+    )
+    .unwrap();
+
+    // Push tombstones → B apply.
+    roundtrip_capture_apply(&a, &mut b, "tombstones");
+
+    // B verify: Shop A data gone.
+    let a_count: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+            [shop_a_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(a_count, 0, "Shop A raw clicks bị xóa cross-device");
+    let a_acc: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM shopee_accounts WHERE id = ?",
+            [shop_a_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(a_acc, 0, "Shop A account row bị xóa");
+
+    // B verify: default account + Shop B data PRESERVED.
+    let default_count: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+            [default_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        default_count, 1,
+        "default account data PRESERVED — không over-delete"
+    );
+    let b_count: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+            [shop_b_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(b_count, 1, "Shop B data preserved");
+}
+
+/// B9 (regression): apply imported_file tombstone KHÔNG được xóa data
+/// của file khác cùng day. Đảm bảo cleanup days chỉ chạm day thực sự orphan.
+#[test]
+fn b9_imported_file_tombstone_does_not_leak_to_other_files() {
+    use crate::sync_v9::content_id;
+    let a = new_db("uid-shared");
+    let mut b = new_db("uid-shared");
+
+    let default_id = content_id::shopee_account_id(crate::db::DEFAULT_ACCOUNT_NAME);
+
+    // 2 file cùng day, mỗi file 1 click riêng (không share).
+    let f1 = content_id::imported_file_id("h1");
+    let f2 = content_id::imported_file_id("h2");
+    for (fid, hash) in [(f1, "h1"), (f2, "h2")] {
+        a.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date, shopee_account_id)
+             VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00Z', ?, '2026-04-20', ?)",
+            params![fid, hash, default_id],
+        )
+        .unwrap();
+    }
+    insert_day(&a, "2026-04-20");
+    for (fid, click_id) in [(f1, "click-from-f1"), (f2, "click-from-f2")] {
+        a.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id, shopee_account_id)
+             VALUES(?, '2026-04-20T10:00:00Z', '2026-04-20', ?, ?)",
+            params![click_id, fid, default_id],
+        )
+        .unwrap();
+        a.execute(
+            "INSERT INTO clicks_to_file(click_id, file_id) VALUES(?, ?)",
+            params![click_id, fid],
+        )
+        .unwrap();
+    }
+
+    for table in [
+        "imported_files",
+        "raw_shopee_clicks",
+        "clicks_to_file",
+    ] {
+        roundtrip_capture_apply(&a, &mut b, table);
+    }
+    assert_eq!(count_rows(&b, "raw_shopee_clicks"), 2);
+
+    // A revert F1 — emit tombstone.
+    a.execute("DELETE FROM clicks_to_file WHERE file_id = ?", [f1])
+        .unwrap();
+    a.execute(
+        "DELETE FROM raw_shopee_clicks WHERE click_id NOT IN (SELECT click_id FROM clicks_to_file)",
+        [],
+    )
+    .unwrap();
+    a.execute(
+        "UPDATE imported_files SET reverted_at = '2026-04-25T08:00:00.000Z' WHERE id = ?",
+        [f1],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+         VALUES('imported_file', ?, '2026-04-25T08:00:00.000Z')",
+        [f1.to_string()],
+    )
+    .unwrap();
+
+    roundtrip_capture_apply(&a, &mut b, "tombstones");
+
+    // B: chỉ click của F1 bị xóa, click của F2 PRESERVED.
+    let count: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE click_id = 'click-from-f2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "F2's click PRESERVED — không leak");
+    let count_f1: i64 = b
+        .query_row(
+            "SELECT COUNT(*) FROM raw_shopee_clicks WHERE click_id = 'click-from-f1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_f1, 0, "F1's click bị xóa đúng");
+
+    // Day vẫn còn vì F2 raw rows vẫn reference.
+    let day_count: i64 = b
+        .query_row("SELECT COUNT(*) FROM days", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(day_count, 1, "day preserved (F2 còn raw)");
 }
 
 /// B6: manual_entry tombstone resurrect rule — local updated_at > deleted_at

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ManualEntryInput, SubIds, UiRow } from "../types";
 import { parseSubIdString } from "../lib/dbImport";
@@ -48,28 +48,56 @@ export function ManualEntryDialog({
   const [commission, setCommission] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /// Snapshot field strings tại lúc mở dialog. Submit so sánh với current
+  /// state — toàn bộ unchanged → skip onSave để Case B (row chưa có override,
+  /// user mở "Sửa dòng" rồi bấm Lưu mà không sửa) không tạo override mới ==
+  /// raw, không advance cursor manual_entries → SyncBadge không "Chờ đồng bộ".
+  const initialSnapshotRef = useRef<{
+    date: string;
+    name: string;
+    clicks: string;
+    spend: string;
+    cpc: string;
+    orders: string;
+    commission: string;
+  } | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
     setError(null);
     setSaving(false);
-    setDate(initialRow?.dayDate || initialDate);
+    const initDate = initialRow?.dayDate || initialDate;
+    let initName = "";
+    let initClicks = "";
+    let initSpend = "";
+    let initCpc = "";
+    let initOrders = "";
+    let initCommission = "";
     if (initialRow) {
       const nonEmpty = initialRow.subIds.filter((s) => s).join("-");
-      setName(nonEmpty || initialRow.displayName);
-      setClicks(n2s(initialRow.adsClicks));
-      setSpend(n2s(initialRow.totalSpend));
-      setCpc(n2s(initialRow.cpc));
-      setOrders(n2s(initialRow.ordersCount));
-      setCommission(n2s(initialRow.commissionTotal));
-    } else {
-      setName("");
-      setClicks("");
-      setSpend("");
-      setCpc("");
-      setOrders("");
-      setCommission("");
+      initName = nonEmpty || initialRow.displayName;
+      initClicks = n2s(initialRow.adsClicks);
+      initSpend = n2s(initialRow.totalSpend);
+      initCpc = n2s(initialRow.cpc);
+      initOrders = n2s(initialRow.ordersCount);
+      initCommission = n2s(initialRow.commissionTotal);
     }
+    setDate(initDate);
+    setName(initName);
+    setClicks(initClicks);
+    setSpend(initSpend);
+    setCpc(initCpc);
+    setOrders(initOrders);
+    setCommission(initCommission);
+    initialSnapshotRef.current = {
+      date: initDate,
+      name: initName,
+      clicks: initClicks,
+      spend: initSpend,
+      cpc: initCpc,
+      orders: initOrders,
+      commission: initCommission,
+    };
   }, [isOpen, initialDate, initialRow]);
 
   useEffect(() => {
@@ -101,6 +129,24 @@ export function ManualEntryDialog({
     }
     if (shopeeAccountId === null) {
       setError("Chưa có account Shopee — tạo account trước khi thêm dòng tay");
+      return;
+    }
+    // Edit mode + form chưa dirty (mọi field giữ nguyên giá trị mở dialog)
+    // → bấm Lưu = no-op. Đóng dialog ngay, không invoke save_manual_entry
+    // (tránh tạo override duplicate raw cho row chưa có manual entry).
+    const snap = initialSnapshotRef.current;
+    if (
+      isEdit &&
+      snap &&
+      snap.date === date &&
+      snap.name === name &&
+      snap.clicks === clicks &&
+      snap.spend === spend &&
+      snap.cpc === cpc &&
+      snap.orders === orders &&
+      snap.commission === commission
+    ) {
+      onClose();
       return;
     }
     setSaving(true);

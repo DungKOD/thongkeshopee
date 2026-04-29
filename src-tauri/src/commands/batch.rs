@@ -300,6 +300,19 @@ pub fn revert_import(
         params![now, file_id],
     )?;
 
+    // 5. Tombstone 'imported_file' — sync v9 propagate revert sang máy khác.
+    // Thiếu tombstone này: cursor `imported_at` không advance khi chỉ
+    // `reverted_at` đổi → file row không capture lại; raw_*/mapping DELETE
+    // không emit event → máy khác pull về sẽ KHÔNG xóa → wipe local + login
+    // thấy raw rows cũ hồi sinh.
+    // entity_key = str(file_id): file_id = content_id(file_hash) deterministic
+    // cross-machine, nên apply side resolve đúng row qua id matching.
+    tx.execute(
+        "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+         VALUES ('imported_file', ?, ?)",
+        params![file_id.to_string(), now],
+    )?;
+
     tx.commit()?;
 
     // 6. Best-effort: xóa physical CSV file khỏi disk (outside tx).

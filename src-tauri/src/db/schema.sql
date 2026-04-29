@@ -220,13 +220,18 @@ CREATE INDEX IF NOT EXISTS idx_manual_account   ON manual_entries(shopee_account
 
 -- =============================================================
 -- tombstones — track deletion cho merge cross-device.
---   'day'          — cả ngày: entity_key = date.
---   'ui_row'       — 1 tuple sub_id: entity_key = '{day}|{s1}|...|{s5}'.
---   'manual_entry' — chỉ manual override (không raw): same key format.
+--   'day'           — cả ngày: entity_key = date.
+--   'ui_row'        — 1 tuple sub_id: entity_key = '{day}|{s1}|...|{s5}'.
+--   'manual_entry'  — chỉ manual override (không raw): same key format.
+--   'imported_file' — 1 file đã import (revert): entity_key = str(file_id)
+--                     (file_id = content_id deterministic cross-machine).
+--   'shopee_account'— 1 account bị xóa: entity_key = str(account_id)
+--                     (account_id = content_id deterministic cross-machine).
+--                     Default account "Mặc định" có protection ở apply layer.
 -- =============================================================
 CREATE TABLE IF NOT EXISTS tombstones (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity_type  TEXT NOT NULL CHECK (entity_type IN ('day', 'ui_row', 'manual_entry')),
+    entity_type  TEXT NOT NULL CHECK (entity_type IN ('day', 'ui_row', 'manual_entry', 'imported_file', 'shopee_account')),
     entity_key   TEXT NOT NULL,
     deleted_at   TEXT NOT NULL,
     UNIQUE(entity_type, entity_key)

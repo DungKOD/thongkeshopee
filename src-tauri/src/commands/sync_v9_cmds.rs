@@ -736,7 +736,7 @@ pub async fn sync_v9_compact_if_needed(
 
     // 2. Prepare snapshot (VACUUM INTO + zstd) + build new manifest.
     let fingerprint = machine_fingerprint_stable();
-    let (artifact, new_manifest, result, _clock_ms) = {
+    let (artifact, new_manifest, result, clock_ms) = {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         let clock = hlc::next_hlc_ms(&conn)?;
         let uid: String = conn
@@ -764,7 +764,25 @@ pub async fn sync_v9_compact_if_needed(
         cas_put_full_manifest_retry(&db, &base_url, &id_token, &new_manifest, cached_etag)
             .await?;
 
-    // 5. Log compaction_complete (best-effort).
+    // 5. CRITICAL — record local snapshot pointer + advance pulled_clock.
+    //
+    // Bug: thiếu bước này, lần pull tiếp theo:
+    //   needs_snapshot_restore: snap.clock_ms (vừa upload) > local last_pulled
+    //   → trigger perform_snapshot_restore → WIPE local DB → restore từ snapshot
+    //   → mất MỌI mutation user vừa làm sau compact (vd xóa ngày → tombstone
+    //   table cũng bị wipe → push lần sau không có gì → data hồi sinh).
+    //
+    // Local DB hiện đã = state mà snapshot capture (snapshot LÀ local). Nên
+    // safe để mark "đã pull tới clock này" — pull sẽ skip restore.
+    {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        manifest::set_snapshot(&conn, &artifact.suggested_r2_key, clock_ms)
+            .map_err(|e| CmdError::msg(format!("set_snapshot post-compact: {e:#}")))?;
+        manifest::advance_pulled_clock(&conn, clock_ms)
+            .map_err(|e| CmdError::msg(format!("advance_pulled_clock post-compact: {e:#}")))?;
+    }
+
+    // 6. Log compaction_complete (best-effort).
     {
         let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
         let ts = hlc::next_hlc_rfc3339(&conn)?;

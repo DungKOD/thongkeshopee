@@ -659,6 +659,26 @@ export function useCloudSync({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoSyncEnabled, enabled]);
 
+  /// Re-arm debounce khi form đóng (pausedByForm true→false). Bug fix: trong
+  /// flow `handleSaveEntry`/`handleConfirmImport`, `markMutation()` chạy
+  /// TRONG lúc dialog còn mở (pausedByForm=true) → effect mutation bail
+  /// không arm debounce. Khi dialog đóng, mutationVersion không đổi nữa →
+  /// effect mutation bail tiếp (mutationVersion === lastSeenMutationRef).
+  /// Hậu quả: trạng thái "Chờ đồng bộ" kẹt vĩnh viễn cho đến force sync.
+  /// Effect này detect transition và arm debounce 45s nếu còn dirty +
+  /// autoSyncEnabled. Cùng pattern với autoSync OFF→ON ở trên.
+  const prevPausedByFormRef = useRef(pausedByForm);
+  useEffect(() => {
+    const wasPaused = prevPausedByFormRef.current;
+    const isPaused = pausedByForm;
+    prevPausedByFormRef.current = pausedByForm;
+    if (!enabled) return;
+    if (wasPaused && !isPaused && status === "dirty" && autoSyncEnabled) {
+      scheduleDebounce();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pausedByForm, enabled, autoSyncEnabled]);
+
   // Idle flush ĐÃ XÓA. Lý do user request: edit save manual entry trong
   // bảng ngày → user thường idle ~30s sau click → idle flush fire ở 30s
   // (sớm hơn debounce 45s) → cảm giác "đồng bộ ngay" thay vì đợi 45s đúng.

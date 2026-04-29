@@ -71,18 +71,32 @@ pub fn list_app_settings(
 /// muộn hơn thắng (xem sync_v9::apply for Upsert handling).
 ///
 /// `value` được trust nguyên dạng — FE đã JSON.stringify trước khi gửi.
+///
+/// Trả `true` nếu DB thực sự thay đổi, `false` nếu value trùng với row hiện
+/// có. Caller dùng flag để bỏ qua mutation event → tránh "Chờ đồng bộ" khi
+/// user bấm cùng giá trị cũ.
 #[tauri::command]
 pub fn set_app_setting(
     state: State<'_, DbState>,
     key: String,
     value: String,
-) -> CmdResult<()> {
+) -> CmdResult<bool> {
     if key.is_empty() {
         return Err(CmdError::msg("app_setting key không được rỗng"));
     }
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     assert_not_bootstrapping(&conn)?;
     let tx = conn.transaction()?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?",
+            [&key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.as_deref() == Some(value.as_str()) {
+        return Ok(false);
+    }
     let now = next_hlc_rfc3339(&tx)?;
     tx.execute(
         "INSERT INTO app_settings (key, value, updated_at)
@@ -93,7 +107,7 @@ pub fn set_app_setting(
         params![key, value, now],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Bulk set — atomic transaction cho migration localStorage → DB. Tránh fail
