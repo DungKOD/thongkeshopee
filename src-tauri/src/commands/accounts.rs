@@ -106,6 +106,24 @@ pub fn list_shopee_accounts(state: State<'_, DbState>) -> CmdResult<Vec<ShopeeAc
 }
 
 /// Tạo account mới. Trả về id mới (string vì content_id có thể > 2^53).
+///
+/// **v0.6.2 fix — tombstone resurrect**: nếu user xóa TK rồi tạo lại cùng tên,
+/// content_id stable nên id giống nhau, NHƯNG row tombstone cũ vẫn ở local +
+/// peer machine có thể chưa apply xong. Bug cũ:
+/// - `created_at` dùng `now_rfc3339_z()` (wall clock) trong khi tombstone
+///   `deleted_at` dùng HLC → cross-machine clock skew khiến `created_at` <
+///   `deleted_at` → resurrect rule (apply layer) không cứu được.
+/// - Stale local tombstone không bị clear → snapshot replay trên fresh install
+///   apply tombstone cũ sau apply INSERT mới → wipe TK vừa tạo.
+///
+/// Fix:
+/// - Dùng `next_hlc_rfc3339(&tx)` cho `created_at` → strictly monotonic với
+///   HLC clock đã absorb từ peer → `created_at` luôn > tombstone `deleted_at`
+///   nếu user thực sự tạo SAU khi xóa.
+/// - DELETE stale local tombstone (entity_type='shopee_account', entity_key=id)
+///   trong cùng tx → capture cursor không re-emit tombstone đã expire, peer
+///   nhận INSERT clean.
+/// - Atomic qua transaction → fail giữa chừng rollback toàn bộ.
 #[tauri::command]
 pub fn create_shopee_account(
     state: State<'_, DbState>,
@@ -116,15 +134,30 @@ pub fn create_shopee_account(
     if trimmed.is_empty() {
         return Err(CmdError::msg("Tên account không được để trống"));
     }
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Bug E fix: bootstrap restore window guard.
     assert_not_bootstrapping(&conn)?;
-    // Bug F: dùng helper chung để chuẩn hoá format `Z` toàn project.
-    let now = crate::sync_v9::hlc::now_rfc3339_z();
     // v13: id = content_id(name). Cross-machine stable — không còn autoincrement
     // collision khi 2 máy tạo cùng account fresh.
     let id = crate::sync_v9::content_id::shopee_account_id(&trimmed);
-    conn.execute(
+
+    let tx = conn.transaction()?;
+    // HLC-monotonic created_at: cross-machine, đảm bảo created_at > tombstone
+    // deleted_at nếu tạo SAU xóa, để apply_shopee_account_tombstone resurrect
+    // rule skip đúng.
+    let now = next_hlc_rfc3339(&tx)?;
+    // Clear stale local tombstone — nếu user xóa TK trước đó rồi tạo lại
+    // (cùng name → cùng content_id), tombstone cũ với entity_key=id vẫn ở
+    // tombstones. Để nó tồn tại sẽ ô nhiễm local state (idempotent replay sẽ
+    // xóa account vừa tạo nếu cursor reset). Capture cursor=deleted_at đã
+    // advance qua tombstone cũ nên không re-push, nhưng clear local cho
+    // sạch + safer cho future replay paths.
+    tx.execute(
+        "DELETE FROM tombstones
+         WHERE entity_type = 'shopee_account' AND entity_key = ?",
+        params![id.to_string()],
+    )?;
+    tx.execute(
         "INSERT INTO shopee_accounts (id, name, color, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![id, trimmed, color, now],
     )
@@ -137,6 +170,7 @@ pub fn create_shopee_account(
             CmdError::from(e)
         }
     })?;
+    tx.commit()?;
     Ok(id.to_string())
 }
 

@@ -159,7 +159,7 @@ fn register_imported_file(
     )?;
 
     // v10: dedup chỉ check file ACTIVE (chưa revert). Row `reverted_at IS NOT NULL`
-    // giữ cho history — user revert xong import lại cùng file → tạo row mới.
+    // giữ cho history — user revert xong import lại cùng file → revive row đó.
     let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM imported_files WHERE file_hash = ? AND reverted_at IS NULL",
@@ -171,8 +171,67 @@ fn register_imported_file(
         return Ok(id);
     }
 
-    // v13: id = content_id(file_hash) — deterministic cross-machine.
+    // v0.6.2 fix — revive reverted file (regression v0.6.1):
+    // v13 dùng `id = content_id(hash)` deterministic, kết hợp với v0.6.1
+    // chuyển revert/orphan-cleanup sang SOFT-MARK (UPDATE reverted_at thay
+    // vì DELETE) → row cũ vẫn ở table với cùng id. INSERT mới sẽ UNIQUE PK
+    // collision (`UNIQUE constraint failed: imported_files.id`).
+    //
+    // Path xảy ra:
+    // 1. `revert_import` user-triggered (đã có trước v0.6.1).
+    // 2. `batch_commit_deletes` xóa toàn bộ day → orphan file soft-mark
+    //    (v0.6.1 fix).
+    //
+    // Fix: tìm row cùng hash đã reverted → UPDATE reverted_at=NULL +
+    // refresh metadata (filename, stored_path, day_date, account, ...) +
+    // clear local tombstone 'imported_file' (entity_key=id) để snapshot
+    // replay không wipe lại.
+    //
+    // Edge case: 2 file khác hash trùng id (collision content_id 63-bit) —
+    // xác suất gần 0 với SHA-256 input 8 byte; nếu xảy ra UNIQUE PK fail
+    // sẽ surface qua error message bình thường.
     let id = crate::sync_v9::content_id::imported_file_id(hash);
+    let reverted_id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM imported_files
+             WHERE file_hash = ? AND reverted_at IS NOT NULL",
+            params![hash],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(prev_id) = reverted_id {
+        // Sanity check: id từ content_id(hash) phải match row cũ. Nếu khác
+        // (legacy row pre-v13 với autoincrement id) → vẫn revive bằng
+        // prev_id để tránh PK collision; raw rows mới sẽ FK về prev_id.
+        let target_id = if prev_id == id { id } else { prev_id };
+        tx.execute(
+            "UPDATE imported_files
+             SET reverted_at = NULL,
+                 filename = ?,
+                 kind = ?,
+                 imported_at = ?,
+                 row_count = ?,
+                 stored_path = ?,
+                 day_date = ?,
+                 shopee_account_id = ?
+             WHERE id = ?",
+            params![
+                filename, kind, now, row_count, stored_path, day_date,
+                shopee_account_id, target_id
+            ],
+        )?;
+        // Clear stale local tombstone — capture cursor `deleted_at` đã advance
+        // qua tombstone cũ nên không re-push, nhưng dọn để snapshot replay
+        // sau wipe + bootstrap không apply nhầm tombstone lên row vừa revive.
+        tx.execute(
+            "DELETE FROM tombstones
+             WHERE entity_type = 'imported_file' AND entity_key = ?",
+            params![target_id.to_string()],
+        )?;
+        return Ok(target_id);
+    }
+
+    // v13: id = content_id(file_hash) — deterministic cross-machine.
     tx.execute(
         "INSERT INTO imported_files
          (id, filename, kind, imported_at, row_count, file_hash, stored_path, day_date, shopee_account_id)
@@ -1352,5 +1411,141 @@ mod tests {
         // 1,000,000,000 * 2.0 * 100 = 200,000,000,000 cents = 2*10^11 << i64::MAX (~9.2*10^18)
         upsert_fb_ad_with_tax(&conn, "ad_BIG", Some(1_000_000_000.0), Some(1), 100.0);
         assert_eq!(read_taxed_spend_cents(&conn, "ad_BIG"), 200_000_000_000);
+    }
+
+    /// Regression v0.6.2: import lại file đã bị soft-mark `reverted_at` (qua
+    /// `revert_import` hoặc `batch_commit_deletes` v0.6.1 orphan cleanup) PHẢI
+    /// revive row cũ thay vì INSERT mới. Pre-fix: UNIQUE PK collision vì
+    /// `id = content_id(hash)` deterministic, row cũ vẫn ở table sau soft-mark.
+    ///
+    /// User-visible: "db: UNIQUE constraint failed: imported_files.id" khi
+    /// import file thứ 2 (sau khi xóa toàn bộ ngày của file thứ nhất).
+    #[test]
+    fn register_imported_file_revives_reverted_row_same_hash() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+
+        let hash = "h-revive-X";
+
+        // Lần 1: import → row active.
+        let tx = conn.transaction().unwrap();
+        let id1 = register_imported_file(
+            &tx,
+            "A.csv",
+            "shopee_clicks",
+            "2026-04-25T08:00:00Z",
+            hash,
+            "imports/h-revive-X.csv",
+            "2026-04-29",
+            100,
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            id1,
+            crate::sync_v9::content_id::imported_file_id(hash),
+            "id = content_id(hash)"
+        );
+
+        // Soft-mark (mirror batch_commit_deletes v0.6.1 / revert_import).
+        conn.execute(
+            "UPDATE imported_files SET reverted_at = '2026-04-29T10:00:00Z',
+             stored_path = NULL WHERE id = ?",
+            params![id1],
+        )
+        .unwrap();
+        // Cùng tombstone mà real flow tạo.
+        conn.execute(
+            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+             VALUES ('imported_file', ?, '2026-04-29T10:00:00Z')",
+            params![id1.to_string()],
+        )
+        .unwrap();
+
+        // Lần 2: import lại cùng hash → MUST revive (không UNIQUE PK fail).
+        let tx = conn.transaction().unwrap();
+        let id2 = register_imported_file(
+            &tx,
+            "A-reimport.csv",
+            "shopee_clicks",
+            "2026-04-29T11:00:00Z",
+            hash,
+            "imports/h-revive-X-v2.csv",
+            "2026-04-29",
+            100,
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(id2, id1, "revive cùng id (content_id stable)");
+
+        // Row active trở lại + metadata refresh.
+        let (filename, reverted, stored_path): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT filename, reverted_at, stored_path FROM imported_files WHERE id = ?",
+                params![id1],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(reverted, None, "reverted_at cleared sau revive");
+        assert_eq!(filename, "A-reimport.csv", "filename refresh từ import mới");
+        assert_eq!(stored_path.as_deref(), Some("imports/h-revive-X-v2.csv"));
+
+        // Local tombstone cleared để snapshot replay không wipe lại.
+        let ts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tombstones
+                 WHERE entity_type = 'imported_file' AND entity_key = ?",
+                params![id1.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts_count, 0, "tombstone 'imported_file' cleared sau revive");
+
+        // Đếm row total = 1 (revive, không INSERT mới).
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imported_files WHERE file_hash = ?",
+                [hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 1, "chỉ 1 row, không tạo row dup");
+    }
+
+    /// Active match path vẫn hoạt động (regression không phá): import 2 lần
+    /// liên tiếp không revert ở giữa → return id cũ, không INSERT mới.
+    #[test]
+    fn register_imported_file_returns_existing_active_id() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let id1 = register_imported_file(
+            &tx, "A.csv", "shopee_clicks", "now", "h-active",
+            "p1", "2026-04-29", 10, None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let id2 = register_imported_file(
+            &tx, "A-dup.csv", "shopee_clicks", "now2", "h-active",
+            "p2", "2026-04-29", 10, None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(id1, id2, "active match: trả id cũ, không tạo mới");
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imported_files WHERE file_hash = 'h-active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 1);
     }
 }

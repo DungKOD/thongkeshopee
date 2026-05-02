@@ -99,6 +99,16 @@ pub fn batch_commit_deletes(
     // reverted_at IS NOT NULL cho lịch sử.
     // Multi-day file an toàn: mapping entries nằm trên raw rows từng day, chỉ
     // khi MỌI day trong file đã hết → mapping rỗng → file mới bị coi orphan.
+    //
+    // v0.6.1 fix: SOFT-MARK (UPDATE reverted_at) thay vì DELETE + emit
+    // 'imported_file' tombstone. Mirror revert_import semantic.
+    //
+    // Bug cũ: hard-DELETE local + KHÔNG tombstone → cursor `imported_at` không
+    // advance (DELETE không sinh capture event), tombstone path không có →
+    // peer / fresh install replay snapshot vẫn thấy file active trong import
+    // history sau khi day tombstone wipe raw_*. User: "xóa ngày → đồng bộ →
+    // wipe local → mở lại thấy 1 số data hồi sinh" (B7-style bug nhưng cho
+    // batch_commit_deletes path).
     let orphan_files: Vec<(i64, Option<String>)> = {
         let mut stmt = tx.prepare(
             "SELECT id, stored_path FROM imported_files
@@ -113,7 +123,22 @@ pub fn batch_commit_deletes(
         iter.collect::<std::result::Result<_, _>>()?
     };
     for (id, _) in &orphan_files {
-        tx.execute("DELETE FROM imported_files WHERE id = ?", params![id])?;
+        // Soft-mark (idempotent qua reverted_at IS NULL guard) để consistent
+        // với apply_imported_file_tombstone ở peer + giữ history record.
+        tx.execute(
+            "UPDATE imported_files
+             SET reverted_at = ?, stored_path = NULL
+             WHERE id = ? AND reverted_at IS NULL",
+            params![now, id],
+        )?;
+        // Tombstone 'imported_file' — sync v9 propagate sang peer + fresh
+        // install. Apply side soft-marks file (UPDATE reverted_at) → state
+        // converge cross-device.
+        tx.execute(
+            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
+             VALUES ('imported_file', ?, ?)",
+            params![id.to_string(), now],
+        )?;
     }
 
     tx.commit()?;

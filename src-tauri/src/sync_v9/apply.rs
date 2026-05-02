@@ -252,7 +252,9 @@ fn apply_tombstone(tx: &Transaction, ev: &TombstoneEvent) -> Result<ApplyOutcome
         "manual_entry" => apply_manual_entry_tombstone(tx, &ev.entity_key, &ev.deleted_at)?,
         "ui_row" => apply_ui_row_tombstone(tx, &ev.entity_key, &ev.deleted_at)?,
         "imported_file" => apply_imported_file_tombstone(tx, &ev.entity_key, &ev.deleted_at)?,
-        "shopee_account" => apply_shopee_account_tombstone(tx, &ev.entity_key)?,
+        "shopee_account" => {
+            apply_shopee_account_tombstone(tx, &ev.entity_key, &ev.deleted_at)?
+        }
         other => anyhow::bail!("unknown tombstone entity_type: {other}"),
     };
     Ok(if deleted > 0 {
@@ -517,8 +519,13 @@ fn apply_imported_file_tombstone(
 ///
 /// Idempotent: replay → DELETE no-op (rows đã xóa), shopee_accounts row đã
 /// xóa hoặc chưa từng có → 0 rows affected.
-fn apply_shopee_account_tombstone(tx: &Transaction, key: &str) -> Result<u64> {
+fn apply_shopee_account_tombstone(
+    tx: &Transaction,
+    key: &str,
+    deleted_at: &str,
+) -> Result<u64> {
     use crate::sync_v9::content_id;
+    use rusqlite::OptionalExtension;
 
     let id: i64 = match key.parse() {
         Ok(n) => n,
@@ -529,6 +536,27 @@ fn apply_shopee_account_tombstone(tx: &Transaction, key: &str) -> Result<u64> {
     let default_id = content_id::shopee_account_id(crate::db::DEFAULT_ACCOUNT_NAME);
     if id == default_id {
         return Ok(0);
+    }
+
+    // Resurrect rule (v0.6.2): nếu shopee_accounts.created_at >= tombstone
+    // deleted_at, account đã được tạo lại SAU khi xóa → tombstone stale, skip.
+    // Mirror manual_entries pattern (edit-wins-over-delete). Cần thiết khi
+    // user xóa "TK A" → đồng bộ → tạo lại "TK A" → snapshot/replay sau wipe
+    // không được wipe TK mới chỉ vì content_id stable.
+    //
+    // String compare RFC3339 Z OK lexicographically vì cả hai dùng HLC format
+    // chuẩn (`create_shopee_account` v0.6.2+ dùng next_hlc_rfc3339).
+    let current_created_at: Option<String> = tx
+        .query_row(
+            "SELECT created_at FROM shopee_accounts WHERE id = ?",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(created) = current_created_at {
+        if created.as_str() >= deleted_at {
+            return Ok(0);
+        }
     }
 
     let mut total: u64 = 0;
@@ -1420,6 +1448,110 @@ mod tests {
         apply_event(&tx, &ev).unwrap();
         let outcome2 = apply_event(&tx, &ev).unwrap();
         assert_eq!(outcome2, ApplyOutcome::TombstoneNoOp, "replay no-op");
+    }
+
+    /// Resurrect rule (v0.6.2): user xóa "TK A" → đồng bộ → tạo lại "TK A".
+    /// content_id stable nên id giống cũ, nhưng `created_at` mới > tombstone
+    /// `deleted_at` cũ → tombstone phải skip để không wipe TK vừa tạo.
+    ///
+    /// Bug pre-fix: snapshot replay trên fresh install / 2nd machine apply
+    /// tombstone cũ unconditionally → TK mới biến mất → user thấy "tạo
+    /// account không được" / "tạo xong rồi mất".
+    #[test]
+    fn apply_shopee_account_tombstone_resurrect_when_recreated_after_delete() {
+        use crate::sync_v9::content_id;
+        let mut conn = test_conn();
+        let acc_id = content_id::shopee_account_id("TK A");
+        // Seed account mới với created_at > tombstone.deleted_at — mirror
+        // case user xóa lúc 08:00, tạo lại lúc 09:00.
+        conn.execute(
+            "INSERT INTO shopee_accounts (id, name, color, created_at)
+             VALUES (?, 'TK A', '#fff', '2026-04-25T09:00:00.000Z')",
+            params![acc_id],
+        )
+        .unwrap();
+        // Seed 1 raw row gắn TK A để chứng minh data cũng được preserve.
+        let file_id = content_id::imported_file_id("h-resurrect");
+        conn.execute(
+            "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date, shopee_account_id)
+             VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-25T09:00:00Z', 'h-resurrect', '2026-04-25', ?)",
+            params![file_id, acc_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO days(date, created_at) VALUES('2026-04-25', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, day_date, source_file_id, shopee_account_id)
+             VALUES('c-resurrect', '2026-04-25T09:30:00Z', '2026-04-25', ?, ?)",
+            params![file_id, acc_id],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "shopee_account".to_string(),
+            entity_key: acc_id.to_string(),
+            // Tombstone cũ — deleted_at < account.created_at.
+            deleted_at: "2026-04-25T08:00:00.000Z".to_string(),
+            clock_ms: 1000,
+        });
+        let outcome = apply_event(&tx, &ev).unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::TombstoneNoOp,
+            "resurrect rule: tombstone cũ phải skip vì account đã được tạo lại sau"
+        );
+
+        // Account row + raw data preserved.
+        let acc_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM shopee_accounts WHERE id = ?",
+                [acc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(acc_count, 1, "TK A vẫn tồn tại sau apply tombstone stale");
+        let raw_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM raw_shopee_clicks WHERE shopee_account_id = ?",
+                [acc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_count, 1, "raw data của TK A preserved");
+    }
+
+    /// Counter-test: nếu account.created_at < tombstone.deleted_at (TK chưa
+    /// re-create), tombstone vẫn xóa bình thường (không bị resurrect rule
+    /// khoá nhầm).
+    #[test]
+    fn apply_shopee_account_tombstone_still_deletes_when_created_before() {
+        let mut conn = test_conn();
+        // seed_account_with_data dùng created_at='2026-04-20T00:00:00Z'.
+        let acc_id = seed_account_with_data(&conn, "Shop A", "c1");
+        let tx = conn.transaction().unwrap();
+        let ev = DeltaEvent::Tombstone(TombstoneEvent {
+            sv: SV_CURRENT,
+            entity_type: "shopee_account".to_string(),
+            entity_key: acc_id.to_string(),
+            // deleted_at > created_at → phải xóa.
+            deleted_at: "2026-04-25T08:00:00.000Z".to_string(),
+            clock_ms: 1000,
+        });
+        apply_event(&tx, &ev).unwrap();
+        let acc_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM shopee_accounts WHERE id = ?",
+                [acc_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(acc_count, 0, "tombstone hợp lệ vẫn xóa được");
     }
 
     #[test]

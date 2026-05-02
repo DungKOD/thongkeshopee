@@ -776,6 +776,155 @@ fn b9_imported_file_tombstone_does_not_leak_to_other_files() {
     assert_eq!(day_count, 1, "day preserved (F2 còn raw)");
 }
 
+/// B12 (regression v0.6.1): user xóa toàn bộ ngày trong stats → đồng bộ →
+/// wipe local + fresh install → restore snapshot + replay tombstones.
+/// imported_files orphan PHẢI được soft-mark `reverted_at` cross-device, nếu
+/// không user thấy "1 số data hồi sinh" trong import history (B7-style bug
+/// nhưng cho `batch_commit_deletes` path thay vì `revert_import`).
+///
+/// User's exact bug: "xóa toàn bộ ngày → đồng bộ → thoát + xóa data local
+/// → build lại → thấy 1 số data hồi sinh từ R2".
+///
+/// Flow:
+/// - A snapshot1 capture ALL imported data (raw_*, imported_files, mappings, days).
+/// - User delete day → batch_commit_deletes:
+///   - DELETE days CASCADE raw_* + manual + trigger cleanup mappings.
+///   - INSERT 'day' tombstone.
+///   - SOFT-MARK orphan imported_files (UPDATE reverted_at) + INSERT
+///     'imported_file' tombstone (FIX). Trước fix: hard-DELETE local, no
+///     tombstone → propagation broken.
+/// - Push delta_with_tombstones (cả 'day' + 'imported_file' tombstones).
+/// - Fresh install: restore snapshot1 → apply tombstones → state consistent.
+#[test]
+fn b12_batch_delete_day_emits_imported_file_tombstone() {
+    use crate::sync_v9::content_id;
+    let mut b = new_db("uid-shared"); // simulate B sau wipe + bootstrap
+
+    // Stage 1: B restore từ snapshot S1 (state initial — F1 + raw + day 24).
+    let f1 = content_id::imported_file_id("h-f1");
+    b.execute(
+        "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+         VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00.000Z', 'h-f1', '2026-04-24')",
+        params![f1],
+    )
+    .unwrap();
+    insert_day(&b, "2026-04-24");
+    b.execute(
+        "INSERT INTO raw_shopee_clicks
+         (click_id, click_time, day_date, source_file_id, sub_id1)
+         VALUES('c1', '2026-04-24T10:00:00Z', '2026-04-24', ?, 'tag')",
+        params![f1],
+    )
+    .unwrap();
+    b.execute(
+        "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c1', ?)",
+        params![f1],
+    )
+    .unwrap();
+
+    // Sanity: B post-restore có data đầy đủ.
+    assert_eq!(count_rows(&b, "imported_files"), 1, "F1 trong snapshot");
+    assert_eq!(count_rows(&b, "raw_shopee_clicks"), 1);
+    assert_eq!(count_rows(&b, "days"), 1);
+
+    // Stage 2: A xóa day 24 qua batch_commit_deletes (mirror logic v0.6.1).
+    let a = new_db("uid-shared");
+    insert_day(&a, "2026-04-24");
+    a.execute(
+        "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
+         VALUES(?, 'f.csv', 'shopee_clicks', '2026-04-20T00:00:00.000Z', 'h-f1', '2026-04-24')",
+        params![f1],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO raw_shopee_clicks
+         (click_id, click_time, day_date, source_file_id, sub_id1)
+         VALUES('c1', '2026-04-24T10:00:00Z', '2026-04-24', ?, 'tag')",
+        params![f1],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO clicks_to_file(click_id, file_id) VALUES('c1', ?)",
+        params![f1],
+    )
+    .unwrap();
+
+    let delete_at = "2026-04-26T08:00:00.000Z";
+    // batch_commit_deletes step 1: DELETE day → CASCADE raw + trigger mapping cleanup.
+    a.execute("DELETE FROM days WHERE date = '2026-04-24'", [])
+        .unwrap();
+    // step 2: INSERT 'day' tombstone.
+    a.execute(
+        "INSERT INTO tombstones(entity_type, entity_key, deleted_at)
+         VALUES('day', '2026-04-24', ?)",
+        [delete_at],
+    )
+    .unwrap();
+    // step 3 (FIX): orphan imported_files soft-mark + 'imported_file' tombstone.
+    let orphan_ids: Vec<i64> = {
+        let mut stmt = a
+            .prepare(
+                "SELECT id FROM imported_files
+                 WHERE reverted_at IS NULL
+                   AND id NOT IN (
+                       SELECT file_id FROM clicks_to_file UNION
+                       SELECT file_id FROM orders_to_file UNION
+                       SELECT file_id FROM fb_ads_to_file
+                   )",
+            )
+            .unwrap();
+        let iter = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap();
+        iter.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(orphan_ids, vec![f1], "F1 trở thành orphan sau day delete");
+    for id in &orphan_ids {
+        a.execute(
+            "UPDATE imported_files SET reverted_at = ?, stored_path = NULL
+             WHERE id = ? AND reverted_at IS NULL",
+            params![delete_at, id],
+        )
+        .unwrap();
+        a.execute(
+            "INSERT OR IGNORE INTO tombstones(entity_type, entity_key, deleted_at)
+             VALUES('imported_file', ?, ?)",
+            params![id.to_string(), delete_at],
+        )
+        .unwrap();
+    }
+
+    // Stage 3: Push tombstones → B apply (replay sau wipe + bootstrap).
+    roundtrip_capture_apply(&a, &mut b, "tombstones");
+
+    // B verify: raw_* + day cleared (qua 'day' tombstone), imported_files
+    // SOFT-MARKED (qua 'imported_file' tombstone — KEY ASSERT của fix).
+    assert_eq!(
+        count_rows(&b, "raw_shopee_clicks"),
+        0,
+        "raw clicks cleared qua day tombstone"
+    );
+    assert_eq!(
+        count_rows(&b, "clicks_to_file"),
+        0,
+        "mappings cleaned (cascade trigger)"
+    );
+    assert_eq!(count_rows(&b, "days"), 0, "day cleared (orphan)");
+
+    // CRITICAL ASSERT: F1 row vẫn tồn tại nhưng reverted_at SET.
+    let reverted_at: Option<String> = b
+        .query_row(
+            "SELECT reverted_at FROM imported_files WHERE id = ?",
+            [f1],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reverted_at.as_deref(),
+        Some(delete_at),
+        "BUG (pre-fix): F1 active trong import history sau wipe + bootstrap. \
+         FIX: 'imported_file' tombstone propagate → soft-mark cross-device."
+    );
+}
+
 /// B6: manual_entry tombstone resurrect rule — local updated_at > deleted_at
 /// của tombstone → row KHÔNG bị xóa (edit-wins-over-delete).
 #[test]
