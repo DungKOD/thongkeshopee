@@ -74,13 +74,6 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Counter bump mỗi khi DB được ghi thành công. Dùng cho auto-sync R2.
-  // KHÔNG bump khi chỉ load (refetch) — chỉ bump sau mutation thực sự.
-  const [mutationVersion, setMutationVersion] = useState(0);
-  const markMutation = useCallback(() => {
-    setMutationVersion((v) => v + 1);
-  }, []);
-
   // Pending state cho staged delete.
   // Row: Map<key, ManualRowKey> để commit reconstruct payload KHÔNG qua scan `days`.
   const [pendingRowDeletes, setPendingRowDeletes] = useState<
@@ -175,15 +168,10 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
 
   const saveManualEntry = useCallback(
     async (input: ManualEntryInput) => {
-      // BE trả `false` khi input trùng row hiện có → no-op, KHÔNG gọi
-      // markMutation để SyncBadge không hiện "Chờ đồng bộ" lúc user mở
-      // dialog rồi bấm Lưu mà không sửa gì. Vẫn refetch để UI nhất quán
-      // nếu cùng lúc có pull về thay đổi cùng tuple.
-      const changed = await invoke<boolean>("save_manual_entry", { input });
-      if (changed) markMutation();
+      await invoke<boolean>("save_manual_entry", { input });
       await refetch();
     },
-    [refetch, markMutation],
+    [refetch],
   );
 
   const toggleRowPending = useCallback(
@@ -192,7 +180,7 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
       setPendingRowDeletes((prev) => {
         const next = new Map(prev);
         if (next.has(key)) next.delete(key);
-        else next.set(key, { dayDate, subIds });
+        else next.set(key, { dayDate, subIds, accountId });
         return next;
       });
     },
@@ -220,34 +208,9 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
       (k) => !pendingDayDeletes.has(k.dayDate),
     );
 
-    // Guard multi-account: BE delete_prefix_compatible KHÔNG filter
-    // shopee_account_id → wipe data của TẤT CẢ TK trên tuple đó. Khi user
-    // pending row ở filter=Account(A) rồi switch filter=All, có thể hiện ra
-    // tuple cùng có data ở TK khác. Chặn commit + báo user trở lại filter
-    // 1 TK rồi review/clear pending. Quét `days` slice hiện tại để check.
-    const conflictTuples: string[] = [];
-    for (const k of rowKeys) {
-      const day = days.find((d) => d.date === k.dayDate);
-      if (!day) continue;
-      const matchedAccs = new Set<string | null>();
-      const tupleKey = k.subIds.join("\x1f");
-      for (const r of day.rows) {
-        if (r.subIds.join("\x1f") === tupleKey) matchedAccs.add(r.accountId);
-      }
-      if (matchedAccs.size >= 2) {
-        const label = k.subIds.filter(Boolean).join("-") || "(empty)";
-        conflictTuples.push(`${k.dayDate} – ${label}`);
-      }
-    }
-    if (conflictTuples.length > 0) {
-      throw new Error(
-        `Có ${conflictTuples.length} dòng pending thuộc sub_id chia sẻ giữa nhiều TK ` +
-          `(${conflictTuples.slice(0, 3).join("; ")}${conflictTuples.length > 3 ? "; ..." : ""}). ` +
-          `Commit sẽ wipe data của tất cả TK trên các tuple này. ` +
-          `Hãy chuyển dropdown TK sang TK cụ thể, "Hủy" pending hiện tại, rồi tạo lại.`,
-      );
-    }
-
+    // BE scope DELETE theo `accountId` của từng row (manual + raw_shopee_*),
+    // FB ads chỉ wipe khi accountId=null ("FB chung"). Không cần guard cross-
+    // account ở FE nữa — DB đảm bảo isolate.
     await invoke<{ daysDeleted: number; rowsDeleted: number }>(
       "batch_commit_deletes",
       {
@@ -257,7 +220,6 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
         },
       },
     );
-    markMutation();
     clearPending();
     await refetch();
   }, [
@@ -265,8 +227,6 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
     pendingRowDeletes,
     clearPending,
     refetch,
-    markMutation,
-    days,
   ]);
 
   const pendingCount = pendingRowDeletes.size + pendingDayDeletes.size;
@@ -286,7 +246,5 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
     clearPending,
     commitPending,
     pendingCount,
-    mutationVersion,
-    markMutation,
   };
 }

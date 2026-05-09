@@ -1,49 +1,22 @@
 //! Commands CRUD `manual_entries`.
-//!
-//! - `save_manual_entry`: INSERT hoặc UPDATE theo UNIQUE(sub_ids, day_date).
-//!   Tự upsert `days(date)` nếu chưa có.
-//! - `delete_manual_entry`: xóa 1 row theo key. Commit ngay (dùng khi
-//!   user huỷ pending change).
-//!
-//! Batch delete của "Lưu thay đổi" → xem `commands::batch`.
 
 use rusqlite::{params, OptionalExtension};
 use tauri::State;
 
 use crate::db::types::{ManualEntryInput, ManualRowKey};
-use crate::db::{tombstone_key_sub, DbState};
+use crate::db::{now_rfc3339_z, DbState};
 
-use crate::sync_v9::hlc::next_hlc_rfc3339;
-use super::{assert_not_bootstrapping, CmdError, CmdResult};
+use super::{CmdError, CmdResult};
 
 /// Trả `true` nếu có thay đổi DB thực sự, `false` nếu input trùng row hiện
-/// có (no-op). Caller (FE) dùng flag để gate `markMutation` — tránh "Chờ đồng
-/// bộ" khi user mở dialog rồi bấm Lưu mà không sửa giá trị nào.
+/// có (no-op).
 #[tauri::command]
 pub fn save_manual_entry(
     state: State<'_, DbState>,
     input: ManualEntryInput,
 ) -> CmdResult<bool> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    assert_not_bootstrapping(&conn)?;
     let tx = conn.transaction()?;
-
-    let key = tombstone_key_sub(&input.day_date, &input.sub_ids);
-
-    // No-op detection: row hiện có khớp toàn bộ input field VÀ không có
-    // tombstone nào cần huỷ → bỏ qua write để cursor `updated_at` không
-    // advance → push delta không trigger.
-    let has_tombstone: bool = tx
-        .query_row(
-            "SELECT 1 FROM tombstones
-             WHERE (entity_type IN ('ui_row', 'manual_entry') AND entity_key = ?1)
-                OR (entity_type = 'day' AND entity_key = ?2)
-             LIMIT 1",
-            params![key, input.day_date],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
 
     type ExistingRow = (
         Option<String>,
@@ -85,43 +58,27 @@ pub fn save_manual_entry(
         )
         .optional()?;
 
-    if !has_tombstone {
-        if let Some((dn, oc, os, occ, oo, ocom, n, sa)) = &existing {
-            if dn == &input.display_name
-                && oc == &input.override_clicks
-                && os == &input.override_spend
-                && occ == &input.override_cpc
-                && oo == &input.override_orders
-                && ocom == &input.override_commission
-                && n == &input.notes
-                && *sa == Some(input.shopee_account_id)
-            {
-                return Ok(false);
-            }
+    if let Some((dn, oc, os, occ, oo, ocom, n, sa)) = &existing {
+        if dn == &input.display_name
+            && oc == &input.override_clicks
+            && os == &input.override_spend
+            && occ == &input.override_cpc
+            && oo == &input.override_orders
+            && ocom == &input.override_commission
+            && n == &input.notes
+            && *sa == Some(input.shopee_account_id)
+        {
+            return Ok(false);
         }
     }
 
-    // HLC-lite: ensure updated_at monotonic across machines. Thay `Utc::now`
-    // bằng `next_hlc_rfc3339` để clock drift của máy local không làm edit này
-    // "trông như" sớm hơn edit đã thấy từ remote.
-    let now = next_hlc_rfc3339(&tx)?;
+    let now = now_rfc3339_z();
 
     tx.execute(
         "INSERT OR IGNORE INTO days(date, created_at) VALUES(?, ?)",
         params![input.day_date, now],
     )?;
 
-    // Resurrect: nếu trước đó user đã xóa tuple này (tombstone 'ui_row' hoặc 'manual_entry')
-    // thì save = huỷ tombstone — tránh merge cross-device xoá mất entry vừa tạo.
-    // Cũng huỷ tombstone 'day' nếu có (save manual entry trên 1 ngày đã bị xóa).
-    tx.execute(
-        "DELETE FROM tombstones
-         WHERE (entity_type IN ('ui_row', 'manual_entry') AND entity_key = ?)
-            OR (entity_type = 'day' AND entity_key = ?)",
-        params![key, input.day_date],
-    )?;
-
-    // UPSERT manual_entries — UNIQUE(sub_ids, day_date) → DO UPDATE.
     tx.execute(
         "INSERT INTO manual_entries
          (sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date,
@@ -164,52 +121,76 @@ pub fn save_manual_entry(
 }
 
 /// Xóa 1 manual entry theo key. Không ảnh hưởng raw tables.
-/// Ghi tombstone 'manual_entry' để merge cross-device không hồi sinh override đã xóa.
+/// `key.account_id` (nếu Some) → scope DELETE theo `shopee_account_id` để
+/// không xóa nhầm manual của account khác trên cùng tuple+ngày.
 #[tauri::command]
 pub fn delete_manual_entry(
     state: State<'_, DbState>,
     key: ManualRowKey,
 ) -> CmdResult<()> {
-    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    assert_not_bootstrapping(&conn)?;
-    let tx = conn.transaction()?;
-    // HLC-lite: tombstone.deleted_at cũng phải monotonic để so sánh với
-    // row.updated_at từ máy khác (xem apply_tombstones có check updated_at).
-    let now = next_hlc_rfc3339(&tx)?;
-
-    tx.execute(
-        "DELETE FROM manual_entries
-         WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
-           AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
-        params![
-            key.sub_ids[0],
-            key.sub_ids[1],
-            key.sub_ids[2],
-            key.sub_ids[3],
-            key.sub_ids[4],
-            key.day_date,
-        ],
-    )?;
-
-    tx.execute(
-        "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-         VALUES ('manual_entry', ?, ?)",
-        params![tombstone_key_sub(&key.day_date, &key.sub_ids), now],
-    )?;
-
-    tx.commit()?;
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    if let Some(acc) = key.account_id {
+        conn.execute(
+            "DELETE FROM manual_entries
+             WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
+               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?
+               AND shopee_account_id = ?",
+            params![
+                key.sub_ids[0],
+                key.sub_ids[1],
+                key.sub_ids[2],
+                key.sub_ids[3],
+                key.sub_ids[4],
+                key.day_date,
+                acc,
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM manual_entries
+             WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
+               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
+            params![
+                key.sub_ids[0],
+                key.sub_ids[1],
+                key.sub_ids[2],
+                key.sub_ids[3],
+                key.sub_ids[4],
+                key.day_date,
+            ],
+        )?;
+    }
     Ok(())
 }
 
-/// Kiểm tra có manual entry nào cho key này không (dùng cho UI detect state).
+/// Kiểm tra có manual entry nào cho key này không.
+/// `key.account_id` (nếu Some) → check theo đúng account.
 #[tauri::command]
 pub fn has_manual_entry(
     state: State<'_, DbState>,
     key: ManualRowKey,
 ) -> CmdResult<bool> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let v: Option<i64> = conn
-        .query_row(
+    let v: Option<i64> = if let Some(acc) = key.account_id {
+        conn.query_row(
+            "SELECT 1 FROM manual_entries
+             WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
+               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?
+               AND shopee_account_id = ?",
+            params![
+                key.sub_ids[0],
+                key.sub_ids[1],
+                key.sub_ids[2],
+                key.sub_ids[3],
+                key.sub_ids[4],
+                key.day_date,
+                acc,
+            ],
+            |r| r.get(0),
+        )
+        .optional()?
+    } else {
+        conn.query_row(
             "SELECT 1 FROM manual_entries
              WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
                AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
@@ -223,6 +204,7 @@ pub fn has_manual_entry(
             ],
             |r| r.get(0),
         )
-        .optional()?;
+        .optional()?
+    };
     Ok(v.is_some())
 }

@@ -21,67 +21,40 @@ import {
   prevMonthRange,
   useFilterMode,
 } from "./hooks/useFilterMode";
-import {
-  APP_SETTING_MUTATION_EVENT,
-  SettingsProvider,
-  useSettings,
-} from "./hooks/useSettings";
+import { SettingsProvider, useSettings } from "./hooks/useSettings";
 import { useToast } from "./components/ToastProvider";
 import { commitCsvBatch, previewCsvBatch } from "./lib/dbImport";
 import type { PreviewBatch } from "./lib/dbImport";
 import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
-import {
-  AdminViewProvider,
-  useAdminView,
-} from "./contexts/AdminViewContext";
 import { AccountProvider, useAccounts } from "./contexts/AccountContext";
 import { AccountFilterDropdown } from "./components/AccountFilterDropdown";
 import { AccountManagerDialog } from "./components/AccountManagerDialog";
 import { ImportAccountPickerDialog } from "./components/ImportAccountPickerDialog";
 import { ScrollToTopButton } from "./components/ScrollToTopButton";
-import { usePremium, useIsAdmin } from "./hooks/usePremium";
-import { useCloudSync, type SyncPhase } from "./hooks/useCloudSync";
-import { useSelfPresence } from "./hooks/usePresence";
-import { SyncBadge } from "./components/SyncBadge";
 import { DayScreenshotDialog } from "./components/DayScreenshotDialog";
 import {
   captureElementToBlob,
   prefetchFontEmbedCSS,
 } from "./lib/screenshot";
-import { BootstrapSplash } from "./components/BootstrapSplash";
 import { UpdatesDropdown } from "./components/UpdatesDropdown";
-import { CloseWarningDialog } from "./components/CloseWarningDialog";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LoginScreen } from "./components/LoginScreen";
-import { PaywallScreen } from "./components/PaywallScreen";
-import { UserListDialog } from "./components/UserListDialog";
 import { UserMenu } from "./components/UserMenu";
 import { DevCredit } from "./components/DevCredit";
 import { SmartCalculator } from "./components/SmartCalculator";
-import { VideoLogsTab } from "./components/VideoLogsTab";
 import "./App.css";
 
 function AppInner() {
   const { signOut: authSignOut } = useAuth();
-  // Khai báo sớm để filter có thể derive theo tab.
   const [activeTab, setActiveTab] = useState<
-    "stats" | "overview" | "download" | "video-logs"
+    "stats" | "overview" | "download"
   >("stats");
 
-  // Mỗi tab giữ filter riêng — cùng logic (useFilterMode), chỉ khác state
-  // instance + localStorage scope. Active hook chọn theo `activeTab`.
   const statsFilter = useFilterMode("stats");
   const overviewFilter = useFilterMode("overview");
   const activeFilter = activeTab === "overview" ? overviewFilter : statsFilter;
 
-  // Filter persist TRONG SESSION (in-memory). Chuyển tab stats ↔ overview
-  // giữ nguyên filter đã chọn của mỗi tab. Reload app / logout → AppInner
-  // remount → state reset về "Ngày gần nhất" (1 ngày) — default cho cả 2 tab.
-  // Không còn auto-reset khi chuyển qua Overview như version cũ.
-
-  // Alias để không đụng call sites hiện có trong component.
   const filterMode = activeFilter.mode;
   const setFilterMode = activeFilter.setMode;
   const setRecentDays = activeFilter.setRecent;
@@ -93,17 +66,12 @@ function AppInner() {
   const [subIdQuery, setSubIdQuery] = useState("");
   const [selectedSubId, setSelectedSubId] = useState<string | null>(null);
 
-  // Account filter + active account từ context. Default filter {kind:"all"}
-  // = không filter (backward compat với code trước multi-account).
   const {
     filter: accountFilter,
     activeAccountId,
     refresh: refreshAccounts,
   } = useAccounts();
 
-  // Filter args gửi xuống Rust. BE nhận từ_date/to_date/limit → trả slice days,
-  // sub_id_filter → subset match trên display_name (xem Rust `display_name_subset_match`),
-  // account_filter → Shopee FK + FB attribution qua sub_ids JOIN.
   const effectiveFilter = useMemo<DaysFilter>(() => {
     const base: DaysFilter = (() => {
       if (filterMode.type === "recent") return { limit: filterMode.count };
@@ -115,7 +83,7 @@ function AppInner() {
         const [lo, hi] = a <= b ? [a, b] : [b, a];
         return { fromDate: lo, toDate: hi };
       }
-      return {}; // all
+      return {};
     })();
     return {
       ...base,
@@ -139,254 +107,27 @@ function AppInner() {
     clearPending,
     commitPending,
     pendingCount,
-    mutationVersion,
-    markMutation,
   } = useDbStats({ filter: effectiveFilter });
 
-  const { view: adminView, busy: adminBusy, exit: adminExit } = useAdminView();
-  const inAdminView = adminView !== null;
-
-  // Settings (clickSources / profitFees / autoSyncEnabled) sync qua app_settings
-  // table — same pipeline với data. SettingsProvider fire window event sau mỗi
-  // mutate; relay sang markMutation để useCloudSync đăng ký dirty + debounce
-  // push 45s (hoặc ngay khi user bấm "Đồng bộ ngay"). Đồng bộ với data nghĩa là
-  // user tắt autoSync → settings cũng KHÔNG push tự động cho đến khi force.
-  useEffect(() => {
-    const handler = () => markMutation();
-    window.addEventListener(APP_SETTING_MUTATION_EVENT, handler);
-    return () =>
-      window.removeEventListener(APP_SETTING_MUTATION_EVENT, handler);
-  }, [markMutation]);
-
-
-  // Sync v2: pull-merge-push. Khi vào app: metadata check; nếu dirty hoặc remote
-  // mới + khác máy → pull-merge-push + refetch UI. UI chặn overlay suốt startup
-  // (cả checking + syncing) để user không thao tác với data cũ trước khi merge xong.
-  //
-  // Khi admin đang xem DB của user khác → disable sync (dirty của DB khác không
-  // được upload lên R2 của admin).
-  // CRITICAL phân quyền: sau khi `switch_db_to_user` swap DB sang user mới
-  // (owner_changed=true) hoặc merge remote, PHẢI refetch cả days/rows lẫn
-  // account list. AccountContext dep uid-change đã refetch lần 1, nhưng race
-  // với switch_db_to_user (AccountContext effect fire trước switch xong) →
-  // cần re-trigger ở đây để đảm bảo list account đúng sau khi DB swapped.
-  // useSettings phải khai báo trước onRemoteApplied vì callback dùng reload.
-  // Các setter consume bên dưới ổn vì closure (đã giữ ở phần sau bên dưới).
-  const settingsCtx = useSettings();
-
-  const onRemoteApplied = useCallback(async () => {
-    await refetch();
-    await refreshAccounts();
-    // Settings reload sau DB swap — fix race: SettingsProvider mount với pre-auth
-    // DB → list rỗng → defer migration; remote_applied = swap đã xong + initial
-    // pull đã merge → reload từ user DB thật + retry migration nếu localStorage
-    // legacy vẫn còn.
-    await settingsCtx.reload();
-  }, [refetch, refreshAccounts, settingsCtx]);
-
-  // L1 form-dirty defer state — update sau khi entryDialog/previewBatch
-  // state được khai báo (phía dưới). Khởi tạo false; effect sau set-true
-  // khi form mở, useCloudSync re-run với giá trị mới.
-  const [pausedByForm, setPausedByForm] = useState(false);
-
-  // useSettings đã được lấy ở `settingsCtx` phía trên (cần cho onRemoteApplied
-  // .reload). Destructure lại các setter từ ctx để không thay đổi call sites.
   const {
     settings,
     setClickSource,
     registerSources,
     setProfitFee,
-    setAutoSyncEnabled,
+    setSubIdMatchMode,
     hydrated: settingsHydrated,
-  } = settingsCtx;
-
-  const {
-    status: syncStatus,
-    isStartupPhase,
-    syncPhase,
-    lastSyncAt,
-    lastSyncStats,
-    hasRemoteChangePending,
-    error: syncError,
-    forceSync,
-  } = useCloudSync({
-    mutationVersion,
-    enabled: !inAdminView,
-    pausedByForm,
-    autoSyncEnabled: settings.autoSyncEnabled,
-    onRemoteApplied,
-  });
-
-  // Trigger settings reload + migration KHI startup phase settles (DB swap +
-  // initial pull đã xong). Cover fresh user case: không có remote data →
-  // onRemoteApplied không fire → reload() không bao giờ chạy → migration kẹt.
-  // Settle = isStartupPhase chuyển true→false → reload chắc chắn DB user-owned.
-  const prevStartupPhaseRef = useRef(isStartupPhase);
-  useEffect(() => {
-    const prev = prevStartupPhaseRef.current;
-    prevStartupPhaseRef.current = isStartupPhase;
-    if (prev && !isStartupPhase) {
-      // Vừa settle: DB swap xong, an toàn migrate + load.
-      void settingsCtx.reload();
-    }
-  }, [isStartupPhase, settingsCtx]);
-
-  // Khi swap sang DB khác (hoặc thoát) → refetch + clear pending changes
-  // của admin (pending state UI không hợp lệ với DB mới).
-  // Gọi refreshAccounts() để AccountContext không giữ list TK của user vừa
-  // xem (hoặc state stale từ trước) — filter dropdown phải khớp DB đang hiển thị.
-  useEffect(() => {
-    clearPending();
-    void refetch();
-    void refreshAccounts();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adminView?.uid]);
-
-  // Khi vào admin view mode: force tab về "stats" nếu đang ở tab bị ẩn
-  // (download / video-logs). Tránh màn trắng vì tab không còn hiển thị.
-  useEffect(() => {
-    if (
-      inAdminView &&
-      (activeTab === "download" || activeTab === "video-logs")
-    ) {
-      setActiveTab("stats");
-    }
-  }, [inAdminView, activeTab]);
-
-  // Intercept Tauri close event — nếu DB dirty, chặn đóng app, show dialog
-  // cảnh báo. User chọn sync+tắt, tắt luôn, hoặc huỷ.
-  // Ref để handler luôn đọc status mới nhất (closure trong listener persist).
-  const syncStatusRef = useRef(syncStatus);
-  useEffect(() => {
-    syncStatusRef.current = syncStatus;
-  }, [syncStatus]);
-  const forceSyncRef = useRef(forceSync);
-  useEffect(() => {
-    forceSyncRef.current = forceSync;
-  }, [forceSync]);
-  // Flag "cho phép đóng bỏ qua guard" — user đã xác nhận trong dialog
-  // (sync xong hoặc tắt luôn). Handler thấy flag = true → return, không
-  // preventDefault → Tauri close binh thường.
-  const bypassCloseGuardRef = useRef(false);
-
-  useEffect(() => {
-    // Admin view: dirty của DB khác, không warn (sync bị disable rồi).
-    if (inAdminView) return;
-    let unlisten: (() => void) | null = null;
-    let disposed = false;
-    // Sync handler — async có thể gây Tauri race với preventDefault. Sync an toàn.
-    getCurrentWindow()
-      .onCloseRequested((event) => {
-        if (bypassCloseGuardRef.current) {
-          // User đã confirm trong dialog → cho đóng luôn, bỏ qua mọi check.
-          return;
-        }
-        const s = syncStatusRef.current;
-        if (s !== "dirty" && s !== "error") {
-          // Clean → không preventDefault → Tauri close window như bình thường.
-          return;
-        }
-        event.preventDefault();
-        setCloseWarningOpen(true);
-      })
-      .then((fn) => {
-        if (disposed) fn();
-        else unlisten = fn;
-      })
-      .catch((e) => console.error("[close] listener setup failed:", e));
-    return () => {
-      disposed = true;
-      if (unlisten) unlisten();
-    };
-  }, [inAdminView]);
-
-  const handleSyncAndClose = useCallback(async () => {
-    setCloseSyncing(true);
-    try {
-      await forceSyncRef.current();
-    } catch (e) {
-      console.error("[close] forceSync failed:", e);
-      // Sync fail → không tự đóng, để user thấy error + chọn lại (tắt luôn).
-      setCloseSyncing(false);
-      return;
-    }
-    setCloseSyncing(false);
-    setCloseWarningOpen(false);
-    // Bypass flag trước khi close() → handler thấy true → return → close OK.
-    bypassCloseGuardRef.current = true;
-    await getCurrentWindow().close();
-  }, []);
-
-  const handleCloseAnyway = useCallback(async () => {
-    setCloseWarningOpen(false);
-    bypassCloseGuardRef.current = true;
-    await getCurrentWindow().close();
-  }, []);
-
-  const handleCancelClose = useCallback(() => {
-    setCloseWarningOpen(false);
-  }, []);
-
-  // Logout flow: check dirty trước khi signOut. Nếu dirty → dialog 3 lựa chọn
-  // (đồng bộ rồi logout / logout luôn / hủy). Không dirty → signOut ngay.
-  const requestSignOut = useCallback(async () => {
-    if (syncStatusRef.current === "dirty") {
-      setLogoutDialogOpen(true);
-      return;
-    }
-    await authSignOut();
-  }, [authSignOut]);
-
-  const handleSyncAndSignOut = useCallback(async () => {
-    setLogoutSyncing(true);
-    try {
-      await forceSyncRef.current();
-    } catch (e) {
-      console.error("[logout] forceSync failed:", e);
-      setLogoutSyncing(false);
-      return; // giữ dialog để user thấy lỗi + chọn lại
-    }
-    setLogoutSyncing(false);
-    setLogoutDialogOpen(false);
-    await authSignOut();
-  }, [authSignOut]);
-
-  const handleSignOutAnyway = useCallback(async () => {
-    setLogoutDialogOpen(false);
-    await authSignOut();
-  }, [authSignOut]);
-
-  const handleCancelSignOut = useCallback(() => {
-    setLogoutDialogOpen(false);
-  }, []);
+  } = useSettings();
 
   const { showToast } = useToast();
 
-  // Auto-register referrers từ DB vào settings.clickSources.
-  // Mỗi khi DB thay đổi (import mới, xóa, v.v.) → refetch → referrers mới → register.
-  // registerSources chỉ thêm referrer mới (default enabled), không đụng trạng thái cũ.
-  //
-  // Bug B fix: gate trên settingsHydrated. Nếu fire trước hydrate, registerSources
-  // sẽ bị skip (internal guard) → referrer không được persist. Effect re-run khi
-  // hydrated flip false→true để pick up referrers đã có từ initial refetch.
   useEffect(() => {
     if (!settingsHydrated) return;
     if (referrers.length > 0) registerSources(referrers);
   }, [settingsHydrated, referrers, registerSources]);
 
-
-  const isAdmin = useIsAdmin();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
-  const [userListOpen, setUserListOpen] = useState(false);
   const [accountMgrOpen, setAccountMgrOpen] = useState(false);
-  // Close warning: Tauri intercept event, show dialog nếu dirty.
-  const [closeWarningOpen, setCloseWarningOpen] = useState(false);
-  const [closeSyncing, setCloseSyncing] = useState(false);
-  // Logout warning: user bấm đăng xuất mà DB dirty → hỏi sync trước.
-  const [logoutDialogOpen, setLogoutDialogOpen] = useState(false);
-  const [logoutSyncing, setLogoutSyncing] = useState(false);
-  // Máy tính — open state lift lên App để header button toggle được.
   const [calcOpen, setCalcOpen] = useState<boolean>(() => {
     try {
       return JSON.parse(localStorage.getItem("smartcalc:open") ?? "false");
@@ -404,7 +145,6 @@ function AppInner() {
   const [subIdFocused, setSubIdFocused] = useState(false);
   const subIdInputRef = useRef<HTMLInputElement>(null);
 
-  // Screenshot tab Overview — capture toàn bộ content tab + preview dialog.
   const overviewCaptureRef = useRef<HTMLDivElement | null>(null);
   const [overviewCapturing, setOverviewCapturing] = useState(false);
   const [overviewScreenshotBlob, setOverviewScreenshotBlob] =
@@ -413,10 +153,6 @@ function AppInner() {
     if (!overviewCaptureRef.current || overviewCapturing) return;
     setOverviewCapturing(true);
     try {
-      // Target inner content (OverviewTab root có `mx-auto max-w-[1400px]`)
-      // thay vì wrapper div — tránh capture whitespace 2 bên trên màn rộng.
-      // firstElementChild = OverviewTab root có bounding box = content width
-      // thực tế (auto-fit hoặc 1400px max).
       const target = (overviewCaptureRef.current
         .firstElementChild as HTMLElement | null) ??
         overviewCaptureRef.current;
@@ -440,25 +176,15 @@ function AppInner() {
     row?: UiRow | null;
   } | null>(null);
   const [previewBatch, setPreviewBatch] = useState<PreviewBatch | null>(null);
-  // L1 form-dirty: sync pausedByForm state theo form-open state.
-  const pausedNow = entryDialog !== null || previewBatch !== null;
-  useEffect(() => {
-    setPausedByForm(pausedNow);
-  }, [pausedNow]);
-  // TK user pick trong ImportAccountPickerDialog — giữ xuyên suốt flow import.
-  // null khi chưa pick (dialog đóng) hoặc không có batch pending.
   const [importAccountId, setImportAccountId] = useState<string | null>(null);
   const [accountPickerOpen, setAccountPickerOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Flow: bấm "Import CSV" → mở AccountPicker → user chọn TK → mở file picker
-  // → parse → preview (hiển thị TK đã pick) → confirm → commit.
   const handleImportClick = () => setAccountPickerOpen(true);
 
   const handleAccountPicked = (accountId: string) => {
     setImportAccountId(accountId);
     setAccountPickerOpen(false);
-    // Defer mở file picker 1 tick để dialog đóng animation xong.
     setTimeout(() => fileInputRef.current?.click(), 0);
   };
 
@@ -501,7 +227,6 @@ function AppInner() {
       (a, r) => a + (r.mcnMismatchCount ?? 0),
       0,
     );
-    // Date range của batch thực tế đã commit (dayDateFrom/To từ kết quả Rust).
     const dateRange = (() => {
       if (results.length === 0) return "";
       const from = results.map((r) => r.dayDateFrom).sort()[0];
@@ -509,7 +234,6 @@ function AppInner() {
       return from === to ? fmtDate(from) : `${fmtDate(from)} → ${fmtDate(to)}`;
     })();
     setPreviewBatch(null);
-    markMutation();
     await refetch();
     showToast({
       message:
@@ -520,15 +244,13 @@ function AppInner() {
             }${totalSkipped > 0 ? `, ${fmtInt(totalSkipped)} skip` : ""}`,
       duration: 5000,
     });
-    // Warning banner riêng nếu Shopee commission có row lệch MCN —
-    // cảnh báo user check lại export (Shopee có thể trả số sai lẻ vài đồng).
     if (totalMcnMismatch > 0) {
       showToast({
         message: `Cảnh báo: ${fmtInt(totalMcnMismatch)} đơn lệch công thức MCN (net ≠ total - fee > 0.5đ). Check lại export Shopee.`,
         duration: 8000,
       });
     }
-  }, [previewBatch, refetch, showToast, markMutation, importAccountId, refreshAccounts]);
+  }, [previewBatch, refetch, showToast, importAccountId, refreshAccounts]);
 
   const handleSaveEntry = useCallback(
     async (input: Parameters<typeof saveManualEntry>[0]) => {
@@ -554,30 +276,19 @@ function AppInner() {
     }
   }, [commitPending, showToast]);
 
-  // BE đã filter theo effectiveFilter → `days` chính là slice cần render.
-  // `overview.totalDaysCount` là tổng ngày trong DB, dùng cho pagination UI.
   const totalDaysInDb = overview.totalDaysCount;
 
-  // Chỉ default-paginated mode mới expand khi scroll. So sánh count đang show
-  // với total ngày trong DB (không phải `days.length` vì BE có thể trả ít hơn
-  // limit khi data thưa).
   const canLoadMore =
     filterMode.type === "recent" &&
     filterMode.canExpand &&
     filterMode.count < totalDaysInDb;
 
-  // Detect active cho highlight shortcut "Tháng trước".
   const prevMonth = useMemo(() => prevMonthRange(), []);
   const isPrevMonthActive =
     filterMode.type === "range" &&
     filterMode.from === prevMonth.from &&
     filterMode.to === prevMonth.to;
 
-  // Hiển thị dates trong picker:
-  // - range mode → lưu trực tiếp trong filterMode.
-  // - shortcut recent (!canExpand) → derive từ `days` (BE đã cắt đúng slice).
-  // - all → derive từ overview.oldest/newest (bounds toàn DB, không cần scan FE).
-  // - default paginated → để trống (chưa chọn range cụ thể).
   const { dateFrom, dateTo } = useMemo<{ dateFrom: string; dateTo: string }>(() => {
     if (filterMode.type === "range") {
       return { dateFrom: filterMode.from, dateTo: filterMode.to };
@@ -601,9 +312,6 @@ function AppInner() {
     return { dateFrom: "", dateTo: "" };
   }, [filterMode, days, overview.oldestDate, overview.newestDate]);
 
-  // Suggestions dropdown: filter `overview.allSubIds` theo query. Dataset từ
-  // overview (toàn DB) nên user chọn được cả sub_id từ ngày không trong slice.
-  // Match = startsWith tại bất kỳ part nào — tránh noise substring giữa part.
   const suggestions = useMemo(() => {
     const q = subIdQuery.toLowerCase().trim();
     if (!q) return overview.allSubIds;
@@ -618,14 +326,12 @@ function AppInner() {
   const clearSubId = () => {
     setSelectedSubId(null);
     setSubIdQuery("");
-    // Refocus input ngay lập tức để dropdown mở lại, user gõ tiếp không bị mất.
     requestAnimationFrame(() => {
       subIdInputRef.current?.focus();
       setSubIdFocused(true);
     });
   };
 
-  // Infinite scroll: observer sentinel → load more 7 ngày khi tới gần đáy.
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (!canLoadMore) return;
@@ -647,51 +353,8 @@ function AppInner() {
     return () => observer.disconnect();
   }, [canLoadMore]);
 
-  if (isStartupPhase) {
-    // Nếu switch_db_to_user fail → hook keep isStartupPhase=true + set syncError.
-    // Splash hiển thị error thay vì text "đang đồng bộ" để user không bị kẹt
-    // nhìn vào loading spinner vô thời hạn. Retry = logout + login lại.
-    if (syncStatus === "error" && syncError) {
-      return (
-        <SplashScreen
-          title="Không mở được database"
-          subtitle={syncError}
-          lastSyncAt={lastSyncAt}
-          error
-          onRetry={() => void authSignOut()}
-          extraActions={<OpenDataDirButton />}
-        />
-      );
-    }
-    // Bootstrap splash dedicated — fresh install cần UX khác (progress
-    // per-phase, cảnh báo không tắt app). Trigger khi sync_v9_get_state
-    // báo freshInstallPending = true HOẶC backend set status = bootstrap
-    // mid-sync.
-    if (syncStatus === "bootstrap") {
-      return (
-        <BootstrapSplash
-          phase={syncPhase}
-          lastSyncAt={lastSyncAt}
-          error={syncError}
-        />
-      );
-    }
-    return (
-      <SplashScreen {...splashTextFor(syncPhase)} lastSyncAt={lastSyncAt} />
-    );
-  }
-
   return (
     <main className="min-h-full bg-surface-0 pb-24">
-      <OfflineBanner />
-      {inAdminView && adminView && (
-        <AdminViewBanner
-          email={adminView.email}
-          localPart={adminView.local_part}
-          busy={adminBusy}
-          onExit={() => void adminExit()}
-        />
-      )}
       <header className="sticky top-0 z-30 bg-gradient-to-r from-shopee-600 to-shopee-500 shadow-elev-4">
         <div className="flex items-center justify-between px-6 py-3">
           <div className="flex items-center gap-3">
@@ -713,50 +376,22 @@ function AppInner() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {!inAdminView && (
-              <SyncBadge
-                status={syncStatus}
-                lastSyncAt={lastSyncAt}
-                lastSyncStats={lastSyncStats}
-                hasRemoteChangePending={hasRemoteChangePending}
-                error={syncError}
-                onForce={forceSync}
-                autoSyncEnabled={settings.autoSyncEnabled}
-              />
-            )}
-            {!inAdminView && (
-              <UpdatesDropdown
-                currentVersion={__APP_VERSION__}
-                repo="DungKOD/thongkeshopee"
-                limit={10}
-              />
-            )}
-            {!inAdminView && (
-              <button
-                onClick={() => setRulesOpen(true)}
-                className="btn-ripple flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
-                title="Quy tắc sử dụng"
-                aria-label="Quy tắc"
-              >
-                <span className="material-symbols-rounded text-base">
-                  menu_book
-                </span>
-                Quy tắc
-              </button>
-            )}
-            {isAdmin && !inAdminView && (
-              <button
-                onClick={() => setUserListOpen(true)}
-                className="btn-ripple flex items-center gap-1.5 rounded-lg border border-white/40 px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
-                title="Danh sách user (admin)"
-                aria-label="Danh sách user"
-              >
-                <span className="material-symbols-rounded text-base">
-                  admin_panel_settings
-                </span>
-                User
-              </button>
-            )}
+            <UpdatesDropdown
+              currentVersion={__APP_VERSION__}
+              repo="DungKOD/thongkeshopee"
+              limit={10}
+            />
+            <button
+              onClick={() => setRulesOpen(true)}
+              className="btn-ripple flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
+              title="Quy tắc sử dụng"
+              aria-label="Quy tắc"
+            >
+              <span className="material-symbols-rounded text-base">
+                menu_book
+              </span>
+              Quy tắc
+            </button>
             <button
               onClick={() => setCalcOpen((o) => !o)}
               className={`btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white transition-colors ${
@@ -768,28 +403,24 @@ function AppInner() {
             >
               <span className="material-symbols-rounded">calculate</span>
             </button>
-            {!inAdminView && (
-              <button
-                onClick={() => setAccountMgrOpen(true)}
-                className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
-                title="Quản lý TK Shopee"
-                aria-label="Quản lý TK Shopee"
-              >
-                <span className="material-symbols-rounded">manage_accounts</span>
-              </button>
-            )}
-            {!inAdminView && (
-              <button
-                onClick={() => setSettingsOpen(true)}
-                className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
-                title="Cài đặt"
-                aria-label="Cài đặt"
-              >
-                <span className="material-symbols-rounded">settings</span>
-              </button>
-            )}
-            {!inAdminView && <UserMenu onRequestSignOut={requestSignOut} />}
-            {activeTab === "stats" && !inAdminView && (
+            <button
+              onClick={() => setAccountMgrOpen(true)}
+              className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
+              title="Quản lý TK Shopee"
+              aria-label="Quản lý TK Shopee"
+            >
+              <span className="material-symbols-rounded">manage_accounts</span>
+            </button>
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
+              title="Cài đặt"
+              aria-label="Cài đặt"
+            >
+              <span className="material-symbols-rounded">settings</span>
+            </button>
+            <UserMenu onRequestSignOut={() => void authSignOut()} />
+            {activeTab === "stats" && (
               <button
                 onClick={handleImportClick}
                 className="btn-ripple flex items-center gap-2 rounded-lg border border-white/50 px-4 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
@@ -803,7 +434,6 @@ function AppInner() {
           </div>
         </div>
 
-        {/* Tab nav */}
         <nav className="flex gap-1 px-6">
           <TabButton
             active={activeTab === "stats"}
@@ -817,22 +447,12 @@ function AppInner() {
             icon="insights"
             label="Tổng quan"
           />
-          {!inAdminView && (
-            <TabButton
-              active={activeTab === "download"}
-              onClick={() => setActiveTab("download")}
-              icon="download"
-              label="Download video"
-            />
-          )}
-          {isAdmin && !inAdminView && (
-            <TabButton
-              active={activeTab === "video-logs"}
-              onClick={() => setActiveTab("video-logs")}
-              icon="admin_panel_settings"
-              label="Video Logs"
-            />
-          )}
+          <TabButton
+            active={activeTab === "download"}
+            onClick={() => setActiveTab("download")}
+            icon="download"
+            label="Download video"
+          />
         </nav>
       </header>
 
@@ -848,8 +468,6 @@ function AppInner() {
       <div className="p-6">
         {activeTab === "download" ? (
           <DownloadVideoPage />
-        ) : activeTab === "video-logs" && isAdmin ? (
-          <VideoLogsTab />
         ) : loading ? (
           <div className="mx-auto flex max-w-xl flex-col items-center gap-3 py-16 text-center text-white/60">
             <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">
@@ -874,41 +492,36 @@ function AppInner() {
             </span>
             <div>
               <h2 className="text-lg font-medium text-white/90">
-                {inAdminView ? "User này chưa có data" : "Chưa có data nào"}
+                Chưa có data nào
               </h2>
               <p className="mt-1 text-sm text-white/60">
-                {inAdminView
-                  ? "DB của user đang xem chưa có ngày nào được import"
-                  : "Bắt đầu bằng import CSV hoặc thêm dòng thủ công"}
+                Bắt đầu bằng import CSV hoặc thêm dòng thủ công
               </p>
             </div>
-            {!inAdminView && (
-              <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
-                <button
-                  onClick={() => setEntryDialog({ date: todayIso() })}
-                  className="btn-ripple flex items-center gap-2 rounded-lg bg-shopee-500 px-5 py-2.5 text-sm font-medium text-white shadow-elev-2 hover:bg-shopee-600 hover:shadow-elev-4"
-                >
-                  <span className="material-symbols-rounded text-base">add</span>
-                  Thêm dòng đầu tiên
-                </button>
-                <button
-                  onClick={handleImportClick}
-                  className="btn-ripple flex items-center gap-2 rounded-lg border border-surface-8 bg-surface-4 px-5 py-2.5 text-sm font-medium text-white/90 hover:bg-surface-6"
-                >
-                  <span className="material-symbols-rounded text-base">
-                    upload_file
-                  </span>
-                  Import CSV
-                </button>
-              </div>
-            )}
+            <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+              <button
+                onClick={() => setEntryDialog({ date: todayIso() })}
+                className="btn-ripple flex items-center gap-2 rounded-lg bg-shopee-500 px-5 py-2.5 text-sm font-medium text-white shadow-elev-2 hover:bg-shopee-600 hover:shadow-elev-4"
+              >
+                <span className="material-symbols-rounded text-base">add</span>
+                Thêm dòng đầu tiên
+              </button>
+              <button
+                onClick={handleImportClick}
+                className="btn-ripple flex items-center gap-2 rounded-lg border border-surface-8 bg-surface-4 px-5 py-2.5 text-sm font-medium text-white/90 hover:bg-surface-6"
+              >
+                <span className="material-symbols-rounded text-base">
+                  upload_file
+                </span>
+                Import CSV
+              </button>
+            </div>
           </div>
         ) : (
           <>
             <div className="sticky top-[92px] z-20 -mx-6 mb-4 border-b border-surface-8 bg-surface-0/95 px-6 py-3 backdrop-blur">
               <div className="flex items-start gap-3 rounded-xl border border-surface-8 bg-surface-2 px-4 py-2 text-sm">
                <div className="flex flex-1 flex-wrap items-center gap-x-3 gap-y-2 min-w-0">
-                {/* Group 2: Date range (bám trái) */}
                 <div className="flex shrink-0 items-center gap-1.5">
                   <span
                     className="material-symbols-rounded shrink-0 text-shopee-400"
@@ -935,7 +548,6 @@ function AppInner() {
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
-                {/* Group 3: Shortcuts (bám trái, ngay sau date) */}
                 <div className="flex shrink-0 flex-wrap items-center gap-1">
                   <ShortcutButton
                     active={
@@ -993,13 +605,10 @@ function AppInner() {
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
-                {/* Account filter — tách theo TK Shopee affiliate. Nút
-                    quản lý TK đã chuyển lên header bên trái nút Cài đặt. */}
                 <AccountFilterDropdown />
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
-                {/* Group 1: Sub_id search (flex-1 fill remaining) */}
                 <div className="relative flex min-w-[200px] max-w-[340px] flex-1 items-center gap-1.5">
                   <span
                     className="material-symbols-rounded shrink-0 text-shopee-400"
@@ -1022,7 +631,6 @@ function AppInner() {
                       setTimeout(() => setSubIdFocused(false), 150)
                     }
                     onKeyDown={(e) => {
-                      // Enter: chọn suggestion đầu tiên (nếu có), fallback: giữ nguyên query làm sub_id filter.
                       if (e.key === "Enter") {
                         e.preventDefault();
                         const pick = suggestions[0] ?? subIdQuery.trim();
@@ -1081,7 +689,6 @@ function AppInner() {
 
                </div>
 
-                {/* Right anchor: badge counter + screenshot button (overview tab) */}
                 <div className="flex shrink-0 items-center gap-2 pt-1">
                   {activeTab === "overview" && (
                     <button
@@ -1144,7 +751,6 @@ function AppInner() {
                     onEditRow={(r) =>
                       setEntryDialog({ date: r.dayDate, row: r })
                     }
-                    readOnly={inAdminView}
                     accountFilter={accountFilter}
                   />
                 ) : (
@@ -1162,7 +768,6 @@ function AppInner() {
                         setEntryDialog({ date: r.dayDate, row: r })
                       }
                       onEditDay={(date) => setEntryDialog({ date })}
-                      readOnly={inAdminView}
                       accountFilter={accountFilter}
                     />
                   ))
@@ -1191,35 +796,25 @@ function AppInner() {
         productsCount={overview.totalRowsCount}
         onToggleClickSource={setClickSource}
         onSetProfitFee={setProfitFee}
-        onSetAutoSyncEnabled={setAutoSyncEnabled}
+        onSetSubIdMatchMode={(mode) => {
+          // BE đọc match-mode từ `app_settings` mỗi query → refetch sau
+          // khi update để UI re-aggregate theo mode mới.
+          setSubIdMatchMode(mode);
+          void refetch();
+        }}
         onClose={() => setSettingsOpen(false)}
         onImportReverted={() => {
-          // Revert = mutation (xóa raw rows, mark file reverted_at) → phải
-          // bump mutationVersion để debounce sync gom lên R2 chung batch,
-          // giống save manual/import/delete.
-          markMutation();
           void refetch();
         }}
       />
 
       <RulesDialog isOpen={rulesOpen} onClose={() => setRulesOpen(false)} />
 
-      {isAdmin && (
-        <UserListDialog
-          isOpen={userListOpen}
-          onClose={() => setUserListOpen(false)}
-        />
-      )}
-
       {entryDialog && (
         <ManualEntryDialog
           isOpen={true}
           initialDate={entryDialog.date}
           initialRow={entryDialog.row}
-          // Priority: row đang edit có manual → dùng account của row đó (không
-          // reassign sang active). Sau đó row.accountId (per-account split khi
-          // filter=All) → giữ đúng acc của row visible. Thêm mới + filter account
-          // → dùng filter id. Fallback cuối: activeAccountId.
           shopeeAccountId={
             entryDialog.row?.shopeeAccountId ??
             entryDialog.row?.accountId ??
@@ -1250,7 +845,6 @@ function AppInner() {
         isOpen={accountMgrOpen}
         onClose={() => setAccountMgrOpen(false)}
         onDataChanged={() => {
-          markMutation();
           void refetch();
         }}
       />
@@ -1271,28 +865,7 @@ function AppInner() {
         onClose={() => setOverviewScreenshotBlob(null)}
       />
 
-      {/* FAB — hiện khi scroll sâu, click về đầu page */}
       <ScrollToTopButton />
-
-      <CloseWarningDialog
-        isOpen={closeWarningOpen}
-        syncing={closeSyncing}
-        onSyncAndClose={handleSyncAndClose}
-        onCloseAnyway={handleCloseAnyway}
-        onCancel={handleCancelClose}
-      />
-
-      <CloseWarningDialog
-        isOpen={logoutDialogOpen}
-        syncing={logoutSyncing}
-        title="Data chưa đồng bộ lên R2"
-        description="Vẫn còn thay đổi chưa upload lên R2. Nếu đăng xuất luôn, khi bạn đăng nhập ở máy khác sẽ không thấy những thay đổi này."
-        syncLabel="Đồng bộ lên R2 rồi đăng xuất"
-        anywayLabel="Đăng xuất luôn (chấp nhận mất đồng bộ R2)"
-        onSyncAndClose={handleSyncAndSignOut}
-        onCloseAnyway={handleSignOutAnyway}
-        onCancel={handleCancelSignOut}
-      />
 
       <PendingChangesBar
         count={pendingCount}
@@ -1309,15 +882,13 @@ function AppInner() {
   );
 }
 
-function ShortcutButton({
-  active,
-  onClick,
-  children,
-}: {
+interface ShortcutButtonProps {
   active?: boolean;
   onClick: () => void;
-  children: React.ReactNode;
-}) {
+  children: ReactNode;
+}
+
+function ShortcutButton({ active, onClick, children }: ShortcutButtonProps) {
   return (
     <button
       type="button"
@@ -1340,54 +911,6 @@ interface TabButtonProps {
   label: string;
 }
 
-interface AdminViewBannerProps {
-  email: string | null;
-  localPart: string;
-  busy: boolean;
-  onExit: () => void;
-}
-
-function AdminViewBanner({
-  email,
-  localPart,
-  busy,
-  onExit,
-}: AdminViewBannerProps) {
-  return (
-    <div className="flex items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-600/90 px-6 py-2 text-sm text-white shadow-elev-4">
-      <div className="flex items-center gap-2 min-w-0">
-        <span className="material-symbols-rounded text-base">
-          admin_panel_settings
-        </span>
-        <span className="font-medium whitespace-nowrap">Chế độ xem admin:</span>
-        <span
-          className="truncate font-mono text-white/95"
-          title={email ?? localPart}
-        >
-          {email ?? `${localPart}.db`}
-        </span>
-        <span className="hidden rounded-full bg-white/20 px-2 py-0.5 text-[11px] font-medium md:inline">
-          READ-ONLY
-        </span>
-      </div>
-      <button
-        type="button"
-        onClick={onExit}
-        disabled={busy}
-        className="btn-ripple flex shrink-0 items-center gap-1 rounded-md border border-white/60 bg-white/10 px-3 py-1 text-xs font-medium text-white hover:bg-white/20 disabled:opacity-50"
-        title="Thoát chế độ xem — quay lại DB của bạn"
-      >
-        <span
-          className={`material-symbols-rounded text-sm ${busy ? "animate-spin" : ""}`}
-        >
-          {busy ? "sync" : "logout"}
-        </span>
-        Thoát
-      </button>
-    </div>
-  );
-}
-
 function TabButton({ active, onClick, icon, label }: TabButtonProps) {
   return (
     <button
@@ -1405,41 +928,10 @@ function TabButton({ active, onClick, icon, label }: TabButtonProps) {
 }
 
 function AuthGate() {
-  const {
-    user,
-    loading: authLoading,
-    authError,
-    deviceCheckError,
-    deviceRevoked,
-    signOut: authSignOut,
-  } = useAuth();
-  const { status, expiredAt } = usePremium();
-  // Track online/offline để bypass paywall khi offline. User đã login rồi
-  // (auth.currentUser còn nhờ browserLocalPersistence) → cho phép dùng local
-  // DB mà không cần check activation. Offline = không sync → không benefit
-  // premium → không tốn R2 → gate paywall chỉ ở online path hợp lý.
-  const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
-  useEffect(() => {
-    const onOnline = () => setIsOnline(true);
-    const onOffline = () => setIsOnline(false);
-    window.addEventListener("online", onOnline);
-    window.addEventListener("offline", onOffline);
-    return () => {
-      window.removeEventListener("online", onOnline);
-      window.removeEventListener("offline", onOffline);
-    };
-  }, []);
-
-  // Presence tracking — mount 1 lần ở AuthGate, hook tự re-subscribe khi
-  // uid đổi qua auth.onAuthStateChanged. Chạy bất kể status paywall vì
-  // user vẫn "online" khi đang ở màn PaywallScreen.
-  useSelfPresence();
+  const { user, loading: authLoading, authError } = useAuth();
 
   if (authLoading) return <SplashScreen title="Đang tải..." />;
 
-  // AuthContext không xác định được state (Firebase init fail / 10s timeout).
-  // Hiện splash error + nút Reload — không có user object thì không có gì
-  // sửa được, reload để retry init từ đầu.
   if (authError) {
     return (
       <SplashScreen
@@ -1451,145 +943,25 @@ function AuthGate() {
     );
   }
 
-  // Device gate: AuthContext đã check; nếu blocked, hiện splash với nút
-  // đăng xuất. Hiển thị TRƯỚC paywall/admin-view để user không truy cập
-  // được data trước khi xác nhận.
-  if (user && deviceCheckError) {
-    return (
-      <SplashScreen
-        title="Không thể đăng nhập trên thiết bị này"
-        subtitle={deviceCheckError}
-        error
-        onRetry={() => void authSignOut()}
-      />
-    );
-  }
-  if (user && deviceRevoked) {
-    return (
-      <SplashScreen
-        title="Thiết bị đã bị admin gỡ"
-        subtitle="Phiên đăng nhập trên máy này đã bị admin thu hồi. Đăng xuất rồi đăng nhập lại — nếu vẫn không vào được, liên hệ admin (vnz.luffy@gmail.com)."
-        error
-        onRetry={() => void authSignOut()}
-      />
-    );
-  }
-
   if (!user) return <LoginScreen />;
 
-  // Offline bypass: user đã auth (token cached qua browserLocalPersistence).
-  // Profile Firestore có thể chưa load (IndexedDB cache miss) → skip check,
-  // cho vào app với data local. Khi online trở lại, usePremium re-check +
-  // paywall sẽ kick nếu inactive.
-  if (!isOnline) {
-    // Fall through vào app inner — không paywall, không splash loading.
-  } else {
-    if (status === "loading") return <SplashScreen title="Đang tải..." />;
-    if (status === "inactive" || status === "expired") {
-      return <PaywallScreen expiredAt={expiredAt} reason={status} />;
-    }
-    // Verify_failed: Firestore không emit profile trong 8s + chưa có cached
-    // (lần đầu login máy này). Hiện splash error với 2 nút: "Thử lại" reload
-    // (force re-init listener) và "Đăng xuất". Tránh treo splash mãi.
-    if (status === "verify_failed") {
-      return (
-        <SplashScreen
-          title="Không xác minh được trạng thái tài khoản"
-          subtitle={
-            "Không kết nối được Firestore để check premium. Có thể do mạng chập chờn hoặc Firebase đang lỗi. " +
-            "Bấm 'Thử lại' để reload — nếu vẫn không vào được, đăng xuất rồi thử lại sau."
-          }
-          error
-          onRetry={() => window.location.reload()}
-          retryLabel="Thử lại"
-          retryIcon="refresh"
-          extraActions={
-            <button
-              onClick={() => void authSignOut()}
-              className="btn-ripple flex items-center gap-2 rounded-lg border border-white/20 bg-white/5 px-4 py-2 text-sm font-medium text-white/80 hover:bg-white/15"
-            >
-              <span className="material-symbols-rounded text-base">logout</span>
-              Đăng xuất
-            </button>
-          }
-        />
-      );
-    }
-  }
-
-  // CRITICAL phân quyền: key={user.uid} force remount toàn bộ subtree khi uid
-  // đổi. Lý do: SettingsProvider/AppInner khởi tạo state từ localStorage SYNC
-  // tại mount (useState(loadSettings), useFilterMode, smartcalc:open…).
-  // `wipeUserLocalStorage` trong useCloudSync chạy SAU mount → chỉ xoá
-  // localStorage, không reset React state. Không remount = user B thấy config
-  // của user A (click sources, profit fee %, filter range, calc open state).
-  // Key theo uid đảm bảo: uid đổi → unmount cũ → localStorage wiped → mount mới
-  // đọc default.
   return (
     <SettingsProvider key={user.uid}>
-      <AdminViewProvider>
-        <AccountProvider>
-          <AppInner />
-        </AccountProvider>
-      </AdminViewProvider>
+      <AccountProvider>
+        <AppInner />
+      </AccountProvider>
     </SettingsProvider>
   );
 }
 
-/// Map sync phase (v9) → text cho SplashScreen. Null (chưa có phase) →
-/// default "Đang đồng bộ..." để UX nhất quán với lúc init.
-function splashTextFor(phase: SyncPhase): { title: string; subtitle?: string } {
-  switch (phase) {
-    case "pulling":
-      return {
-        title: "Đang nhận dữ liệu mới...",
-        subtitle: "Kéo delta từ R2 và áp dụng vào DB local.",
-      };
-    case "pushing":
-      return {
-        title: "Đang đẩy lên R2...",
-        subtitle: "Upload thay đổi local + cập nhật manifest.",
-      };
-    case "snapshot-restore":
-      return {
-        title: "Đang khôi phục dữ liệu từ cloud...",
-        subtitle:
-          "Local đi sau snapshot — tải snapshot mới + apply delta. KHÔNG đóng app.",
-      };
-    default:
-      return {
-        title: "Đang đồng bộ R2...",
-        subtitle: "Hợp nhất dữ liệu từ các máy khác, vui lòng chờ.",
-      };
-  }
-}
-
-/// Fullscreen splash — icon xoay anchor ở vị trí cố định (32vh từ top),
-/// text flow dưới. Khi subtitle/timestamp dài, text wrap xuống nhưng icon
-/// KHÔNG di chuyển — UX ổn định, user vẫn biết đang sync.
-///
-/// error=true → icon chuyển error_outline (không xoay) + optional nút retry.
-function SplashScreen({
-  title,
-  subtitle,
-  lastSyncAt,
-  error,
-  onRetry,
-  retryLabel = "Đăng xuất và thử lại",
-  retryIcon = "logout",
-  extraActions,
-}: {
+interface SplashScreenProps {
   title: string;
   subtitle?: string;
-  lastSyncAt?: Date | null;
   error?: boolean;
   onRetry?: () => void;
-  retryLabel?: string;
-  retryIcon?: string;
-  /** Render thêm 1 hoặc nhiều nút phụ dưới retry. Dùng khi error cần
-   *  multi-action (vd "Mở thư mục data" để user inspect/repair DB). */
-  extraActions?: ReactNode;
-}) {
+}
+
+function SplashScreen({ title, subtitle, error, onRetry }: SplashScreenProps) {
   return (
     <main className="min-h-screen bg-surface-0 px-6 text-white">
       <div className="flex flex-col items-center pt-[32vh]">
@@ -1609,103 +981,18 @@ function SplashScreen({
               {subtitle}
             </p>
           )}
-          {lastSyncAt && (
-            <p className="text-sm text-white/50">
-              Lần cuối: {lastSyncAt.toLocaleString("vi-VN")}
-            </p>
-          )}
           {onRetry && (
             <button
               onClick={onRetry}
               className="btn-ripple mt-2 flex items-center gap-2 rounded-lg border border-white/40 bg-white/10 px-4 py-2 text-sm font-medium text-white hover:bg-white/20"
             >
-              <span className="material-symbols-rounded text-base">{retryIcon}</span>
-              {retryLabel}
+              <span className="material-symbols-rounded text-base">refresh</span>
+              Tải lại
             </button>
           )}
-          {extraActions}
         </div>
       </div>
     </main>
-  );
-}
-
-/// Banner sticky ở top khi `navigator.onLine === false`. Báo user app đang
-/// dùng data local, sync sẽ resume tự động khi mạng về. Dismissible per
-/// session để không che view nếu user biết và muốn ẩn — sẽ hiện lại lần
-/// vào app kế tiếp khi vẫn offline. Listen native online/offline events.
-function OfflineBanner() {
-  const [isOffline, setIsOffline] = useState(!navigator.onLine);
-  const [dismissed, setDismissed] = useState(false);
-  useEffect(() => {
-    const onOnline = () => {
-      setIsOffline(false);
-      setDismissed(false);
-    };
-    const onOffline = () => setIsOffline(true);
-    window.addEventListener("online", onOnline);
-    window.addEventListener("offline", onOffline);
-    return () => {
-      window.removeEventListener("online", onOnline);
-      window.removeEventListener("offline", onOffline);
-    };
-  }, []);
-  if (!isOffline || dismissed) return null;
-  return (
-    <div
-      className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-xs text-amber-100"
-      role="status"
-    >
-      <span className="material-symbols-rounded text-base text-amber-300">
-        wifi_off
-      </span>
-      <span className="flex-1">
-        Đang offline — chỉ dùng data local. Sync sẽ tự resume khi có mạng.
-      </span>
-      <button
-        onClick={() => setDismissed(true)}
-        className="rounded-md px-2 py-0.5 text-amber-200/80 hover:bg-amber-500/15 hover:text-amber-100"
-        title="Ẩn banner"
-        aria-label="Ẩn banner offline"
-      >
-        <span className="material-symbols-rounded text-sm">close</span>
-      </button>
-    </div>
-  );
-}
-
-/// Nút "Mở thư mục data" hiện trong startup error splash. Cho user mở folder
-/// `app_data_dir` (root) trong Explorer — user navigate vào `users/{uid}/`
-/// thủ công để inspect/repair (xóa DB corrupt, copy backup, etc.).
-///
-/// CRITICAL: KHÔNG dùng `get_app_data_paths` Tauri command vì nó lock DbState
-/// để đọc PRAGMA. Khi `switch_db_to_user` fail, DbState vẫn trỏ pre-auth DB
-/// → `active_db_path` trả pre-auth path → user mở SAI folder. Dùng Tauri
-/// path API client-side trực tiếp — chỉ phụ thuộc app handle, không DbState.
-function OpenDataDirButton() {
-  const handleOpen = async () => {
-    try {
-      const [{ appDataDir }, { openPath }] = await Promise.all([
-        import("@tauri-apps/api/path"),
-        import("@tauri-apps/plugin-opener"),
-      ]);
-      const dir = await appDataDir();
-      // openPath cho folder = mở trong Explorer (default app cho directory).
-      await openPath(dir);
-    } catch (e) {
-      console.warn("[OpenDataDirButton] failed:", e);
-      alert(`Không mở được thư mục: ${(e as Error).message}`);
-    }
-  };
-  return (
-    <button
-      onClick={() => void handleOpen()}
-      className="btn-ripple flex items-center gap-2 rounded-lg border border-white/20 bg-white/5 px-4 py-2 text-sm font-medium text-white/80 hover:bg-white/15"
-      title="Mở Explorer vào app_data_dir — navigate vào users/{uid}/ để xem/sửa DB"
-    >
-      <span className="material-symbols-rounded text-base">folder_open</span>
-      Mở thư mục data
-    </button>
   );
 }
 

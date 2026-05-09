@@ -13,11 +13,12 @@ use rusqlite::params;
 use tauri::State;
 
 use crate::db::types::BatchDeletePayload;
-use crate::db::{resolve_active_imports_dir, tombstone_key_sub, DbState};
+use crate::db::{now_rfc3339_z, resolve_active_imports_dir, DbState};
 
-use super::query::{is_prefix, to_canonical, Canonical};
-use crate::sync_v9::hlc::next_hlc_rfc3339;
-use super::{assert_not_bootstrapping, CmdError, CmdResult};
+use super::query::{
+    is_compatible, read_sub_id_match_mode, to_canonical, Canonical, SubIdMatchMode,
+};
+use super::{CmdError, CmdResult};
 
 #[tauri::command]
 pub fn batch_commit_deletes(
@@ -25,61 +26,86 @@ pub fn batch_commit_deletes(
     payload: BatchDeletePayload,
 ) -> CmdResult<BatchResult> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    assert_not_bootstrapping(&conn)?;
+    let match_mode = read_sub_id_match_mode(&conn);
     let tx = conn.transaction()?;
-    // HLC-lite: tombstone.deleted_at monotonic → apply_tombstones compare với
-    // manual_entries.updated_at từ remote chính xác bất chấp clock drift.
-    let now = next_hlc_rfc3339(&tx)?;
+    let now = now_rfc3339_z();
 
     let mut days_deleted = 0_i64;
     for date in &payload.days {
         let n = tx.execute("DELETE FROM days WHERE date = ?", params![date])?;
         days_deleted += n as i64;
-
-        // Tombstone 'day' — apply khi merge: xóa day ở peer, CASCADE raw rows.
-        tx.execute(
-            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-             VALUES ('day', ?, ?)",
-            params![date, now],
-        )?;
     }
 
     let mut rows_deleted = 0_i64;
     for row in &payload.manual_rows {
-        // Target canonical của UI row cần xóa.
         let target = to_canonical(row.sub_ids.clone());
 
-        // 1. Xóa manual_entries khớp tuple chính xác (manual entries chỉ có 1 tuple riêng).
-        tx.execute(
-            "DELETE FROM manual_entries
-             WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
-               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
-            params![
-                row.sub_ids[0],
-                row.sub_ids[1],
-                row.sub_ids[2],
-                row.sub_ids[3],
-                row.sub_ids[4],
-                row.day_date,
-            ],
-        )?;
-
-        // 2. Xóa raw rows có canonical prefix-compatible với target (trên cùng day).
-        for table in [
-            "raw_fb_ads",
-            "raw_shopee_clicks",
-            "raw_shopee_order_items",
-        ] {
-            rows_deleted +=
-                delete_prefix_compatible(&tx, table, &row.day_date, &target)?;
+        // Manual entry exact-match: scope by account_id khi có, để filter=All
+        // không wipe manual của account khác trên cùng tuple+ngày.
+        if let Some(acc) = row.account_id {
+            tx.execute(
+                "DELETE FROM manual_entries
+                 WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
+                   AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?
+                   AND shopee_account_id = ?",
+                params![
+                    row.sub_ids[0],
+                    row.sub_ids[1],
+                    row.sub_ids[2],
+                    row.sub_ids[3],
+                    row.sub_ids[4],
+                    row.day_date,
+                    acc,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM manual_entries
+                 WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
+                   AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?",
+                params![
+                    row.sub_ids[0],
+                    row.sub_ids[1],
+                    row.sub_ids[2],
+                    row.sub_ids[3],
+                    row.sub_ids[4],
+                    row.day_date,
+                ],
+            )?;
         }
 
-        // Tombstone 'ui_row' — apply khi merge: xóa manual + raw prefix-compatible ở peer.
-        tx.execute(
-            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-             VALUES ('ui_row', ?, ?)",
-            params![tombstone_key_sub(&row.day_date, &row.sub_ids), now],
+        // Shopee tables: scope theo account_id khi có. FB ads (`raw_fb_ads`)
+        // KHÔNG có cột shopee_account_id (attribution là derived) → giữ
+        // behavior cross-account: wipe FB theo (day, tuple) duy nhất khi
+        // user delete row "FB chung" (account_id=None) HOẶC khi row đó là
+        // sole owner của tuple. Heuristic đơn giản: chỉ wipe FB khi
+        // account_id=None để tránh xóa nhầm FB chia sẻ giữa nhiều TK.
+        rows_deleted += delete_prefix_compatible_scoped(
+            &tx,
+            "raw_shopee_clicks",
+            &row.day_date,
+            &target,
+            row.account_id,
+            match_mode,
         )?;
+        rows_deleted += delete_prefix_compatible_scoped(
+            &tx,
+            "raw_shopee_order_items",
+            &row.day_date,
+            &target,
+            row.account_id,
+            match_mode,
+        )?;
+        if row.account_id.is_none() {
+            rows_deleted += delete_prefix_compatible_scoped(
+                &tx,
+                "raw_fb_ads",
+                &row.day_date,
+                &target,
+                None,
+                match_mode,
+            )?;
+        }
     }
 
     // Cleanup days orphan (không còn raw/manual nào) — auto-remove.
@@ -123,21 +149,11 @@ pub fn batch_commit_deletes(
         iter.collect::<std::result::Result<_, _>>()?
     };
     for (id, _) in &orphan_files {
-        // Soft-mark (idempotent qua reverted_at IS NULL guard) để consistent
-        // với apply_imported_file_tombstone ở peer + giữ history record.
         tx.execute(
             "UPDATE imported_files
              SET reverted_at = ?, stored_path = NULL
              WHERE id = ? AND reverted_at IS NULL",
             params![now, id],
-        )?;
-        // Tombstone 'imported_file' — sync v9 propagate sang peer + fresh
-        // install. Apply side soft-marks file (UPDATE reverted_at) → state
-        // converge cross-device.
-        tx.execute(
-            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-             VALUES ('imported_file', ?, ?)",
-            params![id.to_string(), now],
         )?;
     }
 
@@ -171,23 +187,35 @@ pub fn batch_commit_deletes(
     })
 }
 
-/// Xóa rows trong `table` có canonical prefix-compatible với `target`, cùng `day_date`.
-/// "Prefix-compatible" = target là prefix của row HOẶC row là prefix của target.
-fn delete_prefix_compatible(
+/// Xóa rows trong `table` có canonical compatible với `target` theo `mode`,
+/// cùng `day_date`. Compatibility check delegate sang `is_compatible` —
+/// Exact = slot equality, Substring = + substring trên joined canonical.
+/// `account_id_eq` = `Some(id)` → thêm `AND shopee_account_id = ?`. Bảng
+/// `raw_fb_ads` không có cột này → caller phải truyền `None`.
+fn delete_prefix_compatible_scoped(
     tx: &rusqlite::Transaction,
     table: &str,
     day_date: &str,
     target: &Canonical,
+    account_id_eq: Option<i64>,
+    mode: SubIdMatchMode,
 ) -> CmdResult<i64> {
-    // Load tất cả tuple sub_id distinct trong day → filter compatible ở Rust.
-    // Dùng DISTINCT để giảm số vòng lặp DELETE.
-    let select_sql = format!(
-        "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
-         FROM {table} WHERE day_date = ?"
-    );
+    // Load tuple distinct trong day → filter compatible ở Rust. Khi scope
+    // theo account, DISTINCT chỉ chạy trên rows của account → ít tuples hơn.
+    let select_sql = if account_id_eq.is_some() {
+        format!(
+            "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+             FROM {table} WHERE day_date = ? AND shopee_account_id = ?"
+        )
+    } else {
+        format!(
+            "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+             FROM {table} WHERE day_date = ?"
+        )
+    };
     let mut stmt = tx.prepare(&select_sql)?;
-    let tuples: Vec<[String; 5]> = stmt
-        .query_map(params![day_date], |r| {
+    let tuples: Vec<[String; 5]> = if let Some(id) = account_id_eq {
+        stmt.query_map(params![day_date, id], |r| {
             Ok([
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -196,28 +224,57 @@ fn delete_prefix_compatible(
                 r.get::<_, String>(4)?,
             ])
         })?
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>()?
+    } else {
+        stmt.query_map(params![day_date], |r| {
+            Ok([
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ])
+        })?
+        .collect::<Result<_, _>>()?
+    };
     drop(stmt);
 
-    let delete_sql = format!(
-        "DELETE FROM {table}
-         WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
-           AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?"
-    );
+    let delete_sql = if account_id_eq.is_some() {
+        format!(
+            "DELETE FROM {table}
+             WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
+               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?
+               AND shopee_account_id = ?"
+        )
+    } else {
+        format!(
+            "DELETE FROM {table}
+             WHERE sub_id1 = ? AND sub_id2 = ? AND sub_id3 = ?
+               AND sub_id4 = ? AND sub_id5 = ? AND day_date = ?"
+        )
+    };
 
     let mut total: i64 = 0;
     for tuple in tuples {
         let canonical = to_canonical(tuple.clone());
-        let compatible = is_prefix(&canonical, target) || is_prefix(target, &canonical);
-        if !compatible {
+        if !is_compatible(&canonical, target, mode) {
             continue;
         }
-        let n = tx.execute(
-            &delete_sql,
-            params![
-                tuple[0], tuple[1], tuple[2], tuple[3], tuple[4], day_date
-            ],
-        )?;
+        let n = if let Some(id) = account_id_eq {
+            tx.execute(
+                &delete_sql,
+                params![
+                    tuple[0], tuple[1], tuple[2], tuple[3], tuple[4], day_date, id
+                ],
+            )?
+        } else {
+            tx.execute(
+                &delete_sql,
+                params![
+                    tuple[0], tuple[1], tuple[2], tuple[3], tuple[4], day_date
+                ],
+            )?
+        };
         total += n as i64;
     }
     Ok(total)
@@ -244,8 +301,6 @@ pub fn revert_import(
     file_id: i64,
 ) -> CmdResult<RevertResult> {
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    // Bug E fix: bootstrap restore window guard.
-    assert_not_bootstrapping(&conn)?;
 
     // Snapshot file info TRƯỚC khi revert — cần stored_path để xóa CSV khỏi disk.
     let (filename, stored_path_rel, already_reverted): (String, Option<String>, bool) = conn
@@ -269,8 +324,7 @@ pub fn revert_import(
     }
 
     let tx = conn.transaction()?;
-    // HLC cho sync cross-device + timestamp revert.
-    let now = next_hlc_rfc3339(&tx)?;
+    let now = now_rfc3339_z();
 
     // 1. Xóa mapping của file này — raw rows nào chỉ link qua file X giờ orphan.
     tx.execute(
@@ -323,19 +377,6 @@ pub fn revert_import(
          SET reverted_at = ?, stored_path = NULL
          WHERE id = ?",
         params![now, file_id],
-    )?;
-
-    // 5. Tombstone 'imported_file' — sync v9 propagate revert sang máy khác.
-    // Thiếu tombstone này: cursor `imported_at` không advance khi chỉ
-    // `reverted_at` đổi → file row không capture lại; raw_*/mapping DELETE
-    // không emit event → máy khác pull về sẽ KHÔNG xóa → wipe local + login
-    // thấy raw rows cũ hồi sinh.
-    // entity_key = str(file_id): file_id = content_id(file_hash) deterministic
-    // cross-machine, nên apply side resolve đúng row qua id matching.
-    tx.execute(
-        "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-         VALUES ('imported_file', ?, ?)",
-        params![file_id.to_string(), now],
     )?;
 
     tx.commit()?;

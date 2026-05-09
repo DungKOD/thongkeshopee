@@ -1,16 +1,12 @@
 import { useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
-import { useIsAdmin } from "../hooks/usePremium";
 
 interface UserMenuProps {
-  /// Override signOut flow — App.tsx pass callback để check dirty DB + hỏi
-  /// sync trước khi signOut. Nếu bỏ, dùng `auth.signOut` trực tiếp (không check).
   onRequestSignOut?: () => Promise<void> | void;
 }
 
 export function UserMenu({ onRequestSignOut }: UserMenuProps = {}) {
   const { user, signOut } = useAuth();
-  const isAdmin = useIsAdmin();
   const [open, setOpen] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
 
@@ -68,11 +64,6 @@ export function UserMenu({ onRequestSignOut }: UserMenuProps = {}) {
               >
                 {email}
               </div>
-              {isAdmin && (
-                <span className="mt-2 inline-block rounded-full bg-shopee-900/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-shopee-300">
-                  Admin
-                </span>
-              )}
             </div>
             <button
               type="button"

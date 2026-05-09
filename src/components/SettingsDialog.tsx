@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { ProfitFees, Settings } from "../hooks/useSettings";
-import { useIsAdmin } from "../hooks/usePremium";
-import { AdminDeviceManagement } from "./AdminDeviceManagement";
+import type {
+  ProfitFees,
+  Settings,
+  SubIdMatchMode,
+} from "../hooks/useSettings";
 import { ImportHistorySection } from "./ImportHistorySection";
 import { invoke } from "../lib/tauri";
 
@@ -20,7 +22,7 @@ interface SettingsDialogProps {
   productsCount: number;
   onToggleClickSource: (source: string, enabled: boolean) => void;
   onSetProfitFee: (key: keyof ProfitFees, value: number) => void;
-  onSetAutoSyncEnabled: (enabled: boolean) => void;
+  onSetSubIdMatchMode: (mode: SubIdMatchMode) => void;
   onClose: () => void;
   /** Trigger reload lịch sử import ngoài (bump khi có import/delete). */
   importHistoryReloadKey?: number;
@@ -35,7 +37,7 @@ export function SettingsDialog({
   productsCount,
   onToggleClickSource,
   onSetProfitFee,
-  onSetAutoSyncEnabled,
+  onSetSubIdMatchMode,
   onClose,
   importHistoryReloadKey,
   onImportReverted,
@@ -49,23 +51,15 @@ export function SettingsDialog({
     return () => window.removeEventListener("keydown", onKey);
   }, [isOpen, onClose]);
 
-  // Fetch app data paths khi dialog mở. Không fetch ở mount (lazy).
   const [paths, setPaths] = useState<AppDataPaths | null>(null);
   const [pathsError, setPathsError] = useState<string | null>(null);
-  const [netLogDir, setNetLogDir] = useState<string | null>(null);
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     (async () => {
       try {
-        const [p, dir] = await Promise.all([
-          invoke<AppDataPaths>("get_app_data_paths"),
-          invoke<string>("get_net_log_dir"),
-        ]);
-        if (!cancelled) {
-          setPaths(p);
-          setNetLogDir(dir);
-        }
+        const p = await invoke<AppDataPaths>("get_app_data_paths");
+        if (!cancelled) setPaths(p);
       } catch (e) {
         if (!cancelled) setPathsError((e as Error).message ?? String(e));
       }
@@ -87,8 +81,6 @@ export function SettingsDialog({
       setSourcesLocked(true);
     }
   }, [isOpen]);
-
-  const isAdmin = useIsAdmin();
 
   if (!isOpen) return null;
 
@@ -205,57 +197,87 @@ export function SettingsDialog({
 
           <section>
             <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
-              <span className="material-symbols-rounded text-base">
-                cloud_sync
-              </span>
-              Đồng bộ tự động
+              <span className="material-symbols-rounded text-base">link</span>
+              Cách khớp Sub_id ↔ tên Camp/Nhóm QC
             </h3>
             <p className="mb-3 text-xs text-white/50">
-              Bật để tự động đẩy thay đổi (import/sửa/xóa) lên R2 sau 45 giây.
-              Tắt thì phải bấm <b>"Đồng bộ ngay"</b> trong icon đám mây.
+              Quyết định khi nào FB ad merge với Shopee subid trong cùng dòng UI.
             </p>
-            <label className="flex cursor-pointer items-center gap-3 rounded-xl bg-surface-6 px-4 py-3 text-sm text-white/85 shadow-elev-1 transition-colors hover:bg-white/5">
-              <input
-                type="checkbox"
-                checked={settings.autoSyncEnabled}
-                onChange={(e) =>
-                  onSetAutoSyncEnabled(e.currentTarget.checked)
-                }
-                className="h-4 w-4 accent-shopee-500"
-              />
-              <span className="flex-1">
-                <span className="font-medium">
-                  Tự động sync sau mỗi thao tác
-                </span>
-                <span className="ml-2 text-xs text-white/50">
-                  (debounce 45s, gom batch lên R2)
-                </span>
-              </span>
-              {settings.autoSyncEnabled ? (
-                <span className="rounded-full bg-green-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-green-300">
-                  ON
-                </span>
-              ) : (
-                <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
-                  OFF
-                </span>
-              )}
-            </label>
-            {!settings.autoSyncEnabled && (
-              <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
-                <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
-                  warning
-                </span>
-                <div>
-                  Auto-sync đang tắt. Thay đổi local <b>không tự đẩy lên R2</b>{" "}
-                  — nếu mở app trên máy khác (hoặc app crash), data mới có thể
-                  chưa được backup. Pull từ R2 và RTDB notify vẫn hoạt động.
+            <div className="space-y-2">
+              <label
+                className={`flex cursor-pointer items-start gap-3 rounded-lg border px-4 py-3 transition-colors ${
+                  settings.subIdMatchMode === "exact"
+                    ? "border-shopee-500 bg-shopee-900/20"
+                    : "border-surface-8 bg-surface-1 hover:bg-surface-2"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="sub-id-match-mode"
+                  value="exact"
+                  checked={settings.subIdMatchMode === "exact"}
+                  onChange={() => onSetSubIdMatchMode("exact")}
+                  className="mt-1 h-4 w-4 accent-shopee-500"
+                />
+                <div className="flex-1 text-sm">
+                  <div className="font-semibold text-white/90">
+                    Khớp chính xác (mặc định)
+                  </div>
+                  <div className="mt-1 text-xs text-white/60">
+                    Tuple sub_id phải bằng nhau từng slot. Ví dụ:{" "}
+                    <span className="font-mono text-shopee-300">camp1</span>{" "}
+                    và{" "}
+                    <span className="font-mono text-shopee-300">
+                      camp1-0412
+                    </span>{" "}
+                    → merge. Còn{" "}
+                    <span className="font-mono text-shopee-300">camp1</span>{" "}
+                    và{" "}
+                    <span className="font-mono text-shopee-300">dungcamp1</span>{" "}
+                    → KHÔNG merge.
+                  </div>
                 </div>
-              </div>
-            )}
+              </label>
+              <label
+                className={`flex cursor-pointer items-start gap-3 rounded-lg border px-4 py-3 transition-colors ${
+                  settings.subIdMatchMode === "substring"
+                    ? "border-shopee-500 bg-shopee-900/20"
+                    : "border-surface-8 bg-surface-1 hover:bg-surface-2"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="sub-id-match-mode"
+                  value="substring"
+                  checked={settings.subIdMatchMode === "substring"}
+                  onChange={() => onSetSubIdMatchMode("substring")}
+                  className="mt-1 h-4 w-4 accent-shopee-500"
+                />
+                <div className="flex-1 text-sm">
+                  <div className="font-semibold text-white/90">
+                    Chứa nhau (substring)
+                  </div>
+                  <div className="mt-1 text-xs text-white/60">
+                    Giống chính xác, PLUS cho phép 2 tên chứa nhau
+                    (case-insensitive, tối thiểu 3 ký tự). Ví dụ:{" "}
+                    <span className="font-mono text-shopee-300">camp1</span>{" "}
+                    và{" "}
+                    <span className="font-mono text-shopee-300">dungcamp1</span>{" "}
+                    → merge.
+                  </div>
+                  <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-amber-300/90">
+                    <span className="material-symbols-rounded mt-0.5 text-xs text-amber-400">
+                      warning
+                    </span>
+                    <span>
+                      Có thể false positive khi sub_id ngắn/giống nhau
+                      ngẫu nhiên (vd "camp" match "scamper").
+                    </span>
+                  </div>
+                </div>
+              </label>
+            </div>
           </section>
-
-          {isAdmin && <AdminDeviceManagement />}
 
           <section>
             <div className="mb-1 flex items-center justify-between gap-2">
@@ -356,22 +378,10 @@ export function SettingsDialog({
                   path={paths.activeImportsDir}
                   revealAsDir
                 />
-                {netLogDir && (
-                  <PathRow
-                    label="Net log (request history daily)"
-                    path={netLogDir}
-                    revealAsDir
-                  />
-                )}
               </div>
             ) : !pathsError ? (
               <div className="text-xs text-white/40">Đang tải...</div>
             ) : null}
-            <p className="mt-2 text-[11px] text-white/40">
-              Net log: 1 file/ngày (<code>YYYY-MM-DD.log</code>). Lưu mọi
-              request FE phát ra (R2, Firebase, admin) — phân tích cost +
-              optimize sau. Plain text, dễ grep.
-            </p>
           </section>
 
           {/* App info — version + build metadata. Cuối Settings làm footer info. */}

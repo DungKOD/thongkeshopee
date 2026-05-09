@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::State;
 
-use crate::db::{resolve_active_imports_dir, DbState};
+use crate::db::{content_id, now_rfc3339_z, resolve_active_imports_dir, DbState};
 
-use super::{assert_not_bootstrapping, CmdError, CmdResult};
+use super::{CmdError, CmdResult};
 
 // ============================================================
 // Shared helpers
@@ -151,13 +151,6 @@ fn register_imported_file(
         params![day_date, now],
     )?;
 
-    // Resurrect: import mới cho day X → huỷ tombstone 'day' nếu có.
-    // Giữ tombstones 'ui_row' / 'manual_entry' vì import raw không chạm manual_entries.
-    tx.execute(
-        "DELETE FROM tombstones WHERE entity_type = 'day' AND entity_key = ?",
-        params![day_date],
-    )?;
-
     // v10: dedup chỉ check file ACTIVE (chưa revert). Row `reverted_at IS NOT NULL`
     // giữ cho history — user revert xong import lại cùng file → revive row đó.
     let existing: Option<i64> = tx
@@ -190,7 +183,7 @@ fn register_imported_file(
     // Edge case: 2 file khác hash trùng id (collision content_id 63-bit) —
     // xác suất gần 0 với SHA-256 input 8 byte; nếu xảy ra UNIQUE PK fail
     // sẽ surface qua error message bình thường.
-    let id = crate::sync_v9::content_id::imported_file_id(hash);
+    let id = content_id::imported_file_id(hash);
     let reverted_id: Option<i64> = tx
         .query_row(
             "SELECT id FROM imported_files
@@ -219,14 +212,6 @@ fn register_imported_file(
                 filename, kind, now, row_count, stored_path, day_date,
                 shopee_account_id, target_id
             ],
-        )?;
-        // Clear stale local tombstone — capture cursor `deleted_at` đã advance
-        // qua tombstone cũ nên không re-push, nhưng dọn để snapshot replay
-        // sau wipe + bootstrap không apply nhầm tombstone lên row vừa revive.
-        tx.execute(
-            "DELETE FROM tombstones
-             WHERE entity_type = 'imported_file' AND entity_key = ?",
-            params![target_id.to_string()],
         )?;
         return Ok(target_id);
     }
@@ -319,12 +304,11 @@ pub fn import_shopee_clicks(
     // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
     // bị xếp trước row có `Z` regardless of timestamp → cursor advance
     // bypass row → next sync skip.
-    let now = crate::sync_v9::hlc::now_rfc3339_z();
+    let now = now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Bug E fix: reject mutation trong bootstrap snapshot restore window.
     // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
-    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -505,12 +489,11 @@ pub fn import_shopee_orders(
     // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
     // bị xếp trước row có `Z` regardless of timestamp → cursor advance
     // bypass row → next sync skip.
-    let now = crate::sync_v9::hlc::now_rfc3339_z();
+    let now = now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Bug E fix: reject mutation trong bootstrap snapshot restore window.
     // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
-    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -602,7 +585,7 @@ pub fn import_shopee_orders(
                 )
                 .unwrap_or(0);
 
-            let content_id = crate::sync_v9::content_id::order_item_id(
+            let content_id = content_id::order_item_id(
                 &r.checkout_id,
                 &r.item_id,
                 &r.model_id,
@@ -825,12 +808,11 @@ pub fn import_fb_ad_groups(
     // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
     // bị xếp trước row có `Z` regardless of timestamp → cursor advance
     // bypass row → next sync skip.
-    let now = crate::sync_v9::hlc::now_rfc3339_z();
+    let now = now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Bug E fix: reject mutation trong bootstrap snapshot restore window.
     // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
-    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -867,7 +849,7 @@ pub fn import_fb_ad_groups(
             let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
             let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
             let content_id =
-                crate::sync_v9::content_id::fb_ad_id(&day_date, "ad_group", &r.ad_group_name);
+                content_id::fb_ad_id(&day_date, "ad_group", &r.ad_group_name);
             let fb_ad_id: i64 = stmt.query_row(
                 params![
                     content_id,
@@ -1013,12 +995,11 @@ pub fn import_fb_campaigns(
     // `Z` (từ schema seed / accounts.rs) → lex sai → row có suffix `+`
     // bị xếp trước row có `Z` regardless of timestamp → cursor advance
     // bypass row → next sync skip.
-    let now = crate::sync_v9::hlc::now_rfc3339_z();
+    let now = now_rfc3339_z();
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // Bug E fix: reject mutation trong bootstrap snapshot restore window.
     // Bypass guard → INSERT vào DB sắp bị swap → mất data sau swap.
-    assert_not_bootstrapping(&conn)?;
     let imports_dir = resolve_active_imports_dir(&conn)
         .map_err(|e| CmdError::msg(e.to_string()))?;
     let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
@@ -1055,7 +1036,7 @@ pub fn import_fb_campaigns(
             let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
             let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
             let content_id =
-                crate::sync_v9::content_id::fb_ad_id(&day_date, "campaign", &r.campaign_name);
+                content_id::fb_ad_id(&day_date, "campaign", &r.campaign_name);
             let fb_ad_id: i64 = stmt.query_row(
                 params![
                     content_id,
@@ -1168,7 +1149,7 @@ mod tests {
             "INSERT INTO days(date, created_at) VALUES('2026-04-17', '2026-04-17T00:00:00Z')",
             [],
         ).unwrap();
-        let file_id = crate::sync_v9::content_id::imported_file_id("hash_x");
+        let file_id = content_id::imported_file_id("hash_x");
         conn.execute(
             "INSERT INTO imported_files(id, filename, kind, imported_at, file_hash, day_date)
              VALUES(?, 'a.csv', 'fb_ad_group', '2026-04-17T00:00:00Z', 'hash_x', '2026-04-17')",
@@ -1194,8 +1175,8 @@ mod tests {
         clicks: Option<i64>,
         tax_rate: f64,
     ) -> i64 {
-        let file_id = crate::sync_v9::content_id::imported_file_id("hash_x");
-        let id = crate::sync_v9::content_id::fb_ad_id("2026-04-17", "ad_group", name);
+        let file_id = content_id::imported_file_id("hash_x");
+        let id = content_id::fb_ad_id("2026-04-17", "ad_group", name);
         conn.query_row(
             FB_ADS_UPSERT_SQL,
             params![
@@ -1444,7 +1425,7 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(
             id1,
-            crate::sync_v9::content_id::imported_file_id(hash),
+            content_id::imported_file_id(hash),
             "id = content_id(hash)"
         );
 
@@ -1453,13 +1434,6 @@ mod tests {
             "UPDATE imported_files SET reverted_at = '2026-04-29T10:00:00Z',
              stored_path = NULL WHERE id = ?",
             params![id1],
-        )
-        .unwrap();
-        // Cùng tombstone mà real flow tạo.
-        conn.execute(
-            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-             VALUES ('imported_file', ?, '2026-04-29T10:00:00Z')",
-            params![id1.to_string()],
         )
         .unwrap();
 
@@ -1492,17 +1466,6 @@ mod tests {
         assert_eq!(reverted, None, "reverted_at cleared sau revive");
         assert_eq!(filename, "A-reimport.csv", "filename refresh từ import mới");
         assert_eq!(stored_path.as_deref(), Some("imports/h-revive-X-v2.csv"));
-
-        // Local tombstone cleared để snapshot replay không wipe lại.
-        let ts_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tombstones
-                 WHERE entity_type = 'imported_file' AND entity_key = ?",
-                params![id1.to_string()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(ts_count, 0, "tombstone 'imported_file' cleared sau revive");
 
         // Đếm row total = 1 (revive, không INSERT mới).
         let total: i64 = conn

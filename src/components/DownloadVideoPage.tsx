@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
-import { getAuthToken } from "../lib/firebase";
 import {
   listVideoDownloads,
   logVideoDownload,
@@ -154,22 +153,15 @@ export function DownloadVideoPage() {
     }
   };
 
-  // Best-effort log: BE ghi local DB (UPSERT theo URL) + silently post Sheet
-  // (thu thập ẩn danh để cải thiện app). TUYỆT ĐỐI không hiển thị bất kỳ
-  // lỗi nào liên quan đến Sheet/đồng bộ cho user — swallow mọi error, UI
-  // chỉ phản ánh local history. Sheet fail → user không biết, flow không đổi.
   const logStatus = async (
     sourceUrl: string,
     status: "success" | "failed",
   ) => {
     try {
-      const idToken = await getAuthToken();
-      await logVideoDownload(idToken, sourceUrl, status);
+      await logVideoDownload(sourceUrl, status);
     } catch {
-      /* silent — không show lỗi sync dưới bất kỳ hình thức nào */
+      /* silent */
     }
-    // Refresh history ngoài try-catch: Rust INSERT local chạy TRƯỚC Sheet
-    // call, nên dù Sheet fail local DB đã có row → history luôn update.
     void refreshHistory();
   };
 

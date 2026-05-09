@@ -13,10 +13,11 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use super::query::{is_prefix, to_canonical, Canonical};
-use super::{assert_not_bootstrapping, CmdError, CmdResult};
-use crate::db::{tombstone_key_sub, DbState};
-use crate::sync_v9::hlc::next_hlc_rfc3339;
+use super::query::{
+    is_compatible, read_sub_id_match_mode, to_canonical, Canonical,
+};
+use super::{CmdError, CmdResult};
+use crate::db::{now_rfc3339_z, DbState};
 
 /// Tên reserved cho account "Mặc định" — catch-all cho sub_id chưa gán TK.
 /// Sau v13 migration id là content_id hash (không còn = 1), nên check bằng
@@ -134,30 +135,10 @@ pub fn create_shopee_account(
     if trimmed.is_empty() {
         return Err(CmdError::msg("Tên account không được để trống"));
     }
-    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    // Bug E fix: bootstrap restore window guard.
-    assert_not_bootstrapping(&conn)?;
-    // v13: id = content_id(name). Cross-machine stable — không còn autoincrement
-    // collision khi 2 máy tạo cùng account fresh.
-    let id = crate::sync_v9::content_id::shopee_account_id(&trimmed);
-
-    let tx = conn.transaction()?;
-    // HLC-monotonic created_at: cross-machine, đảm bảo created_at > tombstone
-    // deleted_at nếu tạo SAU xóa, để apply_shopee_account_tombstone resurrect
-    // rule skip đúng.
-    let now = next_hlc_rfc3339(&tx)?;
-    // Clear stale local tombstone — nếu user xóa TK trước đó rồi tạo lại
-    // (cùng name → cùng content_id), tombstone cũ với entity_key=id vẫn ở
-    // tombstones. Để nó tồn tại sẽ ô nhiễm local state (idempotent replay sẽ
-    // xóa account vừa tạo nếu cursor reset). Capture cursor=deleted_at đã
-    // advance qua tombstone cũ nên không re-push, nhưng clear local cho
-    // sạch + safer cho future replay paths.
-    tx.execute(
-        "DELETE FROM tombstones
-         WHERE entity_type = 'shopee_account' AND entity_key = ?",
-        params![id.to_string()],
-    )?;
-    tx.execute(
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let id = crate::db::content_id::shopee_account_id(&trimmed);
+    let now = now_rfc3339_z();
+    conn.execute(
         "INSERT INTO shopee_accounts (id, name, color, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![id, trimmed, color, now],
     )
@@ -170,7 +151,6 @@ pub fn create_shopee_account(
             CmdError::from(e)
         }
     })?;
-    tx.commit()?;
     Ok(id.to_string())
 }
 
@@ -187,8 +167,6 @@ pub fn rename_shopee_account(
     use rusqlite::OptionalExtension;
     let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    // Bug E fix: bootstrap restore window guard.
-    assert_not_bootstrapping(&conn)?;
     if is_default_account(&conn, id)? {
         return Err(CmdError::msg(
             "TK hệ thống 'Mặc định' không thể đổi tên",
@@ -242,8 +220,6 @@ pub fn update_shopee_account_color(
     use rusqlite::OptionalExtension;
     let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    // Bug E fix: bootstrap restore window guard.
-    assert_not_bootstrapping(&conn)?;
     let current: Option<Option<String>> = conn
         .query_row(
             "SELECT color FROM shopee_accounts WHERE id = ?",
@@ -311,6 +287,7 @@ pub fn count_fb_linked_to_account(
 ) -> CmdResult<i64> {
     let id = parse_id(&id)?;
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let match_mode = read_sub_id_match_mode(&conn);
     let shop_target = load_shopee_canonicals_by_day(&conn, |a| a == id)?;
     if shop_target.is_empty() {
         return Ok(0);
@@ -335,16 +312,13 @@ pub fn count_fb_linked_to_account(
         };
         let linked_to_target = targets
             .iter()
-            .any(|c| is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon));
+            .any(|c| is_compatible(&fb_canon, c, match_mode));
         if !linked_to_target {
             continue;
         }
         let linked_to_other = shop_other
             .get(&day)
-            .map(|s| {
-                s.iter()
-                    .any(|c| is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon))
-            })
+            .map(|s| s.iter().any(|c| is_compatible(&fb_canon, c, match_mode)))
             .unwrap_or(false);
         if !linked_to_other {
             count += 1;
@@ -359,7 +333,8 @@ pub fn count_fb_linked_to_account(
 /// spend hiển thị như data lạc sau khi xóa TK Shopee.
 /// Account default (id=1) bảo vệ không cho xóa.
 /// Atomic qua transaction: fail giữa chừng → rollback.
-/// Cleanup: dọn orphan imported_files + orphan days + bump sync_state.
+/// Cleanup: dọn orphan imported_files + orphan days + reset shopee_account_id
+/// trong imported_files của account đang xóa.
 #[tauri::command]
 pub fn delete_shopee_account(
     state: State<'_, DbState>,
@@ -370,8 +345,6 @@ pub fn delete_shopee_account(
     let also_delete_fb = also_delete_fb.unwrap_or(false);
 
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    // Bug E fix: bootstrap restore window guard.
-    assert_not_bootstrapping(&conn)?;
     if is_default_account(&conn, id)? {
         return Err(CmdError::msg("TK hệ thống 'Mặc định' không thể xóa"));
     }
@@ -380,6 +353,7 @@ pub fn delete_shopee_account(
     // shop_target rỗng → không match được). Collect list (day, tuple) để
     // DELETE trong transaction.
     let fb_to_delete: Vec<(String, [String; 5])> = if also_delete_fb {
+        let match_mode = read_sub_id_match_mode(&conn);
         let shop_target = load_shopee_canonicals_by_day(&conn, |a| a == id)?;
         let shop_other = load_shopee_canonicals_by_day(&conn, |a| a != id)?;
         let mut out: Vec<(String, [String; 5])> = Vec::new();
@@ -402,17 +376,13 @@ pub fn delete_shopee_account(
                 };
                 let linked_to_target = targets
                     .iter()
-                    .any(|c| is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon));
+                    .any(|c| is_compatible(&fb_canon, c, match_mode));
                 if !linked_to_target {
                     continue;
                 }
                 let linked_to_other = shop_other
                     .get(&day)
-                    .map(|s| {
-                        s.iter().any(|c| {
-                            is_prefix(&fb_canon, c) || is_prefix(c, &fb_canon)
-                        })
-                    })
+                    .map(|s| s.iter().any(|c| is_compatible(&fb_canon, c, match_mode)))
                     .unwrap_or(false);
                 if !linked_to_other {
                     out.push((day, tuple));
@@ -425,9 +395,6 @@ pub fn delete_shopee_account(
     };
 
     let tx = conn.transaction()?;
-    // HLC-monotonic deleted_at — để apply_tombstones bên peer so đúng vs HLC
-    // updated_at của manual_entries.
-    let now = next_hlc_rfc3339(&tx)?;
 
     // DELETE FB ads đã xác định (exact match theo day + 5 sub_ids).
     if !fb_to_delete.is_empty() {
@@ -464,6 +431,15 @@ pub fn delete_shopee_account(
         return Err(CmdError::msg(format!("Account id={id} không tồn tại")));
     }
 
+    // Clear `shopee_account_id` ở imported_files của account đang xóa —
+    // tránh ghosting khi user tạo lại account cùng tên (content_id stable
+    // → id giống cũ → file cũ "tự gắn" sai vào account mới). Cột này
+    // informal-ref (không FK), nên phải tự cleanup.
+    tx.execute(
+        "UPDATE imported_files SET shopee_account_id = NULL
+         WHERE shopee_account_id = ?1",
+        params![id],
+    )?;
     // Cleanup orphan imported_files (không còn raw rows nào refer) để user
     // có thể re-import lại file sau này.
     tx.execute(
@@ -486,28 +462,6 @@ pub fn delete_shopee_account(
         [],
     )?;
 
-    // Tombstone 'shopee_account' — sync v9 propagate deletion sang máy khác.
-    // Thiếu tombstone này: capture skip (cursor created_at unchanged), DELETE
-    // không emit event → wipe local + login lại thấy account + raw rows hồi
-    // sinh. apply layer trên B mirror cleanup logic + bảo vệ default account.
-    tx.execute(
-        "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-         VALUES ('shopee_account', ?, ?)",
-        params![id.to_string(), now],
-    )?;
-
-    // Tombstones 'ui_row' cho mỗi FB ad row đã xóa qua also_delete_fb. Apply
-    // layer dùng prefix matching trên tuple → B sẽ DELETE đúng FB rows ngay
-    // cả khi FB data state khác máy A (defensive — pre-computed list không
-    // sync được vì depends on local state lúc xóa).
-    for (day, tuple) in &fb_to_delete {
-        tx.execute(
-            "INSERT OR IGNORE INTO tombstones (entity_type, entity_key, deleted_at)
-             VALUES ('ui_row', ?, ?)",
-            params![tombstone_key_sub(day, tuple), now],
-        )?;
-    }
-
     tx.commit()?;
     Ok(())
 }
@@ -527,8 +481,6 @@ pub fn reassign_shopee_account_data(
         return Err(CmdError::msg("from_id và to_id phải khác nhau"));
     }
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    // Bug E fix: bootstrap restore window guard.
-    assert_not_bootstrapping(&conn)?;
     if is_default_account(&conn, to_id)? {
         return Err(CmdError::msg(
             "Không thể chuyển data về TK 'Mặc định' — chọn TK thật",

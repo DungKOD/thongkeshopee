@@ -1,4 +1,4 @@
--- Schema ThongKeShopee — final consolidated (post v1-v13).
+-- Schema ThongKeShopee — local-only.
 -- ELT: raw tables + manual_entries là source of truth. Query on-the-fly,
 -- không rollup cache. Day là first-class entity, raw có day_date FK CASCADE.
 --
@@ -17,8 +17,7 @@ CREATE TABLE IF NOT EXISTS days (
 
 -- =============================================================
 -- shopee_accounts — user có thể quản lý nhiều TK Shopee affiliate.
--- id = content_id(name) — SHA-256(name) truncate i63, deterministic cross-device.
--- "Mặc định" row seed bởi runtime code (tính content_id) ở lần startup đầu.
+-- id = content_id(name) — SHA-256(name) truncate i63.
 -- =============================================================
 CREATE TABLE IF NOT EXISTS shopee_accounts (
     id           INTEGER PRIMARY KEY,
@@ -29,10 +28,6 @@ CREATE TABLE IF NOT EXISTS shopee_accounts (
 
 -- =============================================================
 -- imported_files — audit log mọi lần import CSV.
--- id = content_id(file_hash). day_date nullable + NO FK (file Shopee có thể
--- chứa nhiều ngày). shopee_account_id nullable (FB file không có account).
--- Không UNIQUE(file_hash) inline — thay bằng partial unique index bên dưới
--- để cho phép re-import sau revert.
 -- =============================================================
 CREATE TABLE IF NOT EXISTS imported_files (
     id                 INTEGER PRIMARY KEY,
@@ -55,10 +50,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_hash_active
 
 -- =============================================================
 -- Mapping tables — track raw row thuộc về file nào (many-to-many).
--- Revert file X → DELETE mapping(file_id=X) → orphan raw rows xóa khi không
--- còn mapping nào trỏ tới.
--- FK ON UPDATE CASCADE (id là content-hash nhưng fresh = stable, CASCADE
--- defensive cho trường hợp future rebuild).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS clicks_to_file (
     click_id   TEXT    NOT NULL,
@@ -83,7 +74,6 @@ CREATE INDEX IF NOT EXISTS idx_fb_ads_to_file_file  ON fb_ads_to_file(file_id);
 
 -- =============================================================
 -- raw_shopee_clicks — 1 row/click từ WebsiteClickReport.
--- PK = click_id (natural key từ CSV, stable cross-device).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS raw_shopee_clicks (
     click_id         TEXT PRIMARY KEY,
@@ -98,7 +88,7 @@ CREATE TABLE IF NOT EXISTS raw_shopee_clicks (
     referrer         TEXT,
     day_date         TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
     source_file_id   INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
-    shopee_account_id INTEGER                -- informal ref, nullable
+    shopee_account_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_clicks_day        ON raw_shopee_clicks(day_date);
@@ -107,8 +97,8 @@ CREATE INDEX IF NOT EXISTS idx_clicks_day_subid  ON raw_shopee_clicks(day_date, 
 CREATE INDEX IF NOT EXISTS idx_clicks_account    ON raw_shopee_clicks(shopee_account_id, day_date);
 
 -- =============================================================
--- raw_shopee_order_items — 1 row/item. id = content_id(checkout_id, item_id, model_id).
--- UNIQUE(checkout_id, item_id, model_id) → ON CONFLICT DO UPDATE (status/price mới nhất).
+-- raw_shopee_order_items — 1 row/item.
+-- id = content_id(checkout_id, item_id, model_id).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS raw_shopee_order_items (
     id                     INTEGER PRIMARY KEY,
@@ -131,10 +121,10 @@ CREATE TABLE IF NOT EXISTS raw_shopee_order_items (
     quantity               INTEGER,
     order_value            REAL,
     refund_amount          REAL,
-    net_commission         REAL,              -- Hoa hồng ròng affiliate nhận (CSV col 37)
-    commission_total       REAL,              -- Tổng hoa hồng sản phẩm (CSV col 28, tra cứu)
-    order_commission_total REAL,              -- Tổng hoa hồng đơn hàng (CSV col 31, pre-MCN)
-    mcn_fee                REAL,              -- Phí quản lý MCN (CSV col 35)
+    net_commission         REAL,
+    commission_total       REAL,
+    order_commission_total REAL,
+    mcn_fee                REAL,
     sub_id1                TEXT NOT NULL DEFAULT '',
     sub_id2                TEXT NOT NULL DEFAULT '',
     sub_id3                TEXT NOT NULL DEFAULT '',
@@ -143,7 +133,7 @@ CREATE TABLE IF NOT EXISTS raw_shopee_order_items (
     channel                TEXT,
     day_date               TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
     source_file_id         INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
-    shopee_account_id      INTEGER,            -- nullable
+    shopee_account_id      INTEGER,
     UNIQUE(checkout_id, item_id, model_id)
 );
 
@@ -155,13 +145,12 @@ CREATE INDEX IF NOT EXISTS idx_orders_status     ON raw_shopee_order_items(order
 CREATE INDEX IF NOT EXISTS idx_orders_account    ON raw_shopee_order_items(shopee_account_id, day_date);
 
 -- =============================================================
--- raw_fb_ads — unified FB ads (campaign + ad_group). id = content_id(day, level, name).
--- clicks/cpc normalized lúc INSERT (link_* ?? all_* ?? result_*). Aggregate
--- ưu tiên level='ad_group' per sub_id tuple để tránh double-count.
+-- raw_fb_ads — unified FB ads (campaign + ad_group).
+-- id = content_id(day, level, name).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS raw_fb_ads (
     id                 INTEGER PRIMARY KEY,
-    level              TEXT NOT NULL,              -- 'campaign' | 'ad_group'
+    level              TEXT NOT NULL,
     name               TEXT NOT NULL,
     sub_id1            TEXT NOT NULL DEFAULT '',
     sub_id2            TEXT NOT NULL DEFAULT '',
@@ -176,10 +165,6 @@ CREATE TABLE IF NOT EXISTS raw_fb_ads (
     cpc                REAL,
     impressions        INTEGER,
     reach              INTEGER,
-    -- Thuế % gắn cho file FB lúc import (TK Việt Nam VAT/business tax). Spend
-    -- raw từ FB report là pre-tax; query time nhân (1 + tax_rate/100.0) ra cost
-    -- thật. Default 0 = không tax. UPSERT: re-import file cùng (day, level,
-    -- name) với tax_rate khác → đè giá trị mới (latest file thắng).
     tax_rate           REAL NOT NULL DEFAULT 0,
     day_date           TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
     source_file_id     INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
@@ -192,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_fb_ads_subid      ON raw_fb_ads(sub_id1, sub_id2,
 CREATE INDEX IF NOT EXISTS idx_fb_ads_day_subid  ON raw_fb_ads(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
 
 -- =============================================================
--- manual_entries — user nhập tay/override. Identity: (sub_id1..5, day_date).
+-- manual_entries — user nhập tay/override.
 -- =============================================================
 CREATE TABLE IF NOT EXISTS manual_entries (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,7 +196,7 @@ CREATE TABLE IF NOT EXISTS manual_entries (
     notes               TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
-    shopee_account_id   INTEGER,               -- nullable (app code set khi save)
+    shopee_account_id   INTEGER,
     UNIQUE(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date)
 );
 
@@ -219,109 +204,13 @@ CREATE INDEX IF NOT EXISTS idx_manual_day       ON manual_entries(day_date);
 CREATE INDEX IF NOT EXISTS idx_manual_account   ON manual_entries(shopee_account_id, day_date);
 
 -- =============================================================
--- tombstones — track deletion cho merge cross-device.
---   'day'           — cả ngày: entity_key = date.
---   'ui_row'        — 1 tuple sub_id: entity_key = '{day}|{s1}|...|{s5}'.
---   'manual_entry'  — chỉ manual override (không raw): same key format.
---   'imported_file' — 1 file đã import (revert): entity_key = str(file_id)
---                     (file_id = content_id deterministic cross-machine).
---   'shopee_account'— 1 account bị xóa: entity_key = str(account_id)
---                     (account_id = content_id deterministic cross-machine).
---                     Default account "Mặc định" có protection ở apply layer.
--- =============================================================
-CREATE TABLE IF NOT EXISTS tombstones (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity_type  TEXT NOT NULL CHECK (entity_type IN ('day', 'ui_row', 'manual_entry', 'imported_file', 'shopee_account')),
-    entity_key   TEXT NOT NULL,
-    deleted_at   TEXT NOT NULL,
-    UNIQUE(entity_type, entity_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tombstones_type ON tombstones(entity_type);
-
--- =============================================================
--- sync_state — singleton HLC clock + owner UID.
--- =============================================================
-CREATE TABLE IF NOT EXISTS sync_state (
-    id                   INTEGER PRIMARY KEY CHECK (id = 1),
-    owner_uid            TEXT,
-    -- HLC-lite: mutation = max(now_ms, last_known_clock_ms + 1).
-    last_known_clock_ms  INTEGER NOT NULL DEFAULT 0
-);
-
-INSERT OR IGNORE INTO sync_state (id) VALUES (1);
-
--- =============================================================
--- app_settings — key-value store cho user preferences (sync qua R2).
--- Mỗi user (DB per-user) có set keys riêng. clickSources keys dynamic theo
--- referrer thực tế user gặp (Facebook, TikTok, ...). profitFees + autoSync
--- là keys cố định. Conflict resolution: LWW theo updated_at HLC.
+-- app_settings — key-value store cho user preferences.
 -- =============================================================
 CREATE TABLE IF NOT EXISTS app_settings (
     key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,    -- JSON-encoded: '"true"', '"10.98"', '"Facebook"'
-    updated_at TEXT NOT NULL      -- HLC RFC3339 Z
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
-
--- =============================================================
--- Sync v9 tracking infrastructure.
--- =============================================================
-
--- Per-table cursor (upload + pull) cho delta sync.
--- last_full_hash: SHA-256 toàn bảng tại lần upload gần nhất, dùng cho revert
--- detection ở 4 bảng nhỏ (app_settings, manual_entries, imported_files,
--- shopee_accounts). Trước khi push, hash hiện tại == last_full_hash → skip
--- upload (state cuối window = state đầu, mọi mutation đã revert). Bảng to
--- (raw_*) luôn NULL — không hash full table vì O(N) chậm.
-CREATE TABLE IF NOT EXISTS sync_cursor_state (
-    table_name            TEXT PRIMARY KEY,
-    last_uploaded_cursor  TEXT NOT NULL DEFAULT '0',
-    last_pulled_cursor    TEXT NOT NULL DEFAULT '0',
-    last_uploaded_hash    TEXT,
-    last_full_hash        TEXT,
-    updated_at            TEXT NOT NULL
-);
-
--- Seed cursor rows cho mọi syncable table.
-INSERT OR IGNORE INTO sync_cursor_state (table_name, updated_at) VALUES
-    ('imported_files',           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('raw_shopee_clicks',        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('raw_shopee_order_items',   strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('raw_fb_ads',               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('clicks_to_file',           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('orders_to_file',           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('fb_ads_to_file',           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('manual_entries',           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('shopee_accounts',          strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('tombstones',               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('app_settings',             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-
--- Manifest state singleton (last remote etag + snapshot metadata).
-CREATE TABLE IF NOT EXISTS sync_manifest_state (
-    id                             INTEGER PRIMARY KEY CHECK (id = 1),
-    last_remote_etag               TEXT,
-    last_pulled_manifest_clock_ms  INTEGER NOT NULL DEFAULT 0,
-    last_snapshot_key              TEXT,
-    last_snapshot_clock_ms         INTEGER NOT NULL DEFAULT 0,
-    fresh_install_pending          INTEGER NOT NULL DEFAULT 0
-);
-
-INSERT OR IGNORE INTO sync_manifest_state (id) VALUES (1);
-
--- Ring buffer event log (user mutations) cho R2 flush.
-CREATE TABLE IF NOT EXISTS sync_event_log (
-    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          TEXT NOT NULL,
-    fingerprint TEXT NOT NULL,
-    kind        TEXT NOT NULL,
-    ctx_json    TEXT NOT NULL,
-    uploaded_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_sync_event_log_pending
-    ON sync_event_log(uploaded_at) WHERE uploaded_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_sync_event_log_ts   ON sync_event_log(ts);
-CREATE INDEX IF NOT EXISTS idx_sync_event_log_kind ON sync_event_log(kind);
 
 -- =============================================================
 -- Mapping cleanup triggers — DELETE raw row → DELETE mapping orphan.

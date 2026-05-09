@@ -161,4 +161,13 @@ pub struct BatchDeletePayload {
 pub struct ManualRowKey {
     pub day_date: String,
     pub sub_ids: [String; 5],
+    /// Account id của row UI bị stage delete. Khi `Some(id)`, BE sẽ scope
+    /// DELETE theo `shopee_account_id = id` cho `manual_entries` +
+    /// `raw_shopee_clicks` + `raw_shopee_order_items` để không wipe data
+    /// account khác có cùng tuple cùng ngày. `raw_fb_ads` không có cột
+    /// account_id → vẫn delete cross-account (FB attribution là derived).
+    /// `None` = "FB chung" row hoặc legacy payload — fallback delete tất cả.
+    /// Serialize as string vì content_id hash > 2^53.
+    #[serde(default, with = "id_str_opt")]
+    pub account_id: Option<i64>,
 }

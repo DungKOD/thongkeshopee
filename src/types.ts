@@ -65,10 +65,15 @@ export type UiDay = {
   totals: UiDayTotals;
 };
 
-/** Key định danh 1 row manual — dùng khi delete. */
+/** Key định danh 1 row UI bị stage delete.
+ *  `accountId`: id account row thuộc về (sau v0.4.5+ split per-account).
+ *  Khi `null` = "FB chung" row (FB ad ≥2 owner) → BE wipe cross-account.
+ *  Khi `string` = scope DELETE theo `shopee_account_id = id` ở Shopee tables
+ *  + `manual_entries` để không wipe data account khác trên cùng tuple+ngày. */
 export type ManualRowKey = {
   dayDate: string;
   subIds: SubIds;
+  accountId: string | null;
 };
 
 /** Payload INSERT/UPDATE manual entry. */

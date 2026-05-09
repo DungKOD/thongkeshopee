@@ -19,14 +19,13 @@ use crate::db::DbState;
 
 use super::{CmdError, CmdResult};
 
-/// Smoke test.
+/// Smoke test — verify DB connection mở được + bảng `days` hiện diện.
+/// Trả về `total_days_count`.
 #[tauri::command]
 pub fn db_ping(state: State<'_, DbState>) -> CmdResult<i64> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    // Ping = đếm sync_state singleton (luôn có từ schema seed). Return 1 nếu
-    // DB OK. Version không còn track (no-migration design).
     let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))?;
+        conn.query_row("SELECT COUNT(*) FROM days", [], |r| r.get(0))?;
     Ok(count)
 }
 
@@ -210,7 +209,9 @@ fn list_days_with_rows_impl(
             || totals.orders_count != 0
             || totals.commission_total != 0.0
             || totals.total_spend != 0.0
-            || totals.impressions != 0;
+            || totals.impressions != 0
+            || totals.order_value_total != 0.0
+            || totals.mcn_fee_total != 0.0;
         if rows.is_empty() && (sub_id_filter_active || !has_totals_data) {
             continue;
         }
@@ -250,20 +251,84 @@ pub(crate) fn to_canonical(s: [String; 5]) -> Canonical {
     v
 }
 
-/// `a` là prefix của `b` (bao gồm trường hợp a == b).
+/// Mode khớp tuple sub_id. Persist trong `app_settings` key `subIdMatchMode`.
+/// - `Exact`: slot-by-slot equality (default, behavior cũ). Tuple A merge với
+///   B chỉ khi A là **vec-prefix** của B (slot 0..N bằng nhau hoàn toàn).
+/// - `Substring`: bao gồm Exact PLUS substring matching trên joined canonical
+///   (case-insensitive, min 3 ký tự). Cho phép "dungcamp1" merge với "camp1"
+///   khi user đặt tên FB campaign dài hơn subid Shopee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubIdMatchMode {
+    #[default]
+    Exact,
+    Substring,
+}
+
+/// Đọc mode từ `app_settings` (key = `subIdMatchMode`, value JSON string).
+/// Default = Exact nếu key vắng mặt hoặc value lạ.
+pub(crate) fn read_sub_id_match_mode(conn: &Connection) -> SubIdMatchMode {
+    use rusqlite::OptionalExtension;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'subIdMatchMode'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    // FE persist qua JSON.stringify → string có quote: `"substring"`.
+    match raw.as_deref() {
+        Some("\"substring\"") | Some("substring") => SubIdMatchMode::Substring,
+        _ => SubIdMatchMode::Exact,
+    }
+}
+
+/// `a` là prefix của `b` (bao gồm trường hợp a == b). Slot-level equality.
 pub(crate) fn is_prefix(a: &Canonical, b: &Canonical) -> bool {
     a.len() <= b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
 }
 
+/// Bi-directional compatibility check theo mode đang chạy.
+/// - Exact: `is_prefix(a, b) || is_prefix(b, a)` (slot-level, behavior cũ).
+/// - Substring: bao gồm Exact + substring trên joined canonical
+///   (case-insensitive). Yêu cầu min 3 ký tự ở chuỗi ngắn hơn để giảm false
+///   positive cho subid quá ngắn (vd "ab" chứa trong "abc" sẽ noisy).
+pub(crate) fn is_compatible(
+    a: &Canonical,
+    b: &Canonical,
+    mode: SubIdMatchMode,
+) -> bool {
+    if is_prefix(a, b) || is_prefix(b, a) {
+        return true;
+    }
+    if mode == SubIdMatchMode::Substring {
+        let sa = a.join("-").to_lowercase();
+        let sb = b.join("-").to_lowercase();
+        if sa.is_empty() || sb.is_empty() {
+            return false;
+        }
+        let min_len = sa.len().min(sb.len());
+        if min_len < 3 {
+            return sa == sb;
+        }
+        return sa.contains(&sb) || sb.contains(&sa);
+    }
+    false
+}
+
 /// Chọn "đại diện" cho 1 canonical: ưu tiên **anchor** (canonical từ Shopee
-/// order = hoa hồng sản phẩm) mà prefix-compatible. Nếu không có anchor compatible,
-/// fallback về chính nó (giữ tuple gốc, VD FB campaign standalone).
+/// order = hoa hồng sản phẩm) mà compatible theo mode. Không có anchor
+/// compatible → fallback về chính nó (FB campaign standalone giữ tên camp).
 /// Tie-break giữa nhiều anchor: chọn dài nhất (match cụ thể nhất), rồi lex order.
-fn representative(c: &Canonical, anchors: &[Canonical]) -> Canonical {
+fn representative(
+    c: &Canonical,
+    anchors: &[Canonical],
+    mode: SubIdMatchMode,
+) -> Canonical {
     let mut best: Option<&Canonical> = None;
     for a in anchors {
-        let compatible = is_prefix(c, a) || is_prefix(a, c);
-        if !compatible {
+        if !is_compatible(c, a, mode) {
             continue;
         }
         match best {
@@ -299,6 +364,7 @@ fn aggregate_rows_for_day(
         AccountFilterMode::Account { id } => Some(*id),
         _ => None,
     };
+    let match_mode = read_sub_id_match_mode(conn);
     // ============================================================
     // Phase 1: load raw data từ 5 nguồn, giữ canonical tuple.
     // ============================================================
@@ -582,14 +648,29 @@ fn aggregate_rows_for_day(
             .collect()
     };
 
-    let resolve = |c: &Canonical| representative(c, &anchors);
+    let resolve = |c: &Canonical| representative(c, &anchors, match_mode);
+
+    // Lookup Mặc định id 1 lần per query (sau v13 không còn = 1). Cần TRƯỚC
+    // build owners_for_day để normalize raw acc_id=0 (legacy NULL) thành
+    // default_id ngay khi insert vào set.
+    let default_id = default_account_id_lookup(conn);
 
     // Build owners_for_day dùng resolve() — rep của (canonical, account_id)
     // từ raw_owner_pairs → set of account_ids.
+    //
+    // Normalize: raw acc_id=0 (Shopee row có shopee_account_id IS NULL —
+    // legacy/orphan) phải quy về default_id để filter=Account(Mặc định) match
+    // được. Nếu giữ 0 trong set, `set.contains(default_id)` trả false → FB
+    // attribute cho Mặc định bị filter out sai.
     let owners_for_day: HashMap<Canonical, HashSet<i64>> = {
         let mut map: HashMap<Canonical, HashSet<i64>> = HashMap::new();
         for (canon, acc_id) in &raw_owner_pairs {
-            map.entry(resolve(canon)).or_default().insert(*acc_id);
+            let normalized = if *acc_id == 0 {
+                default_id.unwrap_or(0)
+            } else {
+                *acc_id
+            };
+            map.entry(resolve(canon)).or_default().insert(normalized);
         }
         map
     };
@@ -598,9 +679,6 @@ fn aggregate_rows_for_day(
     // - All: giữ hết
     // - Account(X) X != Mặc định: giữ nếu owners[resolve(fb)] chứa X
     // - Account(Mặc định): giữ nếu no owner HOẶC owner chứa id Mặc định (catch-all)
-    //
-    // Lookup Mặc định id 1 lần per query (sau v13 không còn = 1).
-    let default_id = default_account_id_lookup(conn);
     fb_ads.retain(|ad| {
         let rep = resolve(&ad.canonical);
         let owners = owners_for_day.get(&rep);
@@ -1089,6 +1167,7 @@ pub fn get_order_items_for_row(
 ) -> CmdResult<Vec<OrderItemDetail>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let target_canonical = to_canonical(sub_ids);
+    let match_mode = read_sub_id_match_mode(&conn);
 
     let account_id_filter: Option<i64> = account_id
         .as_deref()
@@ -1150,23 +1229,23 @@ pub fn get_order_items_for_row(
     for row in iter {
         let item = row?;
         let item_canonical = to_canonical(item.sub_ids.clone());
-        // Prefix-compatible: 1 là prefix của cái còn lại.
-        if is_prefix(&item_canonical, &target_canonical)
-            || is_prefix(&target_canonical, &item_canonical)
-        {
+        if is_compatible(&item_canonical, &target_canonical, match_mode) {
             out.push(item);
         }
     }
     Ok(out)
 }
 
-/// Test xem 1 row có match sub_ids filter không — dùng prefix-compatible
-/// rule (cùng logic `get_order_items_for_row`): canonical của row là prefix
-/// của target HOẶC ngược lại.
-fn sub_ids_match(row: &[String; 5], target: &[String; 5]) -> bool {
+/// Test xem 1 row có match sub_ids filter không — dùng `is_compatible` theo
+/// mode hiện tại (cùng logic UI aggregate đang chạy).
+fn sub_ids_match(
+    row: &[String; 5],
+    target: &[String; 5],
+    mode: SubIdMatchMode,
+) -> bool {
     let row_canon = to_canonical(row.clone());
     let target_canon = to_canonical(target.clone());
-    is_prefix(&row_canon, &target_canon) || is_prefix(&target_canon, &row_canon)
+    is_compatible(&row_canon, &target_canon, mode)
 }
 
 /// Phân bố đơn theo giờ trong ngày (0-23) — aggregate toàn bộ orders trong
@@ -1191,6 +1270,7 @@ pub fn load_hourly_orders(
 ) -> CmdResult<Vec<HourlyOrderBucket>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let f = filter.unwrap_or_default();
+    let match_mode = read_sub_id_match_mode(&conn);
 
     // 2 paths: aggregate SQL-native (fast) khi không filter sub_ids, hoặc
     // scan-and-aggregate per-row (filter prefix-match) khi có sub_ids.
@@ -1287,7 +1367,7 @@ pub fn load_hourly_orders(
         ))
     })? {
         let (order_id, hour, ov, comm, subs) = row?;
-        if !sub_ids_match(&subs, &target) {
+        if !sub_ids_match(&subs, &target, match_mode) {
             continue;
         }
         let idx = hour.clamp(0, 23) as usize;
@@ -1345,6 +1425,7 @@ pub fn load_hourly_clicks(
 ) -> CmdResult<Vec<HourlyClickBucket>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let f = filter.unwrap_or_default();
+    let match_mode = read_sub_id_match_mode(&conn);
 
     // SQL-native path nếu không filter sub_ids. Có sub_ids → query row level
     // + post-filter bằng prefix match.
@@ -1437,7 +1518,7 @@ pub fn load_hourly_clicks(
         ))
     })? {
         let (hour, subs) = row?;
-        if !sub_ids_match(&subs, &target) {
+        if !sub_ids_match(&subs, &target, match_mode) {
             continue;
         }
         let idx = hour.clamp(0, 23) as usize;
@@ -1479,6 +1560,7 @@ pub fn load_referrer_efficiency(
 ) -> CmdResult<Vec<ReferrerEfficiency>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let f = filter.unwrap_or_default();
+    let match_mode = read_sub_id_match_mode(&conn);
 
     // Build WHERE cho shopee_clicks filter.
     let mut where_clicks = String::from(" WHERE 1=1");
@@ -1583,7 +1665,7 @@ pub fn load_referrer_efficiency(
         std::collections::HashMap::new();
     for (key, referrer_clicks) in clicks_by_key {
         if let Some(target) = target_sub_ids.as_ref() {
-            if !sub_ids_match(&key.1, target) {
+            if !sub_ids_match(&key.1, target, match_mode) {
                 continue;
             }
         }
@@ -1653,6 +1735,7 @@ pub fn load_click_order_delays(
 ) -> CmdResult<Vec<ClickOrderDelayBucket>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let f = filter.unwrap_or_default();
+    let match_mode = read_sub_id_match_mode(&conn);
 
     // Compute delay seconds. Null click_time → bucket 'no_click'.
     // Query sub_id columns để filter prefix-match khi f.sub_ids provided.
@@ -1702,7 +1785,7 @@ pub fn load_click_order_delays(
     })? {
         let (order_id, click_time, order_time, subs) = row?;
         if let Some(t) = target.as_ref() {
-            if !sub_ids_match(&subs, t) {
+            if !sub_ids_match(&subs, t, match_mode) {
                 continue;
             }
         }
@@ -1818,11 +1901,11 @@ mod tests {
         let anchors = vec![order.clone()];
 
         // FB [Muse, aoto, 0412] → anchor [Muse, aoto] (order) → rep = order
-        assert_eq!(representative(&fb_with_date, &anchors), order);
+        assert_eq!(representative(&fb_with_date, &anchors, SubIdMatchMode::Exact), order);
         // Order itself → anchor matches self → rep = self
-        assert_eq!(representative(&order, &anchors), order);
+        assert_eq!(representative(&order, &anchors, SubIdMatchMode::Exact), order);
         // FB [dammaxi] không có anchor compatible → rep = self (fallback tên camp)
-        assert_eq!(representative(&fb_other, &anchors), fb_other);
+        assert_eq!(representative(&fb_other, &anchors, SubIdMatchMode::Exact), fb_other);
     }
 
     #[test]
@@ -1830,7 +1913,7 @@ mod tests {
         let fb: Canonical = vec!["abc".into(), "def".into(), "0412".into()];
         // Không có anchor (không có Shopee order nào cho day này)
         let anchors: Vec<Canonical> = vec![];
-        assert_eq!(representative(&fb, &anchors), fb);
+        assert_eq!(representative(&fb, &anchors, SubIdMatchMode::Exact), fb);
     }
 
     #[test]
@@ -1842,7 +1925,71 @@ mod tests {
 
         let anchors = vec![short.clone(), long.clone()];
         // FB [A, B, C] compatible với cả 2 anchor → pick anchor dài nhất = [A, B]
-        assert_eq!(representative(&fb, &anchors), long);
+        assert_eq!(representative(&fb, &anchors, SubIdMatchMode::Exact), long);
+    }
+
+    // =====================================================================
+    // SubIdMatchMode::Substring — joined canonical case-insensitive contains.
+    // =====================================================================
+
+    #[test]
+    fn substring_mode_dungcamp1_matches_camp1() {
+        let shopee: Canonical = vec!["dungcamp1".into()];
+        let fb: Canonical = vec!["camp1".into()];
+        // Exact: tuple position 0 khác → không match.
+        assert!(!is_compatible(&shopee, &fb, SubIdMatchMode::Exact));
+        // Substring: "dungcamp1".contains("camp1") → match.
+        assert!(is_compatible(&shopee, &fb, SubIdMatchMode::Substring));
+        assert!(is_compatible(&fb, &shopee, SubIdMatchMode::Substring));
+    }
+
+    #[test]
+    fn substring_mode_case_insensitive() {
+        let a: Canonical = vec!["MuseStudio".into()];
+        let b: Canonical = vec!["studio".into()];
+        // Slot equality fails ("MuseStudio" != "studio").
+        assert!(!is_compatible(&a, &b, SubIdMatchMode::Exact));
+        // Substring case-insensitive matches.
+        assert!(is_compatible(&a, &b, SubIdMatchMode::Substring));
+    }
+
+    #[test]
+    fn substring_mode_min_3_chars_guard() {
+        // "ab" và "abc" — short side dài 2 < 3 → fallback equality → không match.
+        let a: Canonical = vec!["ab".into()];
+        let b: Canonical = vec!["abc".into()];
+        assert!(!is_compatible(&a, &b, SubIdMatchMode::Substring));
+        // Cùng length 2 và bằng nhau → match (equality).
+        let c: Canonical = vec!["ab".into()];
+        assert!(is_compatible(&a, &c, SubIdMatchMode::Substring));
+    }
+
+    #[test]
+    fn substring_mode_anchor_resolution() {
+        // FB "camp1" với anchor Shopee "dungcamp1" — substring mode merge.
+        let anchor: Canonical = vec!["dungcamp1".into()];
+        let fb: Canonical = vec!["camp1".into()];
+        let anchors = vec![anchor.clone()];
+        // Exact: không merge — fallback rep = self.
+        assert_eq!(representative(&fb, &anchors, SubIdMatchMode::Exact), fb);
+        // Substring: merge về anchor dài hơn = "dungcamp1".
+        assert_eq!(
+            representative(&fb, &anchors, SubIdMatchMode::Substring),
+            anchor
+        );
+    }
+
+    #[test]
+    fn substring_mode_preserves_exact_behavior_when_compatible() {
+        // Khi tuple đã prefix-compatible (Exact match), Substring KHÔNG thay
+        // đổi kết quả — superset semantics.
+        let order: Canonical = vec!["Muse".into(), "aoto".into()];
+        let fb: Canonical = vec!["Muse".into(), "aoto".into(), "0412".into()];
+        let anchors = vec![order.clone()];
+        assert_eq!(
+            representative(&fb, &anchors, SubIdMatchMode::Exact),
+            representative(&fb, &anchors, SubIdMatchMode::Substring)
+        );
     }
 
     // ========================================================================

@@ -156,23 +156,19 @@ export function AccountProvider({ children }: AccountProviderProps) {
 
   const defaultAccountId = accounts?.find(isDefaultAccount)?.id ?? null;
 
-  // CRITICAL phân quyền: user UID đổi → CLEAR state ngay (không giữ list
-  // account + filter của user cũ). KHÔNG tự refresh ở đây vì race với
-  // `switch_db_to_user`: AccountContext effect fire NGAY khi authUid đổi,
-  // nhưng DbState còn trỏ vào user cũ cho đến khi switch_db_to_user xong →
-  // refresh ở đây đọc DB CŨ, hiện list sai.
-  //
-  // Refresh thực sự do `useCloudSync.onRemoteApplied` trigger SAU khi switch
-  // hoàn tất (xem App.tsx `onRemoteApplied` callback).
-  //
-  // Filter: load từ localStorage cho uid mới (per-uid storage). Mỗi user có
-  // filter riêng — switch user A→B sẽ load filter của B, không leak filter
-  // của A. Logout (uid=null) reset về "all".
+  // User UID đổi: CLEAR state cũ → load filter từ localStorage uid mới →
+  // refetch list từ DB. Sau khi cloud-sync stack bị bóc, app chỉ còn 1 DB
+  // local nên không còn race với switch_db_to_user — refresh ngay an toàn.
+  // Logout (uid=null) reset về "all" và bỏ qua refresh (DB vẫn có data nhưng
+  // UI sẽ chuyển sang LoginScreen, không cần list).
   useEffect(() => {
     setAccounts(null);
     setFilterState(loadAccountFilter(uid));
     setActiveAccountId(null);
-  }, [uid]);
+    if (uid) {
+      void refresh();
+    }
+  }, [uid, refresh]);
 
   return (
     <AccountContext.Provider

@@ -170,7 +170,6 @@ export function computeOverviewTotals(
   fees: ProfitFees,
   source: SourceFilter = "all",
 ): OverviewTotals {
-  const includeAds = source === "all";
   const acc: OverviewTotals = {
     clicks: 0,
     shopeeClicks: 0,
@@ -189,46 +188,66 @@ export function computeOverviewTotals(
   };
   for (const day of days) {
     const t = day.totals;
-    const spend = includeAds ? t.totalSpend : 0;
-    const adsClicks = includeAds ? t.adsClicks : 0;
-    const impr = includeAds ? t.impressions : 0;
-    // Dùng computeNetCommission trên day.totals (pre row-0 filter) — KPI
-    // accurate kể cả khi có tuple click-only bị filter.
-    const net = computeNetCommission(
-      t.commissionTotal,
-      t.commissionPending,
-      fees,
-    );
-    // 1 pass qua shopeeClicksByReferrer: vừa accumulate total filtered clicks,
-    // vừa merge vào breakdown. Trước đây 2 pass (sumFiltered + loop) — kết quả
-    // giống hệt, loop này nhanh hơn micro.
-    let shopeeClicksFiltered = 0;
-    for (const [ref, n] of Object.entries(t.shopeeClicksByReferrer)) {
-      if (clickSources[ref] === false) continue;
-      shopeeClicksFiltered += n;
-      acc.clicksByReferrer[ref] = (acc.clicksByReferrer[ref] ?? 0) + n;
+    // source="all": dùng day.totals (BE pre-filter, KPI 100% raw kể cả tuple
+    //   click-only bị row-0 filter).
+    // source="shopee_only": day.totals chứa cả FB-only/manual-only contribution
+    //   → phải sum từ rows (post row-0 filter) qua predicate `rowMatchesSource`.
+    //   Trade-off: miss tuple click-only không-Shopee, nhưng tuple click-only
+    //   không-Shopee không tồn tại theo định nghĩa "chỉ Shopee".
+    if (source === "all") {
+      const net = computeNetCommission(
+        t.commissionTotal,
+        t.commissionPending,
+        fees,
+      );
+      let shopeeClicksFiltered = 0;
+      for (const [ref, n] of Object.entries(t.shopeeClicksByReferrer)) {
+        if (clickSources[ref] === false) continue;
+        shopeeClicksFiltered += n;
+        acc.clicksByReferrer[ref] = (acc.clicksByReferrer[ref] ?? 0) + n;
+      }
+      acc.clicks += t.adsClicks;
+      acc.shopeeClicks += shopeeClicksFiltered;
+      acc.totalSpend += t.totalSpend;
+      acc.impressions += t.impressions;
+      acc.orders += t.ordersCount;
+      acc.commission += t.commissionTotal;
+      acc.netCommission += net;
+      acc.profit += net - t.totalSpend;
+      acc.orderValueTotal += t.orderValueTotal;
+      acc.mcnFeeTotal += t.mcnFeeTotal;
+      acc.commissionPending += t.commissionPending;
+    } else {
+      // shopee_only: bỏ ads (spend=0, adsClicks=0, impressions=0) + sum
+      //   commission/orders/orderValue qua từng UiRow phù hợp predicate.
+      for (const r of day.rows) {
+        if (!rowMatchesSource(r, source)) continue;
+        const net = computeNetCommission(r.commissionTotal, r.commissionPending, fees);
+        let rowShopeeClicks = 0;
+        for (const [ref, n] of Object.entries(r.shopeeClicksByReferrer)) {
+          if (clickSources[ref] === false) continue;
+          rowShopeeClicks += n;
+          acc.clicksByReferrer[ref] = (acc.clicksByReferrer[ref] ?? 0) + n;
+        }
+        acc.shopeeClicks += rowShopeeClicks;
+        acc.orders += r.ordersCount;
+        acc.commission += r.commissionTotal;
+        acc.commissionPending += r.commissionPending;
+        acc.netCommission += net;
+        acc.profit += net;
+        acc.orderValueTotal += r.orderValueTotal;
+      }
     }
-    acc.clicks += adsClicks;
-    acc.shopeeClicks += shopeeClicksFiltered;
-    acc.totalSpend += spend;
-    acc.impressions += impr;
-    acc.orders += t.ordersCount;
-    acc.commission += t.commissionTotal;
-    acc.netCommission += net;
-    acc.profit += net - spend;
-    acc.orderValueTotal += t.orderValueTotal;
-    acc.mcnFeeTotal += t.mcnFeeTotal;
-    acc.commissionPending += t.commissionPending;
 
-    // daysCount/rowsCount vẫn dựa vào row-level vì là metrics hiển thị UI.
+    // daysCount/rowsCount: row-level. Khi source=all + mọi row bị filter row-0
+    // ở BE nhưng day vẫn có data raw → count day theo totals raw để KPI khớp.
     let dayContributed = false;
     for (const r of day.rows) {
       if (!rowMatchesSource(r, source)) continue;
       acc.rowsCount += 1;
       dayContributed = true;
     }
-    // Nếu day có data từ raw (totals != 0) nhưng mọi row bị filter → vẫn count.
-    if (!dayContributed) {
+    if (!dayContributed && source === "all") {
       const hasAnyData =
         t.adsClicks > 0 ||
         t.shopeeClicksTotal > 0 ||

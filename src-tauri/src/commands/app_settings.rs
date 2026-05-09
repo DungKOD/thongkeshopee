@@ -17,9 +17,8 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::db::DbState;
-use crate::sync_v9::hlc::next_hlc_rfc3339;
-use super::{assert_not_bootstrapping, CmdError, CmdResult};
+use crate::db::{now_rfc3339_z, DbState};
+use super::{CmdError, CmdResult};
 
 /// Pair (key, value) cho list endpoint. Camel case ở serialize.
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,10 +83,8 @@ pub fn set_app_setting(
     if key.is_empty() {
         return Err(CmdError::msg("app_setting key không được rỗng"));
     }
-    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    assert_not_bootstrapping(&conn)?;
-    let tx = conn.transaction()?;
-    let existing: Option<String> = tx
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let existing: Option<String> = conn
         .query_row(
             "SELECT value FROM app_settings WHERE key = ?",
             [&key],
@@ -97,8 +94,8 @@ pub fn set_app_setting(
     if existing.as_deref() == Some(value.as_str()) {
         return Ok(false);
     }
-    let now = next_hlc_rfc3339(&tx)?;
-    tx.execute(
+    let now = now_rfc3339_z();
+    conn.execute(
         "INSERT INTO app_settings (key, value, updated_at)
          VALUES (?, ?, ?)
          ON CONFLICT(key) DO UPDATE SET
@@ -106,7 +103,6 @@ pub fn set_app_setting(
             updated_at = excluded.updated_at",
         params![key, value, now],
     )?;
-    tx.commit()?;
     Ok(true)
 }
 
@@ -121,9 +117,8 @@ pub fn set_app_settings_bulk(
         return Ok(());
     }
     let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    assert_not_bootstrapping(&conn)?;
     let tx = conn.transaction()?;
-    let now = next_hlc_rfc3339(&tx)?;
+    let now = now_rfc3339_z();
     {
         let mut stmt = tx.prepare(
             "INSERT INTO app_settings (key, value, updated_at)
@@ -156,7 +151,7 @@ mod tests {
 
     /// Direct UPSERT helper — bypass Tauri State. Tests low-level SQL.
     fn upsert(conn: &Connection, key: &str, value: &str) {
-        let tx_now = next_hlc_rfc3339(conn).unwrap();
+        let tx_now = now_rfc3339_z();
         conn.execute(
             "INSERT INTO app_settings (key, value, updated_at)
              VALUES (?, ?, ?)
@@ -192,20 +187,6 @@ mod tests {
         upsert(&conn, "auto_sync_enabled", "true");
         upsert(&conn, "auto_sync_enabled", "false");
         assert_eq!(read(&conn, "auto_sync_enabled"), Some("false".to_string()));
-    }
-
-    #[test]
-    fn upsert_updated_at_monotonic() {
-        let conn = fresh_db();
-        upsert(&conn, "k", "v1");
-        let t1: String = conn.query_row(
-            "SELECT updated_at FROM app_settings WHERE key = 'k'", [], |r| r.get(0),
-        ).unwrap();
-        upsert(&conn, "k", "v2");
-        let t2: String = conn.query_row(
-            "SELECT updated_at FROM app_settings WHERE key = 'k'", [], |r| r.get(0),
-        ).unwrap();
-        assert!(t2 > t1, "HLC monotonic: t2 ({t2}) phải > t1 ({t1})");
     }
 
     #[test]
