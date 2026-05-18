@@ -29,3 +29,13 @@ export function listImportedFiles(): Promise<ImportedFileInfo[]> {
 export function revertImport(fileId: number): Promise<RevertResult> {
   return invoke<RevertResult>("revert_import", { fileId });
 }
+
+/** Xóa 1 entry lịch sử đã hoàn tác khỏi danh sách. */
+export function deleteImportHistoryEntry(fileId: number): Promise<void> {
+  return invoke<void>("delete_import_history_entry", { fileId });
+}
+
+/** Xóa tất cả entries đã hoàn tác. Trả về số dòng đã xóa. */
+export function deleteAllRevertedHistory(): Promise<number> {
+  return invoke<number>("delete_all_reverted_history");
+}

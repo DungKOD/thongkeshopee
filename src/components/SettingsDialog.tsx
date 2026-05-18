@@ -7,6 +7,7 @@ import type {
   SubIdMatchMode,
 } from "../hooks/useSettings";
 import { ImportHistorySection } from "./ImportHistorySection";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { invoke } from "../lib/tauri";
 
 interface AppDataPaths {
@@ -82,6 +83,21 @@ export function SettingsDialog({
     }
   }, [isOpen]);
 
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+  const [clearing, setClearing] = useState(false);
+
+  const handleClearData = async () => {
+    setClearConfirmOpen(false);
+    setClearing(true);
+    try {
+      await invoke("clear_app_data");
+      window.location.reload();
+    } catch (e) {
+      console.error("[clear_app_data]", e);
+      setClearing(false);
+    }
+  };
+
   if (!isOpen) return null;
 
   const sources = Object.entries(settings.clickSources).sort((a, b) =>
@@ -92,7 +108,9 @@ export function SettingsDialog({
     if (e.target === e.currentTarget) onClose();
   };
 
-  return createPortal(
+  return (
+    <>
+    {createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onMouseDown={handleBackdropMouseDown}
@@ -384,6 +402,33 @@ export function SettingsDialog({
             ) : null}
           </section>
 
+          <section>
+            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+              <span className="material-symbols-rounded text-base text-red-400">
+                delete_forever
+              </span>
+              Xóa dữ liệu
+            </h3>
+            <div className="rounded-xl border border-red-500/25 bg-red-950/15 px-4 py-3">
+              <p className="mb-3 text-xs text-white/60">
+                Xóa toàn bộ dữ liệu thống kê (đơn hàng, click, FB ads, cài
+                đặt, lịch sử import). <b className="text-white/80">Giữ lại</b>{" "}
+                trạng thái đăng nhập. App sẽ tự khởi động lại.
+              </p>
+              <button
+                type="button"
+                onClick={() => setClearConfirmOpen(true)}
+                disabled={clearing}
+                className="btn-ripple flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <span className="material-symbols-rounded text-base">
+                  {clearing ? "hourglass_empty" : "delete_forever"}
+                </span>
+                {clearing ? "Đang xóa và khởi động lại…" : "Xóa tất cả dữ liệu"}
+              </button>
+            </div>
+          </section>
+
           {/* App info — version + build metadata. Cuối Settings làm footer info. */}
           <section className="rounded-xl border border-surface-8 bg-surface-1 px-4 py-3">
             <div className="flex items-center justify-between text-xs text-white/60">
@@ -403,6 +448,18 @@ export function SettingsDialog({
       </div>
     </div>,
     document.body,
+    )}
+    <ConfirmDialog
+      isOpen={clearConfirmOpen}
+      title="Xóa toàn bộ dữ liệu?"
+      message="Hành động này xóa vĩnh viễn tất cả đơn hàng, click, FB ads, lịch sử import và cài đặt. Không thể hoàn tác. Tài khoản đăng nhập sẽ được giữ lại."
+      confirmLabel="Xóa & Khởi động lại"
+      cancelLabel="Hủy"
+      danger
+      onConfirm={handleClearData}
+      onClose={() => setClearConfirmOpen(false)}
+    />
+    </>
   );
 }
 

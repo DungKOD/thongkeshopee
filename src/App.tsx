@@ -25,6 +25,7 @@ import { SettingsProvider, useSettings } from "./hooks/useSettings";
 import { useToast } from "./components/ToastProvider";
 import { commitCsvBatch, previewCsvBatch } from "./lib/dbImport";
 import type { PreviewBatch } from "./lib/dbImport";
+import { FbHierarchyImportDialog } from "./components/FbHierarchyImportDialog";
 import type { UiRow } from "./types";
 import { fmtDate, fmtInt } from "./formulas";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
@@ -179,6 +180,7 @@ function AppInner() {
   const [importAccountId, setImportAccountId] = useState<string | null>(null);
   const [accountPickerOpen, setAccountPickerOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [fbHierarchyOpen, setFbHierarchyOpen] = useState(false);
 
   const handleImportClick = () => setAccountPickerOpen(true);
 
@@ -421,15 +423,28 @@ function AppInner() {
             </button>
             <UserMenu onRequestSignOut={() => void authSignOut()} />
             {activeTab === "stats" && (
-              <button
-                onClick={handleImportClick}
-                className="btn-ripple flex items-center gap-2 rounded-lg border border-white/50 px-4 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
-              >
-                <span className="material-symbols-rounded text-base">
-                  upload_file
-                </span>
-                Import CSV
-              </button>
+              <>
+                <button
+                  onClick={() => setFbHierarchyOpen(true)}
+                  className="btn-ripple flex items-center gap-2 rounded-lg border border-violet-500/60 px-3 py-2 text-sm font-medium text-violet-300 hover:bg-violet-500/10 active:bg-violet-500/20"
+                  title="Import FB Ads — CSV hoặc Excel (.xlsx). Format 3 cấp: chiến dịch → nhóm → quảng cáo."
+                >
+                  <span className="material-symbols-rounded text-base">
+                    campaign
+                  </span>
+                  Import FB
+                </button>
+                <button
+                  onClick={handleImportClick}
+                  className="btn-ripple flex items-center gap-2 rounded-lg border border-white/50 px-4 py-2 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
+                  title="Import Shopee — CSV click hoặc hoa hồng"
+                >
+                  <span className="material-symbols-rounded text-base">
+                    upload_file
+                  </span>
+                  Import Shopee
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -829,6 +844,14 @@ function AppInner() {
         isOpen={accountPickerOpen}
         onPick={handleAccountPicked}
         onClose={() => setAccountPickerOpen(false)}
+      />
+
+      <FbHierarchyImportDialog
+        isOpen={fbHierarchyOpen}
+        onClose={() => setFbHierarchyOpen(false)}
+        onImported={() => {
+          void refetch();
+        }}
       />
 
       <ImportPreviewDialog

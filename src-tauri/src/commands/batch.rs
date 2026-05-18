@@ -105,6 +105,15 @@ pub fn batch_commit_deletes(
                 None,
                 match_mode,
             )?;
+            // Bảng mới: cùng cross-account behavior (không có cột account_id).
+            rows_deleted += delete_prefix_compatible_scoped(
+                &tx,
+                "raw_fb_ads_hierarchy",
+                &row.day_date,
+                &target,
+                None,
+                match_mode,
+            )?;
         }
     }
 
@@ -114,6 +123,7 @@ pub fn batch_commit_deletes(
             SELECT day_date FROM raw_shopee_clicks UNION
             SELECT day_date FROM raw_shopee_order_items UNION
             SELECT day_date FROM raw_fb_ads UNION
+            SELECT day_date FROM raw_fb_ads_hierarchy UNION
             SELECT day_date FROM manual_entries
          )",
         [],
@@ -142,7 +152,8 @@ pub fn batch_commit_deletes(
                AND id NOT IN (
                    SELECT file_id FROM clicks_to_file UNION
                    SELECT file_id FROM orders_to_file UNION
-                   SELECT file_id FROM fb_ads_to_file
+                   SELECT file_id FROM fb_ads_to_file UNION
+                   SELECT file_id FROM fb_ads_hier_to_file
                )",
         )?;
         let iter = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?;
@@ -339,6 +350,10 @@ pub fn revert_import(
         "DELETE FROM fb_ads_to_file WHERE file_id = ?",
         params![file_id],
     )?;
+    tx.execute(
+        "DELETE FROM fb_ads_hier_to_file WHERE file_id = ?",
+        params![file_id],
+    )?;
 
     // 2. Xóa raw rows orphan — không còn file active nào link.
     //    File trùng data với file X (cùng raw row) sẽ có mapping riêng → raw rows
@@ -358,6 +373,12 @@ pub fn revert_import(
          WHERE id NOT IN (SELECT fb_ad_id FROM fb_ads_to_file)",
         [],
     )? as i64;
+    // Hierarchy bảng mới — cùng pattern, mapping riêng.
+    let _fb_ads_hier_deleted = tx.execute(
+        "DELETE FROM raw_fb_ads_hierarchy
+         WHERE id NOT IN (SELECT fb_ad_id FROM fb_ads_hier_to_file)",
+        [],
+    )? as i64;
 
     // 3. Cleanup days orphan (không còn raw/manual nào).
     let days_deleted = tx.execute(
@@ -365,6 +386,7 @@ pub fn revert_import(
             SELECT day_date FROM raw_shopee_clicks UNION
             SELECT day_date FROM raw_shopee_order_items UNION
             SELECT day_date FROM raw_fb_ads UNION
+            SELECT day_date FROM raw_fb_ads_hierarchy UNION
             SELECT day_date FROM manual_entries
          )",
         [],
@@ -418,4 +440,37 @@ pub struct RevertResult {
     pub orders_deleted: i64,
     pub fb_ads_deleted: i64,
     pub days_deleted: i64,
+}
+
+/// Xóa 1 entry lịch sử import khỏi `imported_files`.
+/// Chỉ cho phép xóa entry đã hoàn tác (`reverted_at IS NOT NULL`) — data raw
+/// đã được dọn bởi `revert_import`, thao tác này chỉ dọn log lịch sử.
+#[tauri::command]
+pub fn delete_import_history_entry(
+    state: State<'_, DbState>,
+    file_id: i64,
+) -> CmdResult<()> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let affected = conn.execute(
+        "DELETE FROM imported_files WHERE id = ? AND reverted_at IS NOT NULL",
+        params![file_id],
+    )?;
+    if affected == 0 {
+        return Err(CmdError::msg(
+            "Không tìm thấy entry hoặc entry chưa hoàn tác — chỉ xóa được entry đã hoàn tác."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Xóa tất cả entries lịch sử đã hoàn tác. Trả về số dòng đã xóa.
+#[tauri::command]
+pub fn delete_all_reverted_history(state: State<'_, DbState>) -> CmdResult<i64> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let count = conn.execute(
+        "DELETE FROM imported_files WHERE reverted_at IS NOT NULL",
+        [],
+    )? as i64;
+    Ok(count)
 }

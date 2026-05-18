@@ -39,3 +39,24 @@ pub fn order_item_id(checkout_id: &str, item_id: &str, model_id: &str) -> i64 {
 pub fn fb_ad_id(day_date: &str, level: &str, name: &str) -> i64 {
     hash_parts(&["raw_fb_ads", day_date, level, name])
 }
+
+/// Content ID cho `raw_fb_ads_hierarchy`. Key =
+/// `(day_date, campaign_name, ad_set_name, ad_name, occurrence_idx)`.
+/// occurrence_idx phân biệt nhiều ad cùng tên trong cùng adset.
+pub fn fb_ad_hier_id(
+    day_date: &str,
+    campaign_name: &str,
+    ad_set_name: &str,
+    ad_name: &str,
+    occurrence_idx: i64,
+) -> i64 {
+    let occ = occurrence_idx.to_string();
+    hash_parts(&[
+        "raw_fb_ads_hierarchy",
+        day_date,
+        campaign_name,
+        ad_set_name,
+        ad_name,
+        &occ,
+    ])
+}

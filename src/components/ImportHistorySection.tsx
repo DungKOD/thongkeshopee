@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   listImportedFiles,
   revertImport,
+  deleteImportHistoryEntry,
+  deleteAllRevertedHistory,
   type ImportedFileInfo,
 } from "../lib/imports";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -36,6 +38,9 @@ export function ImportHistorySection({
   const [error, setError] = useState<string | null>(null);
   const [confirmFile, setConfirmFile] = useState<ImportedFileInfo | null>(null);
   const [reverting, setReverting] = useState(false);
+  const [deleteFile, setDeleteFile] = useState<ImportedFileInfo | null>(null);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -70,6 +75,35 @@ export function ImportHistorySection({
     }
   }, [confirmFile, load, onReverted]);
 
+  const handleDeleteEntry = useCallback(async () => {
+    if (!deleteFile) return;
+    setDeleting(true);
+    setError(null);
+    try {
+      await deleteImportHistoryEntry(deleteFile.id);
+      setDeleteFile(null);
+      await load();
+    } catch (e) {
+      setError(`Xóa thất bại: ${(e as Error).message}`);
+    } finally {
+      setDeleting(false);
+    }
+  }, [deleteFile, load]);
+
+  const handleDeleteAll = useCallback(async () => {
+    setDeleting(true);
+    setError(null);
+    try {
+      await deleteAllRevertedHistory();
+      setConfirmDeleteAll(false);
+      await load();
+    } catch (e) {
+      setError(`Xóa thất bại: ${(e as Error).message}`);
+    } finally {
+      setDeleting(false);
+    }
+  }, [load]);
+
   const { activeCount, revertedCount } = useMemo(() => {
     if (!files) return { activeCount: 0, revertedCount: 0 };
     let active = 0;
@@ -95,6 +129,17 @@ export function ImportHistorySection({
               <span className="text-rose-300/70">
                 {revertedCount} đã hoàn tác
               </span>
+            )}
+            {revertedCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteAll(true)}
+                className="btn-ripple flex items-center gap-1 rounded-md border border-rose-700/50 bg-rose-900/20 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-800/40"
+                title={`Xóa ${revertedCount} entry đã hoàn tác khỏi danh sách`}
+              >
+                <span className="material-symbols-rounded text-sm">delete_sweep</span>
+                Xóa đã hoàn tác
+              </button>
             )}
             <button
               type="button"
@@ -215,9 +260,19 @@ export function ImportHistorySection({
                       </td>
                       <td className="px-3 py-2 text-center">
                         {reverted ? (
-                          <span className="text-[11px] text-white/40">
-                            {fmtDateTime(f.revertedAt ?? "")}
-                          </span>
+                          <div className="flex items-center justify-center gap-2">
+                            <span className="text-[11px] text-white/40">
+                              {fmtDateTime(f.revertedAt ?? "")}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setDeleteFile(f)}
+                              className="btn-ripple flex h-6 w-6 items-center justify-center rounded-md text-white/30 hover:bg-rose-900/40 hover:text-rose-300"
+                              title="Xóa khỏi lịch sử"
+                            >
+                              <span className="material-symbols-rounded text-sm">delete</span>
+                            </button>
+                          </div>
                         ) : (
                           <button
                             type="button"
@@ -246,6 +301,42 @@ export function ImportHistorySection({
         phải hoàn tác cả 2 mới thay đổi dữ liệu. File đã hoàn tác giữ trong
         lịch sử — user có thể import lại cùng file để khôi phục.
       </p>
+
+      {/* Xóa 1 entry */}
+      <ConfirmDialog
+        isOpen={deleteFile !== null}
+        title={deleteFile ? `Xóa "${deleteFile.filename}" khỏi lịch sử?` : ""}
+        message={
+          deleteFile ? (
+            <p>
+              Entry này đã hoàn tác — data thực đã được xóa trước đó.
+              Thao tác này chỉ xóa bản ghi khỏi danh sách lịch sử.
+            </p>
+          ) : ""
+        }
+        confirmLabel={deleting ? "Đang xóa..." : "Xóa khỏi lịch sử"}
+        cancelLabel="Quay lại"
+        danger
+        onConfirm={() => void handleDeleteEntry()}
+        onClose={() => { if (!deleting) setDeleteFile(null); }}
+      />
+
+      {/* Xóa tất cả đã hoàn tác */}
+      <ConfirmDialog
+        isOpen={confirmDeleteAll}
+        title="Xóa tất cả lịch sử đã hoàn tác?"
+        message={
+          <p>
+            Sẽ xóa <b>{revertedCount} entry</b> đã hoàn tác khỏi danh sách lịch sử.
+            Data thực đã được xóa trước đó — thao tác này chỉ dọn danh sách.
+          </p>
+        }
+        confirmLabel={deleting ? "Đang xóa..." : `Xóa ${revertedCount} entry`}
+        cancelLabel="Quay lại"
+        danger
+        onConfirm={() => void handleDeleteAll()}
+        onClose={() => { if (!deleting) setConfirmDeleteAll(false); }}
+      />
 
       <ConfirmDialog
         isOpen={confirmFile !== null}

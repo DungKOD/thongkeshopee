@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "../lib/tauri";
 import type { AccountFilterMode } from "../hooks/useDbStats";
+import { useSettings } from "../hooks/useSettings";
 import { HourlyChart, type HourlyBucket } from "./HourlyChart";
 import {
   ClickDelayChart,
@@ -33,6 +34,10 @@ interface FilterInput {
 interface Props {
   /// Filter scope cho BE queries. `subIds` bắt buộc — đây là dialog per-product.
   filter: FilterInput;
+  /// Slot tuỳ chọn: render content NGAY TRƯỚC ClickDelayChart ("Thời gian
+  /// click → đặt hàng"). AggregateProductDialog dùng để chèn chart breakdown
+  /// đơn theo trạng thái vào vị trí này.
+  beforeDelayChart?: React.ReactNode;
 }
 
 /**
@@ -46,7 +51,8 @@ interface Props {
  *
  * Fetch 4 BE commands song song qua Promise.all → 1 round-trip.
  */
-export function ProductClickInsights({ filter }: Props) {
+export function ProductClickInsights({ filter, beforeDelayChart }: Props) {
+  const { settings } = useSettings();
   const [hourlyOrders, setHourlyOrders] = useState<HourlyBucket[]>([]);
   const [hourlyClicks, setHourlyClicks] = useState<HourlyBucket[]>([]);
   const [referrerEff, setReferrerEff] = useState<ReferrerEfficiency[]>([]);
@@ -139,9 +145,11 @@ export function ProductClickInsights({ filter }: Props) {
         />
       </section>
 
+      {beforeDelayChart}
+
       <ClickDelayChart data={delays} />
 
-      <ReferrerEfficiencyTable rows={referrerEff} />
+      <ReferrerEfficiencyTable rows={referrerEff} fees={settings.profitFees} />
     </div>
   );
 }

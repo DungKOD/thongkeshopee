@@ -14,7 +14,9 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::db::types::{UiDay, UiRow};
+use crate::db::types::{
+    FbAdLeaf, FbAdSetGroup, FbBreakdown, FbCampaignGroup, UiDay, UiRow,
+};
 use crate::db::DbState;
 
 use super::{CmdError, CmdResult};
@@ -143,6 +145,7 @@ fn list_days_with_rows_impl(
          EXISTS (SELECT 1 FROM raw_shopee_clicks WHERE day_date = days.date) \
          OR EXISTS (SELECT 1 FROM raw_shopee_order_items WHERE day_date = days.date) \
          OR EXISTS (SELECT 1 FROM raw_fb_ads WHERE day_date = days.date) \
+         OR EXISTS (SELECT 1 FROM raw_fb_ads_hierarchy WHERE day_date = days.date) \
          OR EXISTS (SELECT 1 FROM manual_entries WHERE day_date = days.date))",
     );
     if filter.from_date.is_some() {
@@ -463,6 +466,211 @@ fn aggregate_rows_for_day(
         }
     }
 
+    // FB hierarchy raw rows (format mới, 3 cấp). Mỗi row giữ đầy đủ
+    // (campaign, adset, ad, occurrence_idx) để build cây breakdown ở UI.
+    // Spend đã tax-aware (cùng formula với raw_fb_ads).
+    //
+    // Per (canonical) — nếu hierarchy có data → SUPPRESS row tương ứng từ
+    // raw_fb_ads (bảng cũ) để tránh double-count khi user import cả 2 format
+    // cho cùng ngày. Tuple chỉ tồn tại trong raw_fb_ads (legacy) → giữ như
+    // behavior cũ, không thay đổi.
+    struct FbHierRow {
+        canonical: Canonical,
+        campaign_name: String,
+        ad_set_name: String,
+        ad_name: String,
+        occurrence_idx: i64,
+        spend_cents: i64,
+        clicks: Option<i64>,
+        /// numerator weighted CPC: clicks × cpc × (1 + tax_rate/100).
+        weighted_cpc_sum: f64,
+    }
+    let mut fb_hier_rows: Vec<FbHierRow> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                    campaign_name, ad_set_name, ad_name, occurrence_idx,
+                    CAST(ROUND(COALESCE(spend, 0) * (1.0 + tax_rate / 100.0) * 100) AS INTEGER) AS spend_cents_taxed,
+                    clicks,
+                    CASE WHEN clicks IS NOT NULL AND cpc IS NOT NULL
+                         THEN clicks * cpc * (1.0 + tax_rate / 100.0) ELSE 0 END
+             FROM raw_fb_ads_hierarchy
+             WHERE day_date = ?",
+        )?;
+        let iter = stmt.query_map(params![day_date], |r| {
+            let tuple: [String; 5] =
+                [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
+            Ok(FbHierRow {
+                canonical: to_canonical(tuple),
+                campaign_name: r.get(5)?,
+                ad_set_name: r.get(6)?,
+                ad_name: r.get(7)?,
+                occurrence_idx: r.get(8)?,
+                spend_cents: r.get(9)?,
+                clicks: r.get(10)?,
+                weighted_cpc_sum: r.get(11)?,
+            })
+        })?;
+        for row in iter {
+            fb_hier_rows.push(row?);
+        }
+    }
+
+    // Tuple-level dedup: hierarchy thay thế raw_fb_ads cùng canonical.
+    let hier_canonicals: HashSet<Canonical> =
+        fb_hier_rows.iter().map(|r| r.canonical.clone()).collect();
+    fb_ads.retain(|ad| !hier_canonicals.contains(&ad.canonical));
+
+    // Helper: build cây campaign → adset → ad từ hierarchy rows. Group theo
+    // thứ tự xuất hiện (insertion order, không sort) để UI hiển thị stable
+    // theo thứ tự FB report. CPC weighted nếu raw có cpc, fallback spend/clicks.
+    fn build_breakdown_for_rows(rs: &[&FbHierRow]) -> FbBreakdown {
+        // by_camp: Vec<(name, Vec<&FbHierRow>)> để giữ insertion order.
+        let mut by_camp: Vec<(String, Vec<&FbHierRow>)> = Vec::new();
+        for r in rs {
+            if let Some((_, bucket)) =
+                by_camp.iter_mut().find(|(n, _)| *n == r.campaign_name)
+            {
+                bucket.push(r);
+            } else {
+                by_camp.push((r.campaign_name.clone(), vec![*r]));
+            }
+        }
+
+        let cpc_at_level = |spend_cents: i64,
+                            clicks_total: i64,
+                            cpc_sum: f64|
+         -> Option<f64> {
+            if clicks_total <= 0 {
+                return None;
+            }
+            if cpc_sum > 0.0 {
+                Some(cpc_sum / clicks_total as f64)
+            } else {
+                Some((spend_cents as f64 / 100.0) / clicks_total as f64)
+            }
+        };
+
+        let mut total_spend_cents: i64 = 0;
+        let mut campaigns: Vec<FbCampaignGroup> = Vec::new();
+
+        for (camp_name, camp_rows) in by_camp {
+            let mut by_adset: Vec<(String, Vec<&FbHierRow>)> = Vec::new();
+            for r in camp_rows {
+                if let Some((_, bucket)) =
+                    by_adset.iter_mut().find(|(n, _)| *n == r.ad_set_name)
+                {
+                    bucket.push(r);
+                } else {
+                    by_adset.push((r.ad_set_name.clone(), vec![r]));
+                }
+            }
+
+            let mut camp_spend: i64 = 0;
+            let mut camp_clicks: i64 = 0;
+            let mut camp_cpc_sum: f64 = 0.0;
+            let mut camp_has_clicks = false;
+            let mut adsets: Vec<FbAdSetGroup> = Vec::new();
+
+            for (adset_name, adset_rows) in by_adset {
+                let mut adset_spend: i64 = 0;
+                let mut adset_clicks: i64 = 0;
+                let mut adset_cpc_sum: f64 = 0.0;
+                let mut adset_has_clicks = false;
+                let mut ads: Vec<FbAdLeaf> = Vec::new();
+
+                for r in adset_rows {
+                    adset_spend += r.spend_cents;
+                    if let Some(c) = r.clicks {
+                        adset_clicks += c;
+                        adset_has_clicks = true;
+                    }
+                    adset_cpc_sum += r.weighted_cpc_sum;
+
+                    let leaf_cpc = cpc_at_level(
+                        r.spend_cents,
+                        r.clicks.unwrap_or(0),
+                        r.weighted_cpc_sum,
+                    );
+                    ads.push(FbAdLeaf {
+                        ad_name: r.ad_name.clone(),
+                        occurrence_idx: r.occurrence_idx,
+                        spend: r.spend_cents as f64 / 100.0,
+                        clicks: r.clicks,
+                        cpc: leaf_cpc,
+                    });
+                }
+
+                let adset_cpc =
+                    cpc_at_level(adset_spend, adset_clicks, adset_cpc_sum);
+
+                camp_spend += adset_spend;
+                camp_clicks += adset_clicks;
+                camp_cpc_sum += adset_cpc_sum;
+                if adset_has_clicks {
+                    camp_has_clicks = true;
+                }
+
+                adsets.push(FbAdSetGroup {
+                    ad_set_name: adset_name,
+                    spend: adset_spend as f64 / 100.0,
+                    clicks: if adset_has_clicks {
+                        Some(adset_clicks)
+                    } else {
+                        None
+                    },
+                    cpc: adset_cpc,
+                    ads,
+                });
+            }
+
+            let camp_cpc = cpc_at_level(camp_spend, camp_clicks, camp_cpc_sum);
+            total_spend_cents += camp_spend;
+            campaigns.push(FbCampaignGroup {
+                campaign_name: camp_name,
+                spend: camp_spend as f64 / 100.0,
+                clicks: if camp_has_clicks {
+                    Some(camp_clicks)
+                } else {
+                    None
+                },
+                cpc: camp_cpc,
+                ad_sets: adsets,
+            });
+        }
+
+        FbBreakdown {
+            campaigns,
+            total_spend: total_spend_cents as f64 / 100.0,
+        }
+    }
+
+    // Aggregate hierarchy → FbAds shape, push vào fb_ads để tận dụng pipeline
+    // attribution + per-account split downstream.
+    {
+        let mut by_canonical: HashMap<Canonical, FbAds> = HashMap::new();
+        for r in &fb_hier_rows {
+            let entry = by_canonical
+                .entry(r.canonical.clone())
+                .or_insert_with(|| FbAds {
+                    canonical: r.canonical.clone(),
+                    spend_cents: 0,
+                    imps: None,
+                    clicks: None,
+                    weighted_cpc_sum: None,
+                });
+            entry.spend_cents += r.spend_cents;
+            if let Some(c) = r.clicks {
+                entry.clicks = Some(entry.clicks.unwrap_or(0) + c);
+            }
+            if r.weighted_cpc_sum > 0.0 {
+                entry.weighted_cpc_sum =
+                    Some(entry.weighted_cpc_sum.unwrap_or(0.0) + r.weighted_cpc_sum);
+            }
+        }
+        fb_ads.extend(by_canonical.into_values());
+    }
+
     // Shopee clicks (grouped by tuple + referrer + account_id).
     // account_id=0 = row chưa có shopee_account_id (legacy data); FE quy về
     // Mặc định bucket khi populate accumulator.
@@ -755,12 +963,34 @@ fn aggregate_rows_for_day(
 
     type Key = (Canonical, Option<i64>);
 
+    // Bucket hierarchy raw rows theo (rep, bucket) — populate UiRow dùng để
+    // build cây breakdown. Chỉ rows survive sau attribution; nếu account_filter
+    // loại tuple ra → entry không xuất hiện trong map → UiRow tương ứng nhận
+    // breakdown=None (consistent với row chính bị filter ra).
+    let breakdown_rows_by_key: HashMap<Key, Vec<&FbHierRow>> = {
+        let mut map: HashMap<Key, Vec<&FbHierRow>> = HashMap::new();
+        for r in &fb_hier_rows {
+            let rep = resolve(&r.canonical);
+            let bucket = fb_bucket_for(&r.canonical);
+            map.entry((rep, bucket)).or_default().push(r);
+        }
+        map
+    };
+
     struct Accumulator {
         display_name: String,
         ads_clicks: Option<i64>,
         // Cents (×100). `None` = chưa có FB/manual override nào đặt spend.
         spend_cents: Option<i64>,
+        /// CPC tính cuối cùng — None cho đến khi manual override set hoặc
+        /// weighted sum đủ dữ liệu để tính. Dùng `weighted_cpc_num /
+        /// cpc_clicks_total` để tránh overwrite khi merge ≥2 FB canonicals.
         cpc: Option<f64>,
+        /// Numerator weighted CPC: Σ(clicks × cpc_taxed). Tích lũy qua mọi
+        /// FB row merge vào cùng key. Chia cho `cpc_clicks_total` cuối hàm.
+        weighted_cpc_num: f64,
+        /// Denominator weighted CPC: Σ(clicks có CPC). Tích lũy song song.
+        cpc_clicks_total: i64,
         impressions: Option<i64>,
         shopee_clicks_by_referrer: HashMap<String, i64>,
         shopee_clicks_total: i64,
@@ -789,6 +1019,8 @@ fn aggregate_rows_for_day(
         ads_clicks: None,
         spend_cents: None,
         cpc: None,
+        weighted_cpc_num: 0.0,
+        cpc_clicks_total: 0,
         impressions: None,
         shopee_clicks_by_referrer: HashMap::new(),
         shopee_clicks_total: 0,
@@ -818,11 +1050,14 @@ fn aggregate_rows_for_day(
         if r.clicks.is_some() {
             entry.ads_clicks = Some(entry.ads_clicks.unwrap_or(0) + r.clicks.unwrap_or(0));
         }
-        // CPC weighted: SUM(clicks * cpc) / SUM(clicks). Fallback spend/clicks
-        // ở cuối function nếu weighted sum = 0 (raw không có CPC).
+        // CPC weighted: tích lũy Σ(clicks × cpc_taxed) và Σ(clicks) riêng.
+        // Tính CPC = num/denom ở cuối hàm sau khi tất cả FB rows đã merge.
+        // Ghi đè entry.cpc ngay tại đây sẽ sai khi ≥2 FB canonicals merge
+        // vào cùng (rep, bucket) key — row sau xóa kết quả row trước.
         if let (Some(wsum), Some(clicks)) = (r.weighted_cpc_sum, r.clicks) {
             if clicks > 0 && wsum > 0.0 {
-                entry.cpc = Some(wsum / clicks as f64);
+                entry.weighted_cpc_num += wsum;
+                entry.cpc_clicks_total += clicks;
             }
         }
     }
@@ -908,7 +1143,9 @@ fn aggregate_rows_for_day(
         let commission_total = acc.commission_cents as f64 / 100.0;
         let commission_pending = acc.commission_pending_cents as f64 / 100.0;
         let cpc = acc.cpc.or_else(|| {
-            if let (Some(s_cents), Some(clicks)) = (acc.spend_cents, acc.ads_clicks) {
+            if acc.cpc_clicks_total > 0 && acc.weighted_cpc_num > 0.0 {
+                Some(acc.weighted_cpc_num / acc.cpc_clicks_total as f64)
+            } else if let (Some(s_cents), Some(clicks)) = (acc.spend_cents, acc.ads_clicks) {
                 if clicks > 0 {
                     Some((s_cents as f64 / 100.0) / clicks as f64)
                 } else {
@@ -948,6 +1185,12 @@ fn aggregate_rows_for_day(
             .as_ref()
             .and_then(|id| account_names.get(id).cloned());
 
+        // Build cây breakdown nếu (rep, bucket) có hierarchy rows. None khi
+        // tuple chỉ có data từ raw_fb_ads cũ → UI render giống behavior cũ.
+        let fb_breakdown = breakdown_rows_by_key
+            .get(&(c.clone(), account_id))
+            .map(|rs| build_breakdown_for_rows(rs));
+
         rows.push(UiRow {
             day_date: day_date.to_string(),
             sub_ids: canonical_to_array(&c),
@@ -969,6 +1212,7 @@ fn aggregate_rows_for_day(
             shopee_account_id: acc.shopee_account_id,
             account_id,
             account_name,
+            fb_breakdown,
         });
     }
 
@@ -1004,6 +1248,9 @@ pub fn list_imported_files(state: State<'_, DbState>) -> CmdResult<Vec<ImportedF
                 ) +
                 COALESCE(
                     (SELECT COUNT(*) FROM fb_ads_to_file WHERE file_id = f.id), 0
+                ) +
+                COALESCE(
+                    (SELECT COUNT(*) FROM fb_ads_hier_to_file WHERE file_id = f.id), 0
                 ) AS active_rows
          FROM imported_files f
          LEFT JOIN shopee_accounts sa ON sa.id = f.shopee_account_id
@@ -1536,13 +1783,31 @@ pub fn load_hourly_clicks(
 /// Khác `clicksByReferrer` chỉ count click, cái này bring CR + commission →
 /// biết referrer nào quality traffic (click nhiều + CR cao) vs referrer junk.
 ///
-/// Logic match click → order: cùng sub_ids tuple trong cùng ngày. Shopee
-/// `referrer` chỉ gắn với click_row; order không có referrer → phải JOIN
-/// qua sub_ids + day_date. Approximate — nếu 1 sub_id có nhiều referrer cùng
-/// ngày, order được chia theo tỉ lệ click:
+/// Logic match click → order: cùng sub_ids tuple trong **cùng ngày click**.
+/// Shopee `referrer` chỉ gắn với click_row; order không có referrer →
+/// phải JOIN qua sub_ids + click date. Order side dùng `DATE(click_time)`
+/// (không phải `day_date` = order date) vì order delay >24h là chuyện
+/// thường — nếu join theo order date sẽ mất attribution xuyên ngày.
+///
+/// Tuple sub_id được merge theo **longest-prefix canonical** trong cùng
+/// day: click `(A,B,'','','')` + order `(A,B,C,'','')` → cùng canonical
+/// `(A,B,C)`, được attribute chung. Tránh mất attribution khi click row
+/// và order row ghi sub_ids ở depth khác nhau.
+///
+/// Approximate — nếu 1 sub_id có nhiều referrer cùng ngày, order được
+/// chia theo tỉ lệ click:
 ///   orders_from_R = total_orders_for_subids × (clicks_R / total_clicks_for_subids)
 ///
-/// Filter: `from_date`, `to_date`, `account_filter`.
+/// Order có `click_time` không match click row nào (cùng canonical, cùng
+/// ngày) → đẩy về row đặc biệt `(không gắn click)` với `clicks=0, cr=null`,
+/// để user thấy có bao nhiêu đơn không attribute được vào nguồn traffic.
+///
+/// `commission` và `commission_pending` từ DB (raw `net_commission` đã
+/// trừ MCN, **chưa** trừ tax + reserve). FE áp `computeNetCommission`
+/// để ra số ròng cuối cùng — nhất quán với KPI Overview.
+///
+/// Filter: `from_date`, `to_date`, `account_filter` (áp trên click date
+/// ở cả 2 phía để đối xứng).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferrerEfficiency {
@@ -1550,6 +1815,7 @@ pub struct ReferrerEfficiency {
     pub clicks: i64,
     pub orders: f64,
     pub commission: f64,
+    pub commission_pending: f64,
     pub cr: Option<f64>,
 }
 
@@ -1562,20 +1828,22 @@ pub fn load_referrer_efficiency(
     let f = filter.unwrap_or_default();
     let match_mode = read_sub_id_match_mode(&conn);
 
-    // Build WHERE cho shopee_clicks filter.
+    // Click side filter trên `day_date` (= click date theo schema).
+    // Order side filter trên `DATE(click_time)` để đối xứng — đơn có click_time
+    // nằm trong range được attribute, không quan tâm order_time.
     let mut where_clicks = String::from(" WHERE 1=1");
-    let mut where_orders = String::from(" WHERE 1=1");
+    let mut where_orders = String::from(" WHERE click_time IS NOT NULL");
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let mut params_orders: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(v) = &f.from_date {
         where_clicks.push_str(" AND day_date >= ?");
-        where_orders.push_str(" AND day_date >= ?");
+        where_orders.push_str(" AND DATE(click_time) >= ?");
         params_vec.push(Box::new(v.clone()));
         params_orders.push(Box::new(v.clone()));
     }
     if let Some(v) = &f.to_date {
         where_clicks.push_str(" AND day_date <= ?");
-        where_orders.push_str(" AND day_date <= ?");
+        where_orders.push_str(" AND DATE(click_time) <= ?");
         params_vec.push(Box::new(v.clone()));
         params_orders.push(Box::new(v.clone()));
     }
@@ -1623,21 +1891,27 @@ pub fn load_referrer_efficiency(
             .push((referrer, clicks));
     }
 
-    // Step 2: order count + commission per (day, sub_ids) — distinct order_id.
+    // Step 2: order count + commission per (click_day, sub_ids) — distinct order_id.
+    // Key dùng DATE(click_time) chứ KHÔNG phải day_date (= order date) → để
+    // attribute đúng cho click 1 ngày + order 3 ngày sau (delay phổ biến).
+    // commission_pending split theo order_status để FE áp reserve rate đúng.
     let orders_sql = format!(
-        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+        "SELECT DATE(click_time) AS click_day,
+                sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
                 COUNT(DISTINCT order_id) as orders,
-                COALESCE(SUM(net_commission), 0) as commission
+                COALESCE(SUM(net_commission), 0) as commission,
+                COALESCE(SUM(CASE WHEN order_status IN ('Đang chờ xử lý', 'Chưa thanh toán')
+                                  THEN net_commission ELSE 0 END), 0) as commission_pending
          FROM raw_shopee_order_items
          {where_orders}
-         GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5"
+         GROUP BY click_day, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5"
     );
     let mut stmt = conn.prepare(&orders_sql)?;
     let refs_orders: Vec<&dyn rusqlite::ToSql> = params_orders
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
         .collect();
-    type OrderAgg = (i64, f64);
+    type OrderAgg = (i64, f64, f64);
     let mut orders_by_key: std::collections::HashMap<ClickKey, OrderAgg> =
         std::collections::HashMap::new();
     for row in stmt.query_map(refs_orders.as_slice(), |r| {
@@ -1652,46 +1926,156 @@ pub fn load_referrer_efficiency(
             ],
             r.get::<_, i64>(6)?,
             r.get::<_, f64>(7)?,
+            r.get::<_, f64>(8)?,
         ))
     })? {
-        let (day, subs, orders, commission) = row?;
-        orders_by_key.insert((day, subs), (orders, commission));
+        let (day, subs, orders, commission, pending) = row?;
+        orders_by_key.insert((day, subs), (orders, commission, pending));
     }
 
-    // Step 3: aggregate per referrer — distribute orders theo tỉ lệ click.
+    // Step 3: canonical mapping per-day. Trong cùng day, tuple ngắn được
+    // merge vào tuple dài hơn nếu là prefix-compatible (longest wins).
+    // Multi-chain conflict (vd cùng day có (A,B,C) và (A,B,D)) → iterate
+    // longest first, tuple ngắn (A,B) merge vào tuple longer xuất hiện
+    // trước theo lexicographic order — deterministic, hiếm trên thực tế.
+    use std::collections::HashSet;
+    let mut keys_per_day: std::collections::HashMap<String, Vec<[String; 5]>> =
+        std::collections::HashMap::new();
+    for (day, subs) in clicks_by_key.keys().chain(orders_by_key.keys()) {
+        keys_per_day
+            .entry(day.clone())
+            .or_default()
+            .push(subs.clone());
+    }
+    let mut canonical_for: std::collections::HashMap<ClickKey, [String; 5]> =
+        std::collections::HashMap::new();
+    for (day, raw_tuples) in keys_per_day {
+        // Dedup tuples in this day.
+        let mut tuples: Vec<[String; 5]> = raw_tuples;
+        tuples.sort();
+        tuples.dedup();
+        // Pre-compute Canonical (Vec) for each, then sort longest-first.
+        let mut indexed: Vec<([String; 5], Canonical)> = tuples
+            .into_iter()
+            .map(|s| {
+                let c = to_canonical(s.clone());
+                (s, c)
+            })
+            .collect();
+        indexed.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.1.cmp(&b.1)));
+        let mut assigned: HashSet<[String; 5]> = HashSet::new();
+        for (long_s, long_c) in &indexed {
+            if assigned.contains(long_s) {
+                continue;
+            }
+            for (short_s, short_c) in &indexed {
+                if assigned.contains(short_s) {
+                    continue;
+                }
+                if !is_prefix(short_c, long_c) {
+                    continue;
+                }
+                // Empty canonical (= không có sub_id) là prefix của mọi tuple,
+                // nhưng "không gắn sub_id" KHÔNG được phép merge vào tuple
+                // có sub_id — sẽ gán nhầm click/order vô danh cho 1 product.
+                if short_c.is_empty() && !long_c.is_empty() {
+                    continue;
+                }
+                canonical_for.insert((day.clone(), short_s.clone()), long_s.clone());
+                assigned.insert(short_s.clone());
+            }
+        }
+    }
+
+    // Step 4: re-key cả 2 maps về canonical key.
+    let mut canonical_clicks: std::collections::HashMap<ClickKey, std::collections::HashMap<String, i64>> =
+        std::collections::HashMap::new();
+    for ((day, subs), referrer_clicks) in clicks_by_key {
+        let canonical = canonical_for
+            .get(&(day.clone(), subs.clone()))
+            .cloned()
+            .unwrap_or(subs);
+        let bucket = canonical_clicks
+            .entry((day, canonical))
+            .or_default();
+        for (referrer, c) in referrer_clicks {
+            *bucket.entry(referrer).or_insert(0) += c;
+        }
+    }
+    let mut canonical_orders: std::collections::HashMap<ClickKey, OrderAgg> =
+        std::collections::HashMap::new();
+    for ((day, subs), (orders, commission, pending)) in orders_by_key {
+        let canonical = canonical_for
+            .get(&(day.clone(), subs.clone()))
+            .cloned()
+            .unwrap_or(subs);
+        let entry = canonical_orders
+            .entry((day, canonical))
+            .or_insert((0, 0.0, 0.0));
+        entry.0 += orders;
+        entry.1 += commission;
+        entry.2 += pending;
+    }
+
+    // Step 5: aggregate per referrer — distribute orders theo tỉ lệ click.
     // Nếu f.sub_ids provided (Chi tiết product), filter keys prefix-match trước.
     let target_sub_ids = f.sub_ids.clone();
-    let mut agg: std::collections::HashMap<String, (i64, f64, f64)> =
+    // Tuple agg: (clicks, orders, commission, commission_pending).
+    let mut agg: std::collections::HashMap<String, (i64, f64, f64, f64)> =
         std::collections::HashMap::new();
-    for (key, referrer_clicks) in clicks_by_key {
+    for (key, referrer_clicks) in &canonical_clicks {
         if let Some(target) = target_sub_ids.as_ref() {
             if !sub_ids_match(&key.1, target, match_mode) {
                 continue;
             }
         }
-        let total_clicks: i64 = referrer_clicks.iter().map(|(_, c)| *c).sum();
-        let (orders_for_key, commission_for_key) = orders_by_key
-            .get(&key)
+        let total_clicks: i64 = referrer_clicks.values().sum();
+        let (orders_for_key, commission_for_key, pending_for_key) = canonical_orders
+            .get(key)
             .copied()
-            .unwrap_or((0, 0.0));
+            .unwrap_or((0, 0.0, 0.0));
+        if total_clicks == 0 {
+            continue;
+        }
         for (referrer, clicks) in referrer_clicks {
-            let share = if total_clicks > 0 {
-                clicks as f64 / total_clicks as f64
-            } else {
-                0.0
-            };
+            let share = *clicks as f64 / total_clicks as f64;
             let orders_share = orders_for_key as f64 * share;
             let commission_share = commission_for_key * share;
-            let e = agg.entry(referrer).or_insert((0, 0.0, 0.0));
-            e.0 += clicks;
+            let pending_share = pending_for_key * share;
+            let e = agg.entry(referrer.clone()).or_insert((0, 0.0, 0.0, 0.0));
+            e.0 += *clicks;
             e.1 += orders_share;
             e.2 += commission_share;
+            e.3 += pending_share;
+        }
+    }
+
+    // Step 6: orphan orders — canonical key có trong orders nhưng không có
+    // click match → đẩy vào row đặc biệt "(không gắn click)" với clicks=0.
+    // Đây là đơn có click_time NOT NULL nhưng tuple/day không khớp click row
+    // nào trong DB (ví dụ click data thiếu, hoặc tracking sai).
+    let mut orphan_orders = 0.0_f64;
+    let mut orphan_commission = 0.0_f64;
+    let mut orphan_pending = 0.0_f64;
+    for (key, (orders, commission, pending)) in &canonical_orders {
+        if let Some(target) = target_sub_ids.as_ref() {
+            if !sub_ids_match(&key.1, target, match_mode) {
+                continue;
+            }
+        }
+        let has_clicks = canonical_clicks
+            .get(key)
+            .is_some_and(|m| m.values().any(|c| *c > 0));
+        if !has_clicks {
+            orphan_orders += *orders as f64;
+            orphan_commission += commission;
+            orphan_pending += pending;
         }
     }
 
     let mut out: Vec<ReferrerEfficiency> = agg
         .into_iter()
-        .map(|(referrer, (clicks, orders, commission))| {
+        .map(|(referrer, (clicks, orders, commission, commission_pending))| {
             let cr = if clicks > 0 {
                 Some(orders / clicks as f64 * 100.0)
             } else {
@@ -1702,10 +2086,21 @@ pub fn load_referrer_efficiency(
                 clicks,
                 orders,
                 commission,
+                commission_pending,
                 cr,
             }
         })
         .collect();
+    if orphan_orders > 0.0 || orphan_commission > 0.0 || orphan_pending > 0.0 {
+        out.push(ReferrerEfficiency {
+            referrer: "(không gắn click)".to_string(),
+            clicks: 0,
+            orders: orphan_orders,
+            commission: orphan_commission,
+            commission_pending: orphan_pending,
+            cr: None,
+        });
+    }
     // Sort desc by CR (null last). Tiebreak by clicks desc.
     out.sort_by(|a, b| {
         b.cr
@@ -1832,6 +2227,99 @@ pub fn load_click_order_delays(
             orders: *buckets.get(k).unwrap_or(&0),
         })
         .collect())
+}
+
+/// Bucket per (sub_id tuple, day_date) — dùng cho chart "Tỉ lệ hoàn hủy theo
+/// sản phẩm" trên Overview tab. FE aggregate qua sub_id để xếp hạng DESC theo
+/// % hủy. `cancelled` = đơn có ≥1 line status chứa "hủy" / "Hủy" / "cancel".
+/// `zero_hh` = đơn có SUM(net_commission) = 0 (gồm hủy + đơn chưa attribute).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancellationByDayBucket {
+    pub day_date: String,
+    pub sub_id1: String,
+    pub sub_id2: String,
+    pub sub_id3: String,
+    pub sub_id4: String,
+    pub sub_id5: String,
+    pub total_orders: i64,
+    pub cancelled_orders: i64,
+    pub zero_hh_orders: i64,
+}
+
+/// Aggregate cancellation/zero-HH count per (sub_id, day) — group SQL-side
+/// để 1 round-trip cover toàn bộ Overview range. FE sort + topN.
+/// Filter: from_date/to_date/account. `sub_ids` không dùng (Overview = all SP).
+#[tauri::command]
+pub fn load_cancellation_by_subid(
+    state: State<'_, DbState>,
+    filter: Option<DaysFilter>,
+) -> CmdResult<Vec<CancellationByDayBucket>> {
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let f = filter.unwrap_or_default();
+
+    // 2-tầng: inner collapse line-items thành (sub_ids, day, order_id) +
+    // flag hủy + sum net_commission; outer COUNT distinct order theo
+    // (sub_ids, day). Match "hủy" qua INSTR (case sensitivity Vietnamese:
+    // 'hủy' cover "Đã hủy", thêm 'Hủy' cho variant viết hoa; 'cancel' cover
+    // LOWER cho English). Cùng pattern với regex FE `/hủy|cancel/i`.
+    let mut sql = String::from(
+        "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date,
+                COUNT(*) AS total_orders,
+                COALESCE(SUM(has_cancelled), 0) AS cancelled_orders,
+                COALESCE(SUM(CASE WHEN net_sum = 0 THEN 1 ELSE 0 END), 0) AS zero_hh_orders
+         FROM (
+            SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, order_id,
+                   MAX(CASE
+                        WHEN instr(order_status, 'hủy') > 0 THEN 1
+                        WHEN instr(order_status, 'Hủy') > 0 THEN 1
+                        WHEN instr(lower(order_status), 'cancel') > 0 THEN 1
+                        ELSE 0
+                       END) AS has_cancelled,
+                   COALESCE(SUM(net_commission), 0) AS net_sum
+            FROM raw_shopee_order_items
+            WHERE 1=1",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = &f.from_date {
+        sql.push_str(" AND day_date >= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &f.to_date {
+        sql.push_str(" AND day_date <= ?");
+        params_vec.push(Box::new(v.clone()));
+    }
+    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
+        sql.push_str(" AND shopee_account_id = ?");
+        params_vec.push(Box::new(*id));
+    }
+    sql.push_str(
+        "    GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, order_id
+         )
+         GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date",
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+        .collect();
+    let rows: Vec<CancellationByDayBucket> = stmt
+        .query_map(refs.as_slice(), |r| {
+            Ok(CancellationByDayBucket {
+                sub_id1: r.get(0)?,
+                sub_id2: r.get(1)?,
+                sub_id3: r.get(2)?,
+                sub_id4: r.get(3)?,
+                sub_id5: r.get(4)?,
+                day_date: r.get(5)?,
+                total_orders: r.get(6)?,
+                cancelled_orders: r.get(7)?,
+                zero_hh_orders: r.get(8)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
 }
 
 /// Parse "YYYY-MM-DD HH:MM:SS" (Shopee format) or ISO8601 → epoch seconds.

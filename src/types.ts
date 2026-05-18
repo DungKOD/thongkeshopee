@@ -36,6 +36,43 @@ export type UiRow = {
   accountId: string | null;
   /** Tên account hiển thị UI; null cùng `accountId` (FB chung). */
   accountName: string | null;
+  /** Cây 3 cấp campaign → nhóm → quảng cáo, build từ `raw_fb_ads_hierarchy`.
+   *  `null`/`undefined` = tuple chỉ có data từ format cũ (raw_fb_ads), UI render
+   *  như trước. Khi có → hiển thị nút expand inline để drill-down. */
+  fbBreakdown?: FbBreakdown | null;
+};
+
+/** Cây hierarchy FB ads cho 1 UiRow (xem `UiRow.fbBreakdown`). */
+export type FbBreakdown = {
+  campaigns: FbCampaignGroup[];
+  /** Tổng spend toàn cây (= sum mọi ad-leaf). UI dùng kiểm tra khớp với
+   *  `UiRow.totalSpend`. Khác chút khi row có cả manual override. */
+  totalSpend: number;
+};
+
+export type FbCampaignGroup = {
+  campaignName: string;
+  spend: number;
+  clicks: number | null;
+  cpc: number | null;
+  adSets: FbAdSetGroup[];
+};
+
+export type FbAdSetGroup = {
+  adSetName: string;
+  spend: number;
+  clicks: number | null;
+  cpc: number | null;
+  ads: FbAdLeaf[];
+};
+
+export type FbAdLeaf = {
+  adName: string;
+  /** 0..N — phân biệt nhiều ad cùng tên trong cùng adset. */
+  occurrenceIdx: number;
+  spend: number;
+  clicks: number | null;
+  cpc: number | null;
 };
 
 /** Day-level totals — tính từ MỌI tuple trước row-0 filter. KPI dùng field

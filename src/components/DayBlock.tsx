@@ -15,7 +15,9 @@ import {
   captureElementToBlob,
   prefetchFontEmbedCSS,
 } from "../lib/screenshot";
+import { Fragment } from "react";
 import { VideoRow } from "./VideoRow";
+import { FbHierarchyTree } from "./FbHierarchyTree";
 import { ProductDetailDialog } from "./ProductDetailDialog";
 import { DayScreenshotDialog } from "./DayScreenshotDialog";
 
@@ -382,32 +384,41 @@ export function DayBlock({
                 const tupleKey = r.subIds.join("\x1f");
                 const deleteBlocked =
                   showAccount && multiAccountTuples.has(tupleKey);
+                const hasFbBreakdown =
+                  !!r.fbBreakdown && r.fbBreakdown.campaigns.length > 0;
                 return (
-                  <VideoRow
-                    key={key}
-                    index={i + 1}
-                    row={r}
-                    showAccount={showAccount}
-                    pending={effectiveDayPending || pendingRowDeletes.has(key)}
-                    deleteBlocked={deleteBlocked}
-                    onEdit={() => onEditRow(r)}
-                    onToggleDelete={() => {
-                      // Nếu day đang pending (xóa cả ngày) mà user undo 1 row:
-                      // convert sang per-row pending — bỏ day, add các row khác vào.
-                      if (dayPending) {
-                        onToggleDayDelete(day.date);
-                        for (const other of day.rows) {
-                          if (uiRowKey(other.dayDate, other.subIds, other.accountId) !== key) {
-                            onToggleRowDelete(other);
+                  <Fragment key={key}>
+                    <VideoRow
+                      index={i + 1}
+                      row={r}
+                      showAccount={showAccount}
+                      pending={effectiveDayPending || pendingRowDeletes.has(key)}
+                      deleteBlocked={deleteBlocked}
+                      onEdit={() => onEditRow(r)}
+                      onToggleDelete={() => {
+                        if (dayPending) {
+                          onToggleDayDelete(day.date);
+                          for (const other of day.rows) {
+                            if (
+                              uiRowKey(other.dayDate, other.subIds, other.accountId) !== key
+                            ) {
+                              onToggleRowDelete(other);
+                            }
                           }
+                        } else {
+                          onToggleRowDelete(r);
                         }
-                      } else {
-                        onToggleRowDelete(r);
-                      }
-                    }}
-                    onViewDetail={() => setDetailRow(r)}
-                    readOnly={readOnly}
-                  />
+                      }}
+                      onViewDetail={() => setDetailRow(r)}
+                      readOnly={readOnly}
+                    />
+                    {hasFbBreakdown && (
+                      <FbHierarchyTree
+                        breakdown={r.fbBreakdown!}
+                        showAccount={showAccount}
+                      />
+                    )}
+                  </Fragment>
                 );
               })
             )}

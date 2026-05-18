@@ -294,34 +294,44 @@ pub fn count_fb_linked_to_account(
     }
     let shop_other = load_shopee_canonicals_by_day(&conn, |a| a != id)?;
 
-    let mut stmt = conn.prepare(
+    // Count từ cả 2 bảng FB — dedup (day, canonical) để không đếm 2 lần cùng tuple.
+    let mut seen: std::collections::HashSet<(String, Canonical)> =
+        std::collections::HashSet::new();
+    let mut count: i64 = 0;
+    for sql in [
         "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
          FROM raw_fb_ads",
-    )?;
-    let iter = stmt.query_map([], |r| {
-        let day: String = r.get(0)?;
-        let tuple: [String; 5] =
-            [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
-        Ok((day, to_canonical(tuple)))
-    })?;
-    let mut count: i64 = 0;
-    for row in iter {
-        let (day, fb_canon) = row?;
-        let Some(targets) = shop_target.get(&day) else {
-            continue;
-        };
-        let linked_to_target = targets
-            .iter()
-            .any(|c| is_compatible(&fb_canon, c, match_mode));
-        if !linked_to_target {
-            continue;
-        }
-        let linked_to_other = shop_other
-            .get(&day)
-            .map(|s| s.iter().any(|c| is_compatible(&fb_canon, c, match_mode)))
-            .unwrap_or(false);
-        if !linked_to_other {
-            count += 1;
+        "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+         FROM raw_fb_ads_hierarchy",
+    ] {
+        let mut stmt = conn.prepare(sql)?;
+        let iter = stmt.query_map([], |r| {
+            let day: String = r.get(0)?;
+            let tuple: [String; 5] =
+                [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+            Ok((day, to_canonical(tuple)))
+        })?;
+        for row in iter {
+            let (day, fb_canon) = row?;
+            if !seen.insert((day.clone(), fb_canon.clone())) {
+                continue; // dedup cross-table
+            }
+            let Some(targets) = shop_target.get(&day) else {
+                continue;
+            };
+            let linked_to_target = targets
+                .iter()
+                .any(|c| is_compatible(&fb_canon, c, match_mode));
+            if !linked_to_target {
+                continue;
+            }
+            let linked_to_other = shop_other
+                .get(&day)
+                .map(|s| s.iter().any(|c| is_compatible(&fb_canon, c, match_mode)))
+                .unwrap_or(false);
+            if !linked_to_other {
+                count += 1;
+            }
         }
     }
     Ok(count)
@@ -358,34 +368,44 @@ pub fn delete_shopee_account(
         let shop_other = load_shopee_canonicals_by_day(&conn, |a| a != id)?;
         let mut out: Vec<(String, [String; 5])> = Vec::new();
         if !shop_target.is_empty() {
-            let mut stmt = conn.prepare(
+            // Collect từ cả 2 bảng FB (legacy + hierarchy) — union dedup theo (day, tuple).
+            let mut seen: std::collections::HashSet<(String, [String; 5])> =
+                std::collections::HashSet::new();
+            for sql in [
                 "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
                  FROM raw_fb_ads",
-            )?;
-            let iter = stmt.query_map([], |r| {
-                let day: String = r.get(0)?;
-                let tuple: [String; 5] =
-                    [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
-                Ok((day, tuple))
-            })?;
-            for row in iter {
-                let (day, tuple) = row?;
-                let fb_canon = to_canonical(tuple.clone());
-                let Some(targets) = shop_target.get(&day) else {
-                    continue;
-                };
-                let linked_to_target = targets
-                    .iter()
-                    .any(|c| is_compatible(&fb_canon, c, match_mode));
-                if !linked_to_target {
-                    continue;
-                }
-                let linked_to_other = shop_other
-                    .get(&day)
-                    .map(|s| s.iter().any(|c| is_compatible(&fb_canon, c, match_mode)))
-                    .unwrap_or(false);
-                if !linked_to_other {
-                    out.push((day, tuple));
+                "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+                 FROM raw_fb_ads_hierarchy",
+            ] {
+                let mut stmt = conn.prepare(sql)?;
+                let iter = stmt.query_map([], |r| {
+                    let day: String = r.get(0)?;
+                    let tuple: [String; 5] =
+                        [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+                    Ok((day, tuple))
+                })?;
+                for row in iter {
+                    let (day, tuple) = row?;
+                    if !seen.insert((day.clone(), tuple.clone())) {
+                        continue; // dedup
+                    }
+                    let fb_canon = to_canonical(tuple.clone());
+                    let Some(targets) = shop_target.get(&day) else {
+                        continue;
+                    };
+                    let linked_to_target = targets
+                        .iter()
+                        .any(|c| is_compatible(&fb_canon, c, match_mode));
+                    if !linked_to_target {
+                        continue;
+                    }
+                    let linked_to_other = shop_other
+                        .get(&day)
+                        .map(|s| s.iter().any(|c| is_compatible(&fb_canon, c, match_mode)))
+                        .unwrap_or(false);
+                    if !linked_to_other {
+                        out.push((day, tuple));
+                    }
                 }
             }
         }
@@ -396,16 +416,25 @@ pub fn delete_shopee_account(
 
     let tx = conn.transaction()?;
 
-    // DELETE FB ads đã xác định (exact match theo day + 5 sub_ids).
+    // DELETE FB ads đã xác định (exact match theo day + 5 sub_ids) — cả 2 bảng.
     if !fb_to_delete.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt_legacy = tx.prepare(
             "DELETE FROM raw_fb_ads
              WHERE day_date = ?1
                AND sub_id1 = ?2 AND sub_id2 = ?3
                AND sub_id3 = ?4 AND sub_id4 = ?5 AND sub_id5 = ?6",
         )?;
+        let mut stmt_hier = tx.prepare(
+            "DELETE FROM raw_fb_ads_hierarchy
+             WHERE day_date = ?1
+               AND sub_id1 = ?2 AND sub_id2 = ?3
+               AND sub_id3 = ?4 AND sub_id4 = ?5 AND sub_id5 = ?6",
+        )?;
         for (day, tuple) in &fb_to_delete {
-            stmt.execute(params![
+            stmt_legacy.execute(params![
+                day, tuple[0], tuple[1], tuple[2], tuple[3], tuple[4]
+            ])?;
+            stmt_hier.execute(params![
                 day, tuple[0], tuple[1], tuple[2], tuple[3], tuple[4]
             ])?;
         }
@@ -447,7 +476,8 @@ pub fn delete_shopee_account(
          WHERE id NOT IN (
              SELECT source_file_id FROM raw_shopee_clicks UNION
              SELECT source_file_id FROM raw_shopee_order_items UNION
-             SELECT source_file_id FROM raw_fb_ads
+             SELECT source_file_id FROM raw_fb_ads UNION
+             SELECT source_file_id FROM raw_fb_ads_hierarchy
          )",
         [],
     )?;
@@ -457,6 +487,7 @@ pub fn delete_shopee_account(
             SELECT day_date FROM raw_shopee_clicks UNION
             SELECT day_date FROM raw_shopee_order_items UNION
             SELECT day_date FROM raw_fb_ads UNION
+            SELECT day_date FROM raw_fb_ads_hierarchy UNION
             SELECT day_date FROM manual_entries
          )",
         [],

@@ -209,6 +209,7 @@ export function SubIdTimelineBlock({
               <td className="px-3 py-4 text-center text-sm uppercase tracking-wider text-shopee-300">
                 Tổng
               </td>
+              {showAccount && <td />}
               <td className="px-3 py-4 text-center tabular-nums">
                 {fmtInt(totals.clicks)}
               </td>

@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS shopee_accounts (
 CREATE TABLE IF NOT EXISTS imported_files (
     id                 INTEGER PRIMARY KEY,
     filename           TEXT NOT NULL,
-    kind               TEXT NOT NULL,         -- 'shopee_clicks'|'shopee_commission'|'fb_ad_group'|'fb_campaign'
+    kind               TEXT NOT NULL,         -- 'shopee_clicks'|'shopee_commission'|'fb_ad_group'|'fb_campaign'|'fb_hierarchy'
     imported_at        TEXT NOT NULL,
     row_count          INTEGER NOT NULL DEFAULT 0,
     file_hash          TEXT NOT NULL,
@@ -177,6 +177,57 @@ CREATE INDEX IF NOT EXISTS idx_fb_ads_subid      ON raw_fb_ads(sub_id1, sub_id2,
 CREATE INDEX IF NOT EXISTS idx_fb_ads_day_subid  ON raw_fb_ads(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
 
 -- =============================================================
+-- raw_fb_ads_hierarchy — FB ads theo cấu trúc 3 cấp đầy đủ
+-- (chiến dịch → nhóm quảng cáo → quảng cáo). Bảng riêng song song với
+-- raw_fb_ads (CSV cũ) để không break logic import hiện tại. Khi user
+-- export FB report ở format mới có cột "Cấp độ phân phối"=ad cùng 3 cột
+-- "Tên chiến dịch"/"Tên nhóm quảng cáo"/"Tên quảng cáo", row vào bảng này.
+--
+-- occurrence_idx: 0..N cho row có cùng (day, camp, adset, ad) — FB có thể
+-- có 2+ ad cùng tên trong cùng adset (khác ad_id) → giữ nguyên cả 3 row,
+-- không UPSERT collapse.
+--
+-- id = content_id(day_date, campaign_name, ad_set_name, ad_name, occurrence_idx).
+-- =============================================================
+CREATE TABLE IF NOT EXISTS raw_fb_ads_hierarchy (
+    id              INTEGER PRIMARY KEY,
+    campaign_name   TEXT NOT NULL,
+    ad_set_name     TEXT NOT NULL,
+    ad_name         TEXT NOT NULL,
+    occurrence_idx  INTEGER NOT NULL DEFAULT 0,
+    sub_id1         TEXT NOT NULL DEFAULT '',
+    sub_id2         TEXT NOT NULL DEFAULT '',
+    sub_id3         TEXT NOT NULL DEFAULT '',
+    sub_id4         TEXT NOT NULL DEFAULT '',
+    sub_id5         TEXT NOT NULL DEFAULT '',
+    report_start    TEXT,
+    report_end      TEXT,
+    status          TEXT,
+    spend           REAL,
+    clicks          INTEGER,
+    cpc             REAL,
+    impressions     INTEGER,
+    reach           INTEGER,
+    tax_rate        REAL NOT NULL DEFAULT 0,
+    day_date        TEXT NOT NULL REFERENCES days(date) ON DELETE CASCADE,
+    source_file_id  INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    UNIQUE(day_date, campaign_name, ad_set_name, ad_name, occurrence_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fb_hier_day        ON raw_fb_ads_hierarchy(day_date);
+CREATE INDEX IF NOT EXISTS idx_fb_hier_camp       ON raw_fb_ads_hierarchy(day_date, campaign_name);
+CREATE INDEX IF NOT EXISTS idx_fb_hier_subid      ON raw_fb_ads_hierarchy(sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
+CREATE INDEX IF NOT EXISTS idx_fb_hier_day_subid  ON raw_fb_ads_hierarchy(day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5);
+
+-- Mapping fb_ads_hierarchy ↔ imported_files (parallel với fb_ads_to_file).
+CREATE TABLE IF NOT EXISTS fb_ads_hier_to_file (
+    fb_ad_id INTEGER NOT NULL,
+    file_id  INTEGER NOT NULL REFERENCES imported_files(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    PRIMARY KEY(fb_ad_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fb_ads_hier_to_file_file  ON fb_ads_hier_to_file(file_id);
+
+-- =============================================================
 -- manual_entries — user nhập tay/override.
 -- =============================================================
 CREATE TABLE IF NOT EXISTS manual_entries (
@@ -231,4 +282,10 @@ CREATE TRIGGER IF NOT EXISTS trg_cleanup_fb_ad_mapping
 AFTER DELETE ON raw_fb_ads
 BEGIN
     DELETE FROM fb_ads_to_file WHERE fb_ad_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cleanup_fb_ad_hier_mapping
+AFTER DELETE ON raw_fb_ads_hierarchy
+BEGIN
+    DELETE FROM fb_ads_hier_to_file WHERE fb_ad_id = OLD.id;
 END;

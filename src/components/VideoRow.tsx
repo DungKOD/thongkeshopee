@@ -10,11 +10,7 @@ interface CampaignRowProps {
   onToggleDelete: () => void;
   onViewDetail: () => void;
   readOnly?: boolean;
-  /** Render cột "TK Shopee" giữa "Sản phẩm" và "Click ADS". DayBlock truyền
-   *  true khi filter=All (nhiều acc). Mặc định false → giữ layout cũ. */
   showAccount?: boolean;
-  /** Disable nút delete + tooltip giải thích — DayBlock pass true khi tuple
-   *  hiện cùng lúc trên ≥2 TK (BE delete theo tuple sẽ wipe cả các TK khác). */
   deleteBlocked?: boolean;
 }
 
@@ -54,10 +50,7 @@ export function VideoRow({
       ? "text-red-400"
       : "text-gray-400";
 
-  // Strikethrough + mờ áp cho CELL data, KHÔNG áp cho cell actions để nút
-  // Undo vẫn rõ và bấm được.
   const dataCellPending = pending ? "line-through opacity-50" : "";
-
   const spendCell = fmtOrNa(row.totalSpend, fmtVnd);
   const clicksCell = fmtOrNa(row.adsClicks, fmtInt);
   const cpcCell = fmtOrNa(c.cpc > 0 ? c.cpc : null, fmtVnd);
@@ -73,8 +66,6 @@ export function VideoRow({
   return (
     <tr
       onClick={handleRowClick}
-      // h-[52px] ép chiều cao cố định = py-2.5 (20px) + button h-8 (32px) — giữ
-      // nguyên khi readOnly / capture mode ẩn cột action, tránh row bị co lại.
       className={`h-[52px] border-b border-surface-8 text-white/80 transition-colors ${
         pending
           ? "bg-surface-2/50"
@@ -116,17 +107,13 @@ export function VideoRow({
           )}
         </td>
       )}
-      <td
-        className={`${cellCls} tabular-nums ${clicksCell.cls} ${dataCellPending}`}
-      >
+      <td className={`${cellCls} tabular-nums ${clicksCell.cls} ${dataCellPending}`}>
         {clicksCell.text}
       </td>
       <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
         {fmtInt(shopeeClicks)}
       </td>
-      <td
-        className={`${cellCls} tabular-nums text-gray-400 ${cpcCell.cls} ${dataCellPending}`}
-      >
+      <td className={`${cellCls} tabular-nums text-gray-400 ${cpcCell.cls} ${dataCellPending}`}>
         {cpcCell.text}
       </td>
       <td
@@ -182,9 +169,7 @@ export function VideoRow({
               }`
         }
       >
-        {row.totalSpend && row.totalSpend > 0
-          ? fmtPct(c.profitMargin)
-          : "—"}
+        {row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
       </td>
       <td className={`${cellCls} col-actions`}>
         {!readOnly && (

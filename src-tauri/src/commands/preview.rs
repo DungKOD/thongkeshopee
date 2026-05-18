@@ -21,7 +21,8 @@ use crate::db::DbState;
 
 use super::imports::{
     extract_date, validate_fb_single_date, ImportFbAdGroupsPayload,
-    ImportFbCampaignsPayload, ImportShopeeClicksPayload, ImportShopeeOrdersPayload,
+    ImportFbCampaignsPayload, ImportFbHierarchyPayload, ImportShopeeClicksPayload,
+    ImportShopeeOrdersPayload,
 };
 use super::{CmdError, CmdResult};
 
@@ -455,6 +456,99 @@ pub fn preview_import_fb_campaigns(
 
     Ok(ImportPreview {
         kind: "fb_campaign".into(),
+        filename: payload.filename,
+        day_date: day_date.clone(),
+        day_date_from: day_date.clone(),
+        day_date_to: day_date.clone(),
+        total_rows: total,
+        new_rows,
+        replace_rows,
+        sample_replace,
+        day_has_data: any_day_has_data(&conn, &[day_date])?,
+        already_imported: hash_match && new_rows == 0,
+        hash_match,
+        existing_day_date: existing_day,
+        skipped: 0,
+        empty_rows,
+        mostly_empty,
+    })
+}
+
+// ============================================================
+// FB Hierarchy — preview cho format mới (3 cấp)
+// ============================================================
+
+/// Preview import format hierarchy. Dedup key = (camp, adset, ad, occ_idx).
+#[tauri::command]
+pub fn preview_import_fb_hierarchy(
+    state: State<'_, DbState>,
+    payload: ImportFbHierarchyPayload,
+) -> CmdResult<ImportPreview> {
+    let day_date = validate_fb_single_date(
+        payload
+            .rows
+            .iter()
+            .map(|r| (r.report_start.clone(), r.report_end.clone())),
+        "FB Hierarchy",
+    )?;
+    let hash = compute_hash(&payload.raw_content);
+
+    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let (hash_match, existing_day) = check_hash_imported(&conn, &hash)?;
+
+    let mut existing: HashSet<(String, String, String, i64)> = HashSet::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT campaign_name, ad_set_name, ad_name, occurrence_idx
+             FROM raw_fb_ads_hierarchy WHERE day_date = ?",
+        )?;
+        let iter = stmt.query_map(params![day_date], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in iter {
+            existing.insert(row?);
+        }
+    }
+
+    let mut replace: Vec<String> = Vec::new();
+    for r in &payload.rows {
+        let key = (
+            r.campaign_name.clone(),
+            r.ad_set_name.clone(),
+            r.ad_name.clone(),
+            r.occurrence_idx,
+        );
+        if existing.contains(&key) {
+            let label = if r.occurrence_idx > 0 {
+                format!("{} (#{})", r.ad_name, r.occurrence_idx + 1)
+            } else {
+                r.ad_name.clone()
+            };
+            replace.push(label);
+        }
+    }
+
+    let total = payload.rows.len() as i64;
+    let replace_rows = replace.len() as i64;
+    let new_rows = total - replace_rows;
+    let sample_replace: Vec<String> = replace.into_iter().take(SAMPLE_LIMIT).collect();
+
+    let (empty_rows, mostly_empty) = count_empty_rows(&payload.rows, |r| {
+        let spend_zero = r.spend.map(|v| v <= 0.0).unwrap_or(true);
+        let clicks_zero = r.link_clicks.unwrap_or(0)
+            + r.all_clicks.unwrap_or(0)
+            + r.result_count.unwrap_or(0)
+            == 0;
+        spend_zero && clicks_zero
+    });
+
+    Ok(ImportPreview {
+        kind: "fb_hierarchy".into(),
         filename: payload.filename,
         day_date: day_date.clone(),
         day_date_from: day_date.clone(),

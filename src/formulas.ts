@@ -353,12 +353,27 @@ export function computeDailyTrend(
   fees: ProfitFees,
   source: SourceFilter,
 ): DailyTrendPoint[] {
-  const includeAds = source === "all";
   const points: DailyTrendPoint[] = [];
   for (const day of days) {
-    const t = day.totals;
-    const spend = includeAds ? t.totalSpend : 0;
-    const net = computeNetCommission(t.commissionTotal, t.commissionPending, fees);
+    let spend = 0;
+    let net = 0;
+    let orders = 0;
+    let shopeeClicks = 0;
+    if (source === "all") {
+      const t = day.totals;
+      spend = t.totalSpend;
+      net = computeNetCommission(t.commissionTotal, t.commissionPending, fees);
+      orders = t.ordersCount;
+      shopeeClicks = sumFiltered(t.shopeeClicksByReferrer, clickSources);
+    } else {
+      for (const r of day.rows) {
+        if (!rowMatchesSource(r, source)) continue;
+        net += computeNetCommission(r.commissionTotal, r.commissionPending, fees);
+        orders += r.ordersCount;
+        shopeeClicks += sumFiltered(r.shopeeClicksByReferrer, clickSources);
+      }
+      // spend = 0 cho shopee_only (không tính ads)
+    }
     const profit = net - spend;
     const roi = spend > 0 ? (profit / spend) * 100 : null;
     const [, m, d] = day.date.split("-");
@@ -369,8 +384,8 @@ export function computeDailyTrend(
       netCommission: net,
       profit,
       roi,
-      orders: t.ordersCount,
-      shopeeClicks: sumFiltered(t.shopeeClicksByReferrer, clickSources),
+      orders,
+      shopeeClicks,
       dayCount: 1,
     });
   }

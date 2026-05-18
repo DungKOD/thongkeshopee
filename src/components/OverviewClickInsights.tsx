@@ -8,15 +8,25 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { fmtInt, fmtPct, fmtVnd } from "../formulas";
+import { computeNetCommission, fmtInt, fmtPct, fmtVnd } from "../formulas";
+import type { ProfitFees } from "../hooks/useSettings";
 
 /// Shape BE `load_referrer_efficiency` trả về.
+/// `commission` + `commissionPending` là raw từ DB (đã trừ MCN, chưa trừ
+/// tax + reserve). FE áp `computeNetCommission(commission, commissionPending,
+/// fees)` để ra hoa hồng ròng cuối cùng.
 export interface ReferrerEfficiency {
   referrer: string;
   clicks: number;
   orders: number;
   commission: number;
+  commissionPending: number;
   cr: number | null;
+}
+
+interface ReferrerEfficiencyTableProps {
+  rows: ReferrerEfficiency[];
+  fees: ProfitFees;
 }
 
 /// Bảng referrer leaderboard sắp theo CR (quality signal cho ads).
@@ -24,9 +34,8 @@ export interface ReferrerEfficiency {
 /// + CR để xác định referrer nào bring revenue thực sự.
 export function ReferrerEfficiencyTable({
   rows,
-}: {
-  rows: ReferrerEfficiency[];
-}) {
+  fees,
+}: ReferrerEfficiencyTableProps) {
   if (rows.length === 0) {
     return (
       <section className="rounded-xl bg-surface-2 px-5 py-4 shadow-elev-2">
@@ -51,8 +60,17 @@ export function ReferrerEfficiencyTable({
           className="material-symbols-rounded cursor-help text-sm text-white/40"
           title={
             "Sắp theo CR (Conversion Rate). Orders được phân bổ theo tỉ lệ " +
-            "click giữa các referrer cùng sub_ids trong cùng ngày (approximate " +
-            "vì Shopee không gắn referrer cho order)."
+            "click giữa các referrer có cùng sub_ids và cùng ngày click " +
+            "(approximate vì Shopee không gắn referrer cho order).\n" +
+            "Match theo DATE(click_time) → click hôm nay + đơn 3 ngày sau " +
+            "vẫn được attribute đúng.\n" +
+            "Tuple sub_id ngắn (vd 2 slot) merge với tuple dài hơn (3 slot) " +
+            "cùng ngày nếu prefix-compatible — không mất attribution khi " +
+            "click row và order row ghi sub_ids khác depth.\n" +
+            "Row \"(không gắn click)\" = đơn có click_time nhưng không match " +
+            "click row nào trong DB (click thiếu hoặc tracking sai).\n" +
+            "Hoa hồng ròng = commission × (1 - tax) - pending × reserve, " +
+            "áp đúng config Settings → khớp với KPI Overview."
           }
         >
           help
@@ -66,7 +84,7 @@ export function ReferrerEfficiencyTable({
               <th className="px-3 py-2 text-right">Click</th>
               <th className="px-3 py-2 text-right">Đơn</th>
               <th className="px-3 py-2 text-right">CR</th>
-              <th className="px-3 py-2 text-right">Hoa hồng</th>
+              <th className="px-3 py-2 text-right">Hoa hồng ròng</th>
             </tr>
           </thead>
           <tbody>
@@ -79,6 +97,11 @@ export function ReferrerEfficiencyTable({
                   : r.cr >= 1
                   ? "text-amber-300"
                   : "text-red-400";
+              const netCommission = computeNetCommission(
+                r.commission,
+                r.commissionPending,
+                fees,
+              );
               return (
                 <tr
                   key={r.referrer || "(unknown)"}
@@ -102,7 +125,7 @@ export function ReferrerEfficiencyTable({
                     {r.cr !== null ? fmtPct(r.cr) : "—"}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-white/85">
-                    {fmtVnd(r.commission)}
+                    {fmtVnd(netCommission)}
                   </td>
                 </tr>
               );

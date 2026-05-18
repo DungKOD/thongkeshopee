@@ -1,5 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  LabelList,
+  Legend,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import type { OrderItemDetail, UiDay } from "../types";
 import {
   fmtDate,
@@ -139,10 +151,78 @@ export function AggregateProductDialog({
     };
   }, [isOpen, product, perDayMatches]);
 
-  const uniqueOrderIds = useMemo(
-    () => new Set(items.map((i) => i.orderId)).size,
-    [items],
-  );
+  // Aggregate stats ở MỨC ĐƠN (distinct order_id), KHÔNG phải line-item.
+  // 1 đơn có nhiều line → trước đây 14 hủy / 469 không HH cộng nhiều lần per
+  // line; giờ collapse về order: hủy = có ≥1 line hủy, không-HH = sum(net) = 0.
+  const orderStats = useMemo(() => {
+    const perOrder = new Map<string, { cancelled: boolean; netSum: number }>();
+    for (const it of items) {
+      const cur = perOrder.get(it.orderId) ?? { cancelled: false, netSum: 0 };
+      if (/hủy|cancel/i.test(it.orderStatus ?? "")) cur.cancelled = true;
+      cur.netSum += it.netCommission ?? 0;
+      perOrder.set(it.orderId, cur);
+    }
+    let cancelledOrders = 0;
+    let zeroCommissionOrders = 0;
+    let attributedOrders = 0;
+    for (const v of perOrder.values()) {
+      if (v.cancelled) cancelledOrders += 1;
+      if (v.netSum === 0) zeroCommissionOrders += 1;
+      else attributedOrders += 1;
+    }
+    return {
+      totalOrders: perOrder.size,
+      cancelledOrders,
+      zeroCommissionOrders,
+      attributedOrders,
+    };
+  }, [items]);
+
+  // Daily breakdown cho chart: mỗi bar = 1 ngày, stack {attributed, zeroHH,
+  // cancelled}. Phân loại đơn theo orderTime date (không phải day_date input
+  // — đơn có thể click ngày X, đặt ngày Y; chart dùng ngày ĐẶT đơn).
+  // 3 nhóm exclusive: cancelled > zeroHH (non-cancelled) > attributed (HH>0).
+  const dailyBreakdown = useMemo(() => {
+    const perDate = new Map<
+      string,
+      Map<string, { cancelled: boolean; netSum: number }>
+    >();
+    for (const it of items) {
+      const date = it.orderTime ? it.orderTime.slice(0, 10) : "";
+      if (!date) continue;
+      let orderMap = perDate.get(date);
+      if (!orderMap) {
+        orderMap = new Map();
+        perDate.set(date, orderMap);
+      }
+      const cur = orderMap.get(it.orderId) ?? { cancelled: false, netSum: 0 };
+      if (/hủy|cancel/i.test(it.orderStatus ?? "")) cur.cancelled = true;
+      cur.netSum += it.netCommission ?? 0;
+      orderMap.set(it.orderId, cur);
+    }
+    const out: {
+      date: string;
+      dateShort: string;
+      attributed: number;
+      zeroHH: number;
+      cancelled: number;
+    }[] = [];
+    for (const [date, orderMap] of perDate) {
+      let attributed = 0;
+      let cancelled = 0;
+      let zeroHH = 0;
+      for (const v of orderMap.values()) {
+        if (v.cancelled) cancelled += 1;
+        else if (v.netSum === 0) zeroHH += 1;
+        else attributed += 1;
+      }
+      const parts = date.split("-");
+      const dateShort = parts.length === 3 ? `${parts[2]}/${parts[1]}` : date;
+      out.push({ date, dateShort, attributed, zeroHH, cancelled });
+    }
+    out.sort((a, b) => a.date.localeCompare(b.date));
+    return out;
+  }, [items]);
 
   // Product insights filter — derive date range từ days prop. Days list
   // sorted DESC (newest first) → first=to, last=from. ProductClickInsights
@@ -159,14 +239,6 @@ export function AggregateProductDialog({
       subIds: product.subIds as unknown as [string, string, string, string, string],
     };
   }, [product, days, accountFilter]);
-  const cancelledCount = useMemo(
-    () => items.filter((i) => /hủy|cancel/i.test(i.orderStatus ?? "")).length,
-    [items],
-  );
-  const zeroCommissionCount = useMemo(
-    () => items.filter((i) => (i.netCommission ?? 0) === 0).length,
-    [items],
-  );
 
   const handleScreenshot = async () => {
     if (!dialogRef.current || capturing) return;
@@ -386,8 +458,21 @@ export function AggregateProductDialog({
             </div>
           </Section>
 
-          {/* ============ Phân tích click Shopee (scope theo sub_ids) ============ */}
-          {insightsFilter && <ProductClickInsights filter={insightsFilter} />}
+          {/* ============ Phân tích click Shopee (scope theo sub_ids) ============
+              Chart "Đơn hàng theo trạng thái" được chèn qua slot beforeDelayChart
+              → nằm NGAY TRÊN "Thời gian click → đặt hàng" (ClickDelayChart). */}
+          {insightsFilter && (
+            <ProductClickInsights
+              filter={insightsFilter}
+              beforeDelayChart={
+                !loadingItems && dailyBreakdown.length > 0 ? (
+                  <Section icon="bar_chart" title="Đơn hàng theo trạng thái">
+                    <OrderStatusBreakdownChart data={dailyBreakdown} />
+                  </Section>
+                ) : null
+              }
+            />
+          )}
 
           {/* ============ Tất cả đơn hàng ============ */}
           <Section
@@ -397,12 +482,29 @@ export function AggregateProductDialog({
             right={
               !loadingItems && items.length > 0 ? (
                 <div className="flex gap-1.5 text-[11px]">
-                  <Chip tone="default">{uniqueOrderIds} đơn</Chip>
-                  {cancelledCount > 0 && (
-                    <Chip tone="danger">{cancelledCount} hủy</Chip>
+                  <Chip
+                    tone="default"
+                    title={`${fmtInt(orderStats.attributedOrders)} đơn có HH · ${fmtInt(
+                      orderStats.zeroCommissionOrders,
+                    )} đơn HH=0đ (gồm cả đơn hủy & đơn Shopee chưa attribute)`}
+                  >
+                    {orderStats.totalOrders} đơn
+                  </Chip>
+                  {orderStats.cancelledOrders > 0 && (
+                    <Chip
+                      tone="danger"
+                      title="Đơn có ít nhất 1 line trạng thái 'Đã hủy' / 'Cancelled'"
+                    >
+                      {orderStats.cancelledOrders} hủy
+                    </Chip>
                   )}
-                  {zeroCommissionCount > 0 && (
-                    <Chip tone="warning">{zeroCommissionCount} không HH</Chip>
+                  {orderStats.zeroCommissionOrders > 0 && (
+                    <Chip
+                      tone="warning"
+                      title="Đơn có hoa hồng = 0đ. Nguyên nhân: đơn hủy, Shopee chưa attribute sub_id, hoặc bị phí MCN trừ hết. Bao gồm cả đơn hủy."
+                    >
+                      {orderStats.zeroCommissionOrders} không HH
+                    </Chip>
                   )}
                 </div>
               ) : null
@@ -451,8 +553,11 @@ export function AggregateProductDialog({
                         <th className="border-b border-surface-8 px-3 py-2.5 text-right font-semibold uppercase tracking-wider">
                           GMV
                         </th>
-                        <th className="border-b border-surface-8 px-3 py-2.5 text-right font-semibold uppercase tracking-wider">
-                          Hoa hồng ròng
+                        <th
+                          className="cursor-help border-b border-surface-8 px-3 py-2.5 text-right font-semibold uppercase tracking-wider"
+                          title="HH Shopee đã trả (raw CSV col 'Hoa hồng ròng tiếp thị liên kết', đã trừ phí MCN). Chưa trừ thuế & dự phòng — KPI 'Hoa hồng ròng' ở trên đã trừ tiếp."
+                        >
+                          HH Shopee trả
                         </th>
                         <th className="border-b border-surface-8 px-3 py-2.5 text-left font-semibold uppercase tracking-wider">
                           Kênh
@@ -612,9 +717,11 @@ function Section({
 
 function Chip({
   tone,
+  title,
   children,
 }: {
   tone: "default" | "danger" | "warning";
+  title?: string;
   children: React.ReactNode;
 }) {
   const cls =
@@ -625,7 +732,10 @@ function Chip({
       : "bg-surface-6 text-white/70 border-surface-8";
   return (
     <span
-      className={`rounded-full border px-2 py-0.5 font-medium normal-case ${cls}`}
+      title={title}
+      className={`rounded-full border px-2 py-0.5 font-medium normal-case ${
+        title ? "cursor-help" : ""
+      } ${cls}`}
     >
       {children}
     </span>
@@ -702,3 +812,292 @@ function MetricRow({
   );
 }
 
+// =========================================================
+// Chart: breakdown đơn theo trạng thái (stack theo ngày)
+// =========================================================
+
+type BreakdownPoint = {
+  date: string;
+  dateShort: string;
+  attributed: number;
+  zeroHH: number;
+  cancelled: number;
+};
+
+const COLOR_ATTRIBUTED = "#22c55e"; // green — đơn có HH
+const COLOR_ZERO_HH = "#f59e0b"; // amber — đơn HH=0 (chưa attribute / MCN trừ hết)
+const COLOR_CANCELLED = "#ef4444"; // red — đơn hủy
+
+type BreakdownChartPoint = BreakdownPoint & {
+  total: number;
+  badPct: number; // (zeroHH + cancelled) / total × 100
+};
+
+function OrderStatusBreakdownChart({ data }: { data: BreakdownPoint[] }) {
+  // Augment với total + badPct cho label/tooltip.
+  const points: BreakdownChartPoint[] = useMemo(
+    () =>
+      data.map((d) => {
+        const total = d.attributed + d.zeroHH + d.cancelled;
+        const bad = d.zeroHH + d.cancelled;
+        const badPct = total > 0 ? (bad / total) * 100 : 0;
+        return { ...d, total, badPct };
+      }),
+    [data],
+  );
+
+  // Totals + averages per day để hiển thị summary phía trên chart.
+  // daysCount = số ngày có ít nhất 1 đơn (= data.length sau khi filter ở memo).
+  const stats = useMemo(() => {
+    let attributed = 0;
+    let zeroHH = 0;
+    let cancelled = 0;
+    for (const d of data) {
+      attributed += d.attributed;
+      zeroHH += d.zeroHH;
+      cancelled += d.cancelled;
+    }
+    const total = attributed + zeroHH + cancelled;
+    const daysCount = data.length;
+    const safeDiv = (a: number, b: number) => (b > 0 ? a / b : 0);
+    return {
+      attributed,
+      zeroHH,
+      cancelled,
+      total,
+      daysCount,
+      avgAttributed: safeDiv(attributed, daysCount),
+      avgZeroHH: safeDiv(zeroHH, daysCount),
+      avgCancelled: safeDiv(cancelled, daysCount),
+      avgTotal: safeDiv(total, daysCount),
+    };
+  }, [data]);
+
+  const fmtPctTotal = (n: number) =>
+    stats.total > 0 ? `${((n / stats.total) * 100).toFixed(1)}%` : "0%";
+  const fmtAvg = (n: number) =>
+    n >= 10 ? n.toFixed(0) : n.toFixed(1);
+
+  return (
+    <div className="rounded-xl bg-surface-2 px-4 py-4 shadow-elev-1">
+      {/* Summary row — tổng + TB/ngày */}
+      <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
+        <SummaryDot
+          color={COLOR_ATTRIBUTED}
+          label="Có HH"
+          value={stats.attributed}
+          pct={fmtPctTotal(stats.attributed)}
+          avg={fmtAvg(stats.avgAttributed)}
+        />
+        <SummaryDot
+          color={COLOR_ZERO_HH}
+          label="HH = 0đ"
+          value={stats.zeroHH}
+          pct={fmtPctTotal(stats.zeroHH)}
+          avg={fmtAvg(stats.avgZeroHH)}
+        />
+        <SummaryDot
+          color={COLOR_CANCELLED}
+          label="Hủy"
+          value={stats.cancelled}
+          pct={fmtPctTotal(stats.cancelled)}
+          avg={fmtAvg(stats.avgCancelled)}
+        />
+        <span className="text-white/55">
+          ·{" "}
+          <span className="font-semibold text-white/85">
+            {fmtAvg(stats.avgTotal)} đơn/ngày
+          </span>
+          <span className="text-white/40"> (TB qua {stats.daysCount} ngày)</span>
+        </span>
+        <span className="ml-auto text-white/45">
+          Label trên cột = % đơn xấu (hủy + HH=0đ)
+        </span>
+      </div>
+      <div className="h-[240px] w-full">
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={points} margin={{ top: 18, right: 10, left: 0, bottom: 0 }}>
+            <CartesianGrid stroke="#ffffff10" vertical={false} />
+            <XAxis
+              dataKey="dateShort"
+              tick={{ fill: "#ffffff70", fontSize: 11 }}
+              axisLine={{ stroke: "#ffffff20" }}
+              tickLine={false}
+            />
+            <YAxis
+              tick={{ fill: "#ffffff70", fontSize: 11 }}
+              axisLine={{ stroke: "#ffffff20" }}
+              tickLine={false}
+              allowDecimals={false}
+              width={40}
+            />
+            <Tooltip
+              cursor={{ fill: "#ffffff08" }}
+              content={<BreakdownTooltip avgTotal={stats.avgTotal} />}
+            />
+            <Legend
+              wrapperStyle={{ fontSize: 12, paddingTop: 8 }}
+              iconType="circle"
+            />
+            {stats.daysCount > 1 && stats.avgTotal > 0 && (
+              <ReferenceLine
+                y={stats.avgTotal}
+                stroke="#ffffff60"
+                strokeDasharray="4 4"
+                strokeWidth={1.5}
+                label={{
+                  value: `TB ${fmtAvg(stats.avgTotal)}/ngày`,
+                  position: "insideTopRight",
+                  fill: "#ffffffb0",
+                  fontSize: 10,
+                  fontWeight: 600,
+                }}
+              />
+            )}
+            <Bar dataKey="attributed" stackId="a" name="Có HH" fill={COLOR_ATTRIBUTED} />
+            <Bar dataKey="zeroHH" stackId="a" name="HH = 0đ" fill={COLOR_ZERO_HH} />
+            <Bar
+              dataKey="cancelled"
+              stackId="a"
+              name="Hủy"
+              fill={COLOR_CANCELLED}
+              radius={[4, 4, 0, 0]}
+            >
+              <LabelList
+                dataKey="badPct"
+                position="top"
+                formatter={(v: unknown) => {
+                  const n = Number(v);
+                  return n > 0 ? `${n.toFixed(0)}%` : "";
+                }}
+                style={{ fill: "#ffffff90", fontSize: 10, fontWeight: 600 }}
+              />
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+// Custom tooltip — hiển thị count + % cho mỗi segment + tổng + so sánh TB.
+function BreakdownTooltip({
+  active,
+  payload,
+  label,
+  avgTotal,
+}: {
+  active?: boolean;
+  payload?: Array<{ payload?: BreakdownChartPoint }>;
+  label?: string;
+  avgTotal?: number;
+}) {
+  if (!active || !payload || payload.length === 0) return null;
+  const p = payload[0]?.payload;
+  if (!p) return null;
+  const total = p.total;
+  const pct = (n: number) =>
+    total > 0 ? `${((n / total) * 100).toFixed(1)}%` : "0%";
+
+  // Diff vs TB — biết ngày này trên/dưới mức bình thường.
+  let avgDiff: { sign: "up" | "down" | "eq"; text: string } | null = null;
+  if (avgTotal !== undefined && avgTotal > 0) {
+    const diffPct = ((total - avgTotal) / avgTotal) * 100;
+    if (Math.abs(diffPct) < 0.5) avgDiff = { sign: "eq", text: "≈ TB" };
+    else if (diffPct > 0)
+      avgDiff = { sign: "up", text: `+${diffPct.toFixed(0)}% vs TB` };
+    else avgDiff = { sign: "down", text: `${diffPct.toFixed(0)}% vs TB` };
+  }
+
+  return (
+    <div className="rounded-lg border border-white/20 bg-[#1f1f23] px-3 py-2 text-xs shadow-lg">
+      <div className="mb-1.5 font-semibold text-white/90">{label}</div>
+      <div className="space-y-0.5">
+        <TooltipRow color={COLOR_ATTRIBUTED} label="Có HH" value={p.attributed} pct={pct(p.attributed)} />
+        <TooltipRow color={COLOR_ZERO_HH} label="HH = 0đ" value={p.zeroHH} pct={pct(p.zeroHH)} />
+        <TooltipRow color={COLOR_CANCELLED} label="Hủy" value={p.cancelled} pct={pct(p.cancelled)} />
+      </div>
+      <div className="mt-1.5 flex items-center justify-between border-t border-white/10 pt-1.5">
+        <span className="text-white/60">Tổng</span>
+        <span className="flex items-center gap-2">
+          <span className="font-semibold tabular-nums text-white/95">
+            {fmtInt(total)} đơn
+          </span>
+          {avgDiff && (
+            <span
+              className={`text-[10px] tabular-nums ${
+                avgDiff.sign === "up"
+                  ? "text-green-400"
+                  : avgDiff.sign === "down"
+                  ? "text-amber-400"
+                  : "text-white/50"
+              }`}
+            >
+              {avgDiff.text}
+            </span>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function TooltipRow({
+  color,
+  label,
+  value,
+  pct,
+}: {
+  color: string;
+  label: string;
+  value: number;
+  pct: string;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        className="inline-block h-2 w-2 rounded-full"
+        style={{ backgroundColor: color }}
+      />
+      <span className="flex-1 text-white/70">{label}</span>
+      <span className="tabular-nums text-white/95">{fmtInt(value)}</span>
+      <span className="w-12 text-right tabular-nums text-white/50">{pct}</span>
+    </div>
+  );
+}
+
+function SummaryDot({
+  color,
+  label,
+  value,
+  pct,
+  avg,
+}: {
+  color: string;
+  label: string;
+  value: number;
+  pct: string;
+  avg?: string;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span
+        className="inline-block h-2.5 w-2.5 rounded-full"
+        style={{ backgroundColor: color }}
+      />
+      <span className="text-white/70">{label}:</span>
+      <span className="font-semibold tabular-nums text-white/95">
+        {fmtInt(value)}
+      </span>
+      <span className="text-white/45">({pct})</span>
+      {avg !== undefined && (
+        <span
+          className="text-white/45"
+          title="Trung bình mỗi ngày trong khoảng đã chọn"
+        >
+          · TB <span className="tabular-nums text-white/75">{avg}</span>/ngày
+        </span>
+      )}
+    </div>
+  );
+}

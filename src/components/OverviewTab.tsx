@@ -38,6 +38,10 @@ import {
   type DelayBucket,
   type ReferrerEfficiency,
 } from "./OverviewClickInsights";
+import {
+  CancellationRateChart,
+  type CancellationByDayBucket,
+} from "./CancellationRateChart";
 
 interface OverviewTabProps {
   days: UiDay[];
@@ -218,6 +222,9 @@ export function OverviewTab({
   const [hourlyClicks, setHourlyClicks] = useState<HourlyBucket[]>([]);
   const [referrerEff, setReferrerEff] = useState<ReferrerEfficiency[]>([]);
   const [clickDelays, setClickDelays] = useState<DelayBucket[]>([]);
+  const [cancellationByDay, setCancellationByDay] = useState<
+    CancellationByDayBucket[]
+  >([]);
   const [clickInsightsLoading, setClickInsightsLoading] = useState(false);
   useEffect(() => {
     let cancelled = false;
@@ -233,8 +240,11 @@ export function OverviewTab({
       invoke<HourlyClickBucketDto[]>("load_hourly_clicks", { filter: beFilter }),
       invoke<ReferrerEfficiency[]>("load_referrer_efficiency", { filter: beFilter }),
       invoke<DelayBucket[]>("load_click_order_delays", { filter: beFilter }),
+      invoke<CancellationByDayBucket[]>("load_cancellation_by_subid", {
+        filter: beFilter,
+      }),
     ])
-      .then(([orders, clicks, referrers, delays]) => {
+      .then(([orders, clicks, referrers, delays, cancellations]) => {
         if (cancelled) return;
         setHourlyOrders(
           orders.map((b) => ({
@@ -256,6 +266,7 @@ export function OverviewTab({
         );
         setReferrerEff(referrers);
         setClickDelays(delays);
+        setCancellationByDay(cancellations);
       })
       .catch((e) => {
         console.error("[overview click insights] load failed:", e);
@@ -264,6 +275,7 @@ export function OverviewTab({
           setHourlyClicks([]);
           setReferrerEff([]);
           setClickDelays([]);
+          setCancellationByDay([]);
         }
       })
       .finally(() => {
@@ -377,11 +389,23 @@ export function OverviewTab({
         />
       </section>
 
+      {/* ============ Tỉ lệ hoàn hủy top sản phẩm — sort DESC theo % hủy ============ */}
+      <CancellationRateChart
+        data={cancellationByDay}
+        onSelectSubId={(subIds) => {
+          // Lookup product trong aggregate list theo sub_id key (join \x1f).
+          // Match found → mở dialog detail; không → silent (SP ngoài source filter).
+          const key = subIds.join("\x1f");
+          const match = products.find((p) => p.subIds.join("\x1f") === key);
+          if (match) setSelectedProduct(match);
+        }}
+      />
+
       {/* ============ Click-to-order delay histogram ============ */}
       <ClickDelayChart data={clickDelays} />
 
       {/* ============ Referrer efficiency leaderboard ============ */}
-      <ReferrerEfficiencyTable rows={referrerEff} />
+      <ReferrerEfficiencyTable rows={referrerEff} fees={settings.profitFees} />
 
       {/* ============ Efficiency + Breakeven + Funnel + Best/Worst day +
            Referrers + Winners/Losers ============ */}

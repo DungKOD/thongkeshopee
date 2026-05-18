@@ -1086,6 +1086,206 @@ pub fn import_fb_campaigns(
 }
 
 // ============================================================
+// FB Hierarchy ads (format mới: chiến dịch + nhóm + quảng cáo)
+// ============================================================
+// CSV/XLSX export FB Ads Manager mới có 3 cột tách rời:
+//   "Tên chiến dịch", "Tên nhóm quảng cáo", "Tên quảng cáo"
+// + cột "Cấp độ phân phối" với value 'ad' cho leaf rows.
+//
+// Một (campaign, adset, ad) có thể trùng tên nhưng FB phân biệt qua ID.
+// Vì CSV không xuất ID, ta dùng `occurrence_idx` (0..N) để giữ tất cả row
+// trùng triple-key, không UPSERT collapse → tránh mất data.
+
+const KIND_FB_HIERARCHY: &str = "fb_hierarchy";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct FbHierarchyAdRow {
+    pub campaign_name: String,
+    pub ad_set_name: String,
+    pub ad_name: String,
+    /// 0..N — phân biệt nhiều ad cùng (camp, adset, ad) trong cùng ngày.
+    /// FE compute: group rows by triple-key, gán index 0..N theo thứ tự gặp.
+    pub occurrence_idx: i64,
+    /// Sub_id ưu tiên parse từ ad_name → ad_set_name → campaign_name.
+    /// FE đã resolve trước khi gửi sang.
+    pub sub_ids: [String; 5],
+    pub report_start: String,
+    pub report_end: String,
+    pub status: Option<String>,
+    pub spend: Option<f64>,
+    pub impressions: Option<i64>,
+    pub reach: Option<i64>,
+    pub frequency: Option<f64>,
+    pub link_clicks: Option<i64>,
+    pub all_clicks: Option<i64>,
+    pub link_cpc: Option<f64>,
+    pub all_cpc: Option<f64>,
+    pub link_ctr: Option<f64>,
+    pub all_ctr: Option<f64>,
+    pub cpm: Option<f64>,
+    pub result_count: Option<i64>,
+    pub cost_per_result: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFbHierarchyPayload {
+    pub filename: String,
+    pub raw_content: String,
+    pub rows: Vec<FbHierarchyAdRow>,
+    /// Thuế % gắn cho cả file. Xem doc ở `ImportFbAdGroupsPayload::tax_rate`.
+    #[serde(default)]
+    pub tax_rate: f64,
+}
+
+/// UPSERT cho `raw_fb_ads_hierarchy`. Cùng pattern no-overwrite-with-zero
+/// guard như `FB_ADS_UPSERT_SQL`. Conflict key dài hơn vì có 3 tên + occ_idx.
+const FB_ADS_HIER_UPSERT_SQL: &str = "
+    INSERT INTO raw_fb_ads_hierarchy
+    (id, campaign_name, ad_set_name, ad_name, occurrence_idx,
+     sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+     report_start, report_end, status,
+     spend, clicks, cpc, impressions, reach, tax_rate,
+     day_date, source_file_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(day_date, campaign_name, ad_set_name, ad_name, occurrence_idx) DO UPDATE SET
+       sub_id1 = excluded.sub_id1, sub_id2 = excluded.sub_id2,
+       sub_id3 = excluded.sub_id3, sub_id4 = excluded.sub_id4,
+       sub_id5 = excluded.sub_id5,
+       report_start = excluded.report_start, report_end = excluded.report_end,
+       status = excluded.status,
+       spend       = CASE WHEN COALESCE(excluded.spend, 0)       > 0 THEN excluded.spend       ELSE spend       END,
+       clicks      = CASE WHEN COALESCE(excluded.clicks, 0)      > 0 THEN excluded.clicks      ELSE clicks      END,
+       cpc         = CASE WHEN COALESCE(excluded.cpc, 0)         > 0 THEN excluded.cpc         ELSE cpc         END,
+       impressions = CASE WHEN COALESCE(excluded.impressions, 0) > 0 THEN excluded.impressions ELSE impressions END,
+       reach       = CASE WHEN COALESCE(excluded.reach, 0)       > 0 THEN excluded.reach       ELSE reach       END,
+       tax_rate    = excluded.tax_rate,
+       source_file_id = excluded.source_file_id
+    RETURNING id
+";
+
+/// Import FB hierarchy rows (format 3 cấp). Parallel với `import_fb_ad_groups`,
+/// không động vào flow cũ.
+#[tauri::command]
+pub fn import_fb_hierarchy(
+    state: State<'_, DbState>,
+    payload: ImportFbHierarchyPayload,
+) -> CmdResult<ImportResult> {
+    let day_date = validate_fb_single_date(
+        payload
+            .rows
+            .iter()
+            .map(|r| (r.report_start.clone(), r.report_end.clone())),
+        "FB Hierarchy",
+    )?;
+    let tax_rate = validate_tax_rate(payload.tax_rate)?;
+
+    let hash = compute_hash(&payload.raw_content);
+    let now = now_rfc3339_z();
+
+    let mut conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let imports_dir = resolve_active_imports_dir(&conn)
+        .map_err(|e| CmdError::msg(e.to_string()))?;
+    let stored_path = save_raw_csv(&imports_dir, &hash, &payload.raw_content)?;
+    let tx = conn.transaction()?;
+
+    let source_file_id = register_imported_file(
+        &tx,
+        &payload.filename,
+        KIND_FB_HIERARCHY,
+        &now,
+        &hash,
+        &stored_path,
+        &day_date,
+        payload.rows.len() as i64,
+        None,
+    )?;
+
+    let mut inserted: i64 = 0;
+    let mut duplicated: i64 = 0;
+    {
+        let mut stmt = tx.prepare(FB_ADS_HIER_UPSERT_SQL)?;
+        let mut map_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO fb_ads_hier_to_file(fb_ad_id, file_id) VALUES(?, ?)",
+        )?;
+        for r in &payload.rows {
+            let before: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM raw_fb_ads_hierarchy
+                     WHERE day_date = ? AND campaign_name = ? AND ad_set_name = ?
+                       AND ad_name = ? AND occurrence_idx = ?",
+                    params![
+                        day_date,
+                        r.campaign_name,
+                        r.ad_set_name,
+                        r.ad_name,
+                        r.occurrence_idx
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let clicks = normalize_clicks(r.link_clicks, r.all_clicks, r.result_count);
+            let cpc = normalize_cpc(r.link_cpc, r.all_cpc, r.cost_per_result);
+            let content_id = content_id::fb_ad_hier_id(
+                &day_date,
+                &r.campaign_name,
+                &r.ad_set_name,
+                &r.ad_name,
+                r.occurrence_idx,
+            );
+            let fb_ad_id: i64 = stmt.query_row(
+                params![
+                    content_id,
+                    r.campaign_name,
+                    r.ad_set_name,
+                    r.ad_name,
+                    r.occurrence_idx,
+                    r.sub_ids[0],
+                    r.sub_ids[1],
+                    r.sub_ids[2],
+                    r.sub_ids[3],
+                    r.sub_ids[4],
+                    r.report_start,
+                    r.report_end,
+                    r.status,
+                    r.spend,
+                    clicks,
+                    cpc,
+                    r.impressions,
+                    r.reach,
+                    tax_rate,
+                    day_date,
+                    source_file_id,
+                ],
+                |row| row.get(0),
+            )?;
+            map_stmt.execute(params![fb_ad_id, source_file_id])?;
+            if before == 0 {
+                inserted += 1;
+            } else {
+                duplicated += 1;
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    Ok(ImportResult {
+        imported_file_id: source_file_id,
+        day_date: day_date.clone(),
+        day_date_from: day_date.clone(),
+        day_date_to: day_date,
+        row_count: payload.rows.len() as i64,
+        inserted,
+        duplicated,
+        skipped: 0,
+        mcn_mismatch_count: 0,
+    })
+}
+
+// ============================================================
 // Tests
 // ============================================================
 

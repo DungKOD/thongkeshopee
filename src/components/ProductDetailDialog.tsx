@@ -145,18 +145,37 @@ export function ProductDetailDialog({
     { icon: "edit_note", label: "Manual", active: row.hasManual },
   ];
 
-  const uniqueOrderIds = new Set(items.map((i) => i.orderId)).size;
-  const cancelledCount = items.filter((i) =>
-    /hủy|cancel/i.test(i.orderStatus ?? ""),
-  ).length;
-  const zeroCommissionCount = items.filter(
-    (i) => (i.netCommission ?? 0) === 0,
-  ).length;
+  // Aggregate ở mức đơn (distinct order_id), không phải line-item.
+  // 1 đơn có nhiều line → cancelled = ≥1 line hủy, không-HH = sum(net) = 0.
+  const orderStats = (() => {
+    const perOrder = new Map<string, { cancelled: boolean; netSum: number }>();
+    for (const it of items) {
+      const cur = perOrder.get(it.orderId) ?? { cancelled: false, netSum: 0 };
+      if (/hủy|cancel/i.test(it.orderStatus ?? "")) cur.cancelled = true;
+      cur.netSum += it.netCommission ?? 0;
+      perOrder.set(it.orderId, cur);
+    }
+    let cancelledOrders = 0;
+    let zeroCommissionOrders = 0;
+    let attributedOrders = 0;
+    for (const v of perOrder.values()) {
+      if (v.cancelled) cancelledOrders += 1;
+      if (v.netSum === 0) zeroCommissionOrders += 1;
+      else attributedOrders += 1;
+    }
+    return {
+      totalOrders: perOrder.size,
+      cancelledOrders,
+      zeroCommissionOrders,
+      attributedOrders,
+    };
+  })();
 
-  // Chỉ số đơn hàng
-  const totalItemsCount = items.length;
+  // Tỷ lệ hủy ở mức ĐƠN (không phải line-item) để khớp với chip.
   const cancelRate =
-    totalItemsCount > 0 ? (cancelledCount / totalItemsCount) * 100 : null;
+    orderStats.totalOrders > 0
+      ? (orderStats.cancelledOrders / orderStats.totalOrders) * 100
+      : null;
   const avgCommission =
     row.ordersCount > 0 ? row.commissionTotal / row.ordersCount : null;
   const commissionRate =
@@ -379,7 +398,7 @@ export function ProductDetailDialog({
                     ? "…"
                     : "—"
                 }
-                tooltip="Số item hủy / Tổng item trong đơn × 100% (tính từ Shopee Commission CSV)"
+                tooltip="Số đơn có ≥1 line hủy / Tổng đơn × 100% (tính ở mức order, không phải line-item)"
               />
               <MetricRow
                 label="GMV tổng"
@@ -508,12 +527,29 @@ export function ProductDetailDialog({
             right={
               !loadingItems && items.length > 0 ? (
                 <div className="flex gap-1.5 text-[11px]">
-                  <Chip tone="default">{uniqueOrderIds} đơn</Chip>
-                  {cancelledCount > 0 && (
-                    <Chip tone="danger">{cancelledCount} hủy</Chip>
+                  <Chip
+                    tone="default"
+                    title={`${fmtInt(orderStats.attributedOrders)} đơn có HH · ${fmtInt(
+                      orderStats.zeroCommissionOrders,
+                    )} đơn HH=0đ (gồm cả đơn hủy & đơn Shopee chưa attribute)`}
+                  >
+                    {orderStats.totalOrders} đơn
+                  </Chip>
+                  {orderStats.cancelledOrders > 0 && (
+                    <Chip
+                      tone="danger"
+                      title="Đơn có ít nhất 1 line trạng thái 'Đã hủy' / 'Cancelled'"
+                    >
+                      {orderStats.cancelledOrders} hủy
+                    </Chip>
                   )}
-                  {zeroCommissionCount > 0 && (
-                    <Chip tone="warning">{zeroCommissionCount} không HH</Chip>
+                  {orderStats.zeroCommissionOrders > 0 && (
+                    <Chip
+                      tone="warning"
+                      title="Đơn có hoa hồng = 0đ. Nguyên nhân: đơn hủy, Shopee chưa attribute sub_id, hoặc bị phí MCN trừ hết. Bao gồm cả đơn hủy."
+                    >
+                      {orderStats.zeroCommissionOrders} không HH
+                    </Chip>
                   )}
                 </div>
               ) : null
@@ -557,8 +593,11 @@ export function ProductDetailDialog({
                         <th className="border-b border-surface-8 px-3 py-2.5 text-right font-semibold uppercase tracking-wider">
                           GMV
                         </th>
-                        <th className="border-b border-surface-8 px-3 py-2.5 text-right font-semibold uppercase tracking-wider">
-                          Hoa hồng ròng
+                        <th
+                          className="cursor-help border-b border-surface-8 px-3 py-2.5 text-right font-semibold uppercase tracking-wider"
+                          title="HH Shopee đã trả (raw CSV col 'Hoa hồng ròng tiếp thị liên kết', đã trừ phí MCN). Chưa trừ thuế & dự phòng — KPI 'Hoa hồng ròng' ở trên đã trừ tiếp."
+                        >
+                          HH Shopee trả
                         </th>
                         <th className="border-b border-surface-8 px-3 py-2.5 text-left font-semibold uppercase tracking-wider">
                           Kênh
@@ -797,9 +836,11 @@ function BreakdownRow({
 
 function Chip({
   tone,
+  title,
   children,
 }: {
   tone: "default" | "danger" | "warning";
+  title?: string;
   children: React.ReactNode;
 }) {
   const cls =
@@ -810,7 +851,10 @@ function Chip({
       : "bg-surface-6 text-white/70 border-surface-8";
   return (
     <span
-      className={`rounded-full border px-2 py-0.5 font-medium normal-case ${cls}`}
+      title={title}
+      className={`rounded-full border px-2 py-0.5 font-medium normal-case ${
+        title ? "cursor-help" : ""
+      } ${cls}`}
     >
       {children}
     </span>

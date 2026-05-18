@@ -60,6 +60,54 @@ pub struct UiRow {
     /// Tên account hiển thị UI (nullable cùng `account_id`). Backend lookup từ
     /// `shopee_accounts` 1 lần per query để tránh N+1.
     pub account_name: Option<String>,
+
+    /// Cây 3 cấp campaign → ad_set → ad cho row này. `None` khi tuple không có
+    /// dữ liệu trong `raw_fb_ads_hierarchy` (legacy import dùng `raw_fb_ads` cũ
+    /// không có hierarchy info). UI render expand inline khi `Some`. Spend ở
+    /// mỗi cấp tax-aware (đã nhân `1 + tax_rate/100`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fb_breakdown: Option<FbBreakdown>,
+}
+
+/// Cây hierarchy FB ads cho 1 UiRow. Spend/clicks/CPC đã aggregate ở mỗi cấp.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FbBreakdown {
+    pub campaigns: Vec<FbCampaignGroup>,
+    /// Tổng spend toàn breakdown (= sum tất cả ad-leaf, đã tax). UI dùng để
+    /// verify khớp với `UiRow.total_spend` (sanity check).
+    pub total_spend: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FbCampaignGroup {
+    pub campaign_name: String,
+    pub spend: f64,
+    pub clicks: Option<i64>,
+    pub cpc: Option<f64>,
+    pub ad_sets: Vec<FbAdSetGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FbAdSetGroup {
+    pub ad_set_name: String,
+    pub spend: f64,
+    pub clicks: Option<i64>,
+    pub cpc: Option<f64>,
+    pub ads: Vec<FbAdLeaf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FbAdLeaf {
+    pub ad_name: String,
+    /// 0..N — distinguish nhiều ad cùng tên trong cùng adset.
+    pub occurrence_idx: i64,
+    pub spend: f64,
+    pub clicks: Option<i64>,
+    pub cpc: Option<f64>,
 }
 
 mod id_str_opt {
