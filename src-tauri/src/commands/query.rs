@@ -372,23 +372,42 @@ fn aggregate_rows_for_day(
     // Phase 1: load raw data từ 5 nguồn, giữ canonical tuple.
     // ============================================================
 
-    // Raw owner pairs (canonical, account_id) từ 3 bảng Shopee. Load TẤT CẢ
-    // (không filter account) để owners_for_day đủ info map FB ↔ Shopee. Sau
-    // khi có resolve() mới build owners_for_day với prefix matching.
-    let raw_owner_pairs: Vec<(Canonical, i64)> = {
+    // Owner pairs tách thành 2 tầng để tránh click của TK khác làm nhiễm
+    // canonical khi build owners_for_day.
+    //
+    // Bug: UNION cũ gộp clicks vào cùng orders/manual → TK_A (hoa hồng "sp1")
+    // + TK_B (click "sp1") → owners = {A, B} → fb_bucket = None (FB chung) →
+    // row TK_B mất FB spend → row-0 filter ẩn click → user thấy 0 click.
+    //
+    // Fix: hard owners từ orders + manual (sở hữu thật). Click owners chỉ
+    // dùng làm fallback cho canonical chưa có hard owner (ví dụ: account có
+    // click nhưng chưa có hoa hồng cho ngày đó → FB vẫn được attribution đúng).
+    let hard_owner_pairs: Vec<(Canonical, i64)> = {
         let mut pairs: Vec<(Canonical, i64)> = Vec::new();
         let mut stmt = conn.prepare(
-            // COALESCE → 0 cho row không có shopee_account_id (post-schema
-            // nullable). Id=0 không match bất kỳ account thực nào → filter
-            // by_account vẫn hoạt động; filter All giữ tất cả rows.
             "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, COALESCE(shopee_account_id, 0)
-             FROM raw_shopee_clicks WHERE day_date = ?1
-             UNION
-             SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, COALESCE(shopee_account_id, 0)
              FROM raw_shopee_order_items WHERE day_date = ?1
              UNION
              SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, COALESCE(shopee_account_id, 0)
              FROM manual_entries WHERE day_date = ?1",
+        )?;
+        let iter = stmt.query_map(params![day_date], |r| {
+            let tuple: [String; 5] = [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
+            let acc: i64 = r.get(5)?;
+            Ok((to_canonical(tuple), acc))
+        })?;
+        for row in iter {
+            pairs.push(row?);
+        }
+        pairs
+    };
+
+    let click_owner_pairs: Vec<(Canonical, i64)> = {
+        let mut pairs: Vec<(Canonical, i64)> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+                    COALESCE(shopee_account_id, 0)
+             FROM raw_shopee_clicks WHERE day_date = ?1",
         )?;
         let iter = stmt.query_map(params![day_date], |r| {
             let tuple: [String; 5] = [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?];
@@ -864,21 +883,39 @@ fn aggregate_rows_for_day(
     let default_id = default_account_id_lookup(conn);
 
     // Build owners_for_day dùng resolve() — rep của (canonical, account_id)
-    // từ raw_owner_pairs → set of account_ids.
+    // → set of account_ids cho FB attribution.
     //
     // Normalize: raw acc_id=0 (Shopee row có shopee_account_id IS NULL —
     // legacy/orphan) phải quy về default_id để filter=Account(Mặc định) match
     // được. Nếu giữ 0 trong set, `set.contains(default_id)` trả false → FB
     // attribute cho Mặc định bị filter out sai.
+    //
+    // 2-tier priority:
+    // - Phase 1: chỉ hard owners (orders + manual). Canonical có hard owner
+    //   → click owners của canonical đó bị bỏ qua (không thêm TK_B vào set
+    //   chỉ vì TK_B có click cho canonical đó khi TK_A đã có hoa hồng).
+    // - Phase 2: click owners chỉ dùng làm fallback cho canonical chưa có
+    //   hard owner nào (ví dụ: chỉ có click chưa có hoa hồng → FB vẫn attr đúng).
     let owners_for_day: HashMap<Canonical, HashSet<i64>> = {
+        let normalize_acc = |acc_id: i64| -> i64 {
+            if acc_id == 0 { default_id.unwrap_or(0) } else { acc_id }
+        };
         let mut map: HashMap<Canonical, HashSet<i64>> = HashMap::new();
-        for (canon, acc_id) in &raw_owner_pairs {
-            let normalized = if *acc_id == 0 {
-                default_id.unwrap_or(0)
-            } else {
-                *acc_id
-            };
-            map.entry(resolve(canon)).or_default().insert(normalized);
+        // Phase 1: hard owners.
+        for (canon, acc_id) in &hard_owner_pairs {
+            map.entry(resolve(canon))
+                .or_default()
+                .insert(normalize_acc(*acc_id));
+        }
+        // Phase 2: click owners fallback — chỉ cho canonical chưa có hard owner.
+        let hard_owned: HashSet<Canonical> = map.keys().cloned().collect();
+        for (canon, acc_id) in &click_owner_pairs {
+            let rep = resolve(canon);
+            if !hard_owned.contains(&rep) {
+                map.entry(rep)
+                    .or_default()
+                    .insert(normalize_acc(*acc_id));
+            }
         }
         map
     };
@@ -1062,10 +1099,26 @@ fn aggregate_rows_for_day(
         }
     }
 
-    // Shopee clicks
+    // Shopee clicks — attribute về hard owner nếu canonical có đúng 1 hard owner.
+    // Bug: click TK_B cho sub_id của TK_A (hard owner) bị tích vào ("sp1", TK_B)
+    // → TK_B không có commission/spend → row-0 filter ẩn → click biến mất khỏi row.
+    // Fix: 1 hard owner → merge click vào bucket hard owner (TK_A's row).
+    // 0 owner (chỉ có click, không có hoa hồng) → giữ click.account_id (fallback đúng).
+    // 2+ owners (nhiều TK cùng có hoa hồng sub_id này) → giữ click.account_id, không
+    // xác định được nên merge vào TK nào.
     for r in shopee_clicks {
         let rep = resolve(&r.canonical);
-        let key: Key = (rep.clone(), bucket_for_shopee(r.account_id));
+        let key: Key = {
+            let hard_ids: Vec<i64> = owners_for_day
+                .get(&rep)
+                .map(|s| s.iter().copied().filter(|v| *v != 0).collect())
+                .unwrap_or_default();
+            if hard_ids.len() == 1 {
+                (rep.clone(), Some(hard_ids[0]))
+            } else {
+                (rep.clone(), bucket_for_shopee(r.account_id))
+            }
+        };
         let entry = map.entry(key).or_insert_with(|| make_empty(&rep));
         entry.has_shopee_clicks = true;
         entry.shopee_clicks_total += r.count;
@@ -2895,6 +2948,96 @@ mod tests {
         assert_eq!(day.rows[0].total_spend, Some(999.0));
     }
 
+    fn seed_shopee_click(
+        conn: &Connection,
+        day_date: &str,
+        account_id: i64,
+        sub_ids: [&str; 5],
+        click_id_suffix: &str,
+    ) {
+        let file_id = seed_imported_file(conn, "shopee_clicks", day_date);
+        conn.execute(
+            "INSERT INTO raw_shopee_clicks
+             (click_id, click_time, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              day_date, source_file_id, shopee_account_id)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                format!("CLK-{account_id}-{click_id_suffix}"),
+                format!("{day_date} 10:00:00"),
+                sub_ids[0],
+                sub_ids[1],
+                sub_ids[2],
+                sub_ids[3],
+                sub_ids[4],
+                day_date,
+                file_id,
+                account_id,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Regression test cho bug: import hoa hồng TK_A + click TK_B cùng sub_id
+    /// + FB ads → trước fix `owners_for_day` có {A, B} → fb_bucket = None →
+    /// FB chung thay vì TK_A → row TK_B mất FB spend → row-0 filter ẩn click.
+    /// Sau fix: click TK_B chỉ là soft owner, không thêm vào nếu A đã hard-own.
+    #[test]
+    fn commission_account_a_click_account_b_same_sub_fb_attributed_to_a() {
+        let conn = seed_conn();
+        let acc_a = seed_account(&conn, "TK_A");
+        let acc_b = seed_account(&conn, "TK_B");
+        let date = "2026-04-30";
+        seed_day(&conn, date);
+
+        // TK_A có hoa hồng, TK_B có click, cùng sub_id "camp-q".
+        seed_shopee_order(&conn, date, acc_a, ["camp", "q", "", "", ""], 1, 120.0, 1200.0);
+        seed_shopee_click(&conn, date, acc_b, ["camp", "q", "", "", ""], "1");
+        seed_fb_ad(&conn, date, ["camp", "q", "", "", ""], 500.0, 40);
+
+        let days =
+            list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+
+        // Không được có "FB chung" (account_id = None) — FB phải về TK_A.
+        let fb_chung = day.rows.iter().find(|r| r.account_id.is_none());
+        assert!(
+            fb_chung.is_none(),
+            "FB không được là 'FB chung' khi TK_A là hard owner duy nhất"
+        );
+
+        // Row TK_A: commission + FB spend (single hard owner → merge).
+        let row_a = day.rows.iter().find(|r| r.account_id == Some(acc_a)).unwrap();
+        assert_eq!(row_a.commission_total, 120.0);
+        assert_eq!(row_a.total_spend, Some(500.0));
+        assert!(row_a.has_fb);
+
+        // Day totals: spend không bị double count.
+        assert_eq!(day.totals.total_spend, 500.0);
+    }
+
+    /// Click-only (không hoa hồng) vẫn được dùng làm soft owner cho FB.
+    /// Đảm bảo fix không phá fallback case: TK_B có click cho sub_id "lone"
+    /// nhưng không có hoa hồng → FB vẫn về TK_B (không phải Mặc định).
+    #[test]
+    fn click_only_account_acts_as_soft_owner_for_fb() {
+        let conn = seed_conn();
+        let acc_b = seed_account(&conn, "TK_B");
+        let date = "2026-05-01";
+        seed_day(&conn, date);
+
+        // Chỉ click + FB, không có hoa hồng → soft owner TK_B.
+        seed_shopee_click(&conn, date, acc_b, ["lone", "", "", "", ""], "1");
+        seed_fb_ad(&conn, date, ["lone", "", "", "", ""], 300.0, 30);
+
+        let days =
+            list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+        assert_eq!(day.rows.len(), 1);
+        // FB phải về TK_B (fallback từ click owner).
+        assert_eq!(day.rows[0].account_id, Some(acc_b));
+        assert_eq!(day.rows[0].total_spend, Some(300.0));
+    }
+
     #[test]
     fn legacy_default_account_seed_assigns_default_to_orphan_fb() {
         let conn = seed_conn();
@@ -2914,6 +3057,64 @@ mod tests {
             day.rows[0].account_name.as_deref(),
             Some(DEFAULT_ACCOUNT_NAME)
         );
+    }
+
+    /// Click TK_B cho sub_id của TK_A → click phải hiện trong row TK_A (không bị row-0 filter).
+    /// Scenario: import hoa hồng TK_A trước, import click TK_B sau — cùng sub_id.
+    #[test]
+    fn click_from_other_account_merged_into_hard_owner_row() {
+        let conn = seed_conn();
+        let acc_a = seed_account(&conn, "TK_A");
+        let acc_b = seed_account(&conn, "TK_B");
+        let date = "2026-05-10";
+        seed_day(&conn, date);
+
+        seed_shopee_order(&conn, date, acc_a, ["prod", "x", "", "", ""], 1, 80.0, 800.0);
+        seed_shopee_click(&conn, date, acc_b, ["prod", "x", "", "", ""], "ck1");
+        seed_shopee_click(&conn, date, acc_b, ["prod", "x", "", "", ""], "ck2");
+
+        let days = list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+
+        // Chỉ 1 row (TK_A) — không có row TK_B click-only bị row-0 filter.
+        assert_eq!(day.rows.len(), 1, "phải chỉ có 1 row (TK_A)");
+        let row = &day.rows[0];
+        assert_eq!(row.account_id, Some(acc_a));
+        assert_eq!(row.commission_total, 80.0);
+        // 2 click của TK_B phải được merge vào row TK_A.
+        assert_eq!(row.shopee_clicks_total, 2, "clicks TK_B phải merge vào row TK_A");
+        assert!(row.has_shopee_clicks);
+
+        // Totals không đổi.
+        assert_eq!(day.totals.shopee_clicks_total, 2);
+    }
+
+    /// Khi 2 TK cùng có hoa hồng cho cùng sub_id (2 hard owners), click giữ nguyên
+    /// account của click row — không thể xác định merge vào TK nào.
+    #[test]
+    fn click_not_merged_when_two_hard_owners() {
+        let conn = seed_conn();
+        let acc_a = seed_account(&conn, "TK_A");
+        let acc_b = seed_account(&conn, "TK_B");
+        let date = "2026-05-11";
+        seed_day(&conn, date);
+
+        // Cả TK_A và TK_B đều có hoa hồng cho cùng sub_id "shared" (đơn khác nhau).
+        seed_shopee_order(&conn, date, acc_a, ["shared", "", "", "", ""], 1, 50.0, 500.0);
+        seed_shopee_order(&conn, date, acc_b, ["shared", "", "", "", ""], 1, 60.0, 600.0);
+        // Click từ TK_B — 2 hard owners → click giữ nguyên TK_B.
+        seed_shopee_click(&conn, date, acc_b, ["shared", "", "", "", ""], "ckX");
+
+        let days = list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+
+        let row_a = day.rows.iter().find(|r| r.account_id == Some(acc_a)).unwrap();
+        let row_b = day.rows.iter().find(|r| r.account_id == Some(acc_b)).unwrap();
+        // Click về TK_B (không merge vào TK_A vì 2 hard owners).
+        assert_eq!(row_b.shopee_clicks_total, 1);
+        assert_eq!(row_a.shopee_clicks_total, 0);
+
+        assert_eq!(day.totals.shopee_clicks_total, 1);
     }
 
     // ========================================================================

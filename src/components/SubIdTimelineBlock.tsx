@@ -11,6 +11,7 @@ import {
 } from "../formulas";
 import { sumFiltered, useSettings } from "../hooks/useSettings";
 import { ProductDetailDialog } from "./ProductDetailDialog";
+import { ProductHistoryDialog } from "./ProductHistoryDialog";
 
 interface SubIdTimelineBlockProps {
   subId: string;
@@ -80,6 +81,7 @@ export function SubIdTimelineBlock({
 }: SubIdTimelineBlockProps) {
   const { settings } = useSettings();
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
+  const [historyRow, setHistoryRow] = useState<UiRow | null>(null);
 
   // Flatten rows giữ thứ tự days (DESC). Sau v0.4.5+ aggregate split per-acc:
   // 1 day có thể có nhiều row cùng tuple — tab này hiện hết, mỗi row 1 acc.
@@ -200,6 +202,7 @@ export function SubIdTimelineBlock({
                 onEdit={() => onEditRow(r)}
                 onToggleDelete={() => onToggleRowDelete(r)}
                 onViewDetail={() => setDetailRow(r)}
+                onViewHistory={() => setHistoryRow(r)}
                 readOnly={readOnly}
               />
             ))}
@@ -264,6 +267,13 @@ export function SubIdTimelineBlock({
         accountFilter={accountFilter}
         onClose={() => setDetailRow(null)}
       />
+
+      <ProductHistoryDialog
+        isOpen={!!historyRow}
+        row={historyRow}
+        accountFilter={accountFilter}
+        onClose={() => setHistoryRow(null)}
+      />
     </section>
   );
 }
@@ -274,6 +284,7 @@ interface TimelineRowProps {
   onEdit: () => void;
   onToggleDelete: () => void;
   onViewDetail: () => void;
+  onViewHistory?: () => void;
   readOnly?: boolean;
   showAccount?: boolean;
 }
@@ -284,6 +295,7 @@ function TimelineRow({
   onEdit,
   onToggleDelete,
   onViewDetail,
+  onViewHistory,
   readOnly = false,
   showAccount = false,
 }: TimelineRowProps) {
@@ -401,41 +413,56 @@ function TimelineRow({
         {row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
       </td>
       <td className={cellCls}>
-        {!readOnly && (
-          <div className="flex justify-center gap-0.5">
+        <div className="flex justify-center gap-0.5">
+          {onViewHistory && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                if (!pending) onEdit();
+                onViewHistory();
               }}
-              disabled={pending}
-              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-                pending
-                  ? "cursor-not-allowed text-white/20"
-                  : "text-shopee-400 hover:bg-shopee-500/10"
-              }`}
-              title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
+              className="btn-ripple flex h-8 w-8 items-center justify-center rounded-full text-white/40 hover:bg-shopee-500/10 hover:text-shopee-300"
+              title="Xem lịch sử theo ngày"
+              aria-label="Lịch sử"
             >
-              <span className="material-symbols-rounded text-lg">edit</span>
+              <span className="material-symbols-rounded text-lg">timeline</span>
             </button>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggleDelete();
-              }}
-              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-                pending
-                  ? "text-amber-400 hover:bg-amber-500/10"
-                  : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
-              }`}
-              title={pending ? "Khôi phục" : "Đánh dấu xóa"}
-            >
-              <span className="material-symbols-rounded text-lg">
-                {pending ? "undo" : "delete"}
-              </span>
-            </button>
-          </div>
-        )}
+          )}
+          {!readOnly && (
+            <>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!pending) onEdit();
+                }}
+                disabled={pending}
+                className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                  pending
+                    ? "cursor-not-allowed text-white/20"
+                    : "text-shopee-400 hover:bg-shopee-500/10"
+                }`}
+                title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
+              >
+                <span className="material-symbols-rounded text-lg">edit</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleDelete();
+                }}
+                className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                  pending
+                    ? "text-amber-400 hover:bg-amber-500/10"
+                    : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
+                }`}
+                title={pending ? "Khôi phục" : "Đánh dấu xóa"}
+              >
+                <span className="material-symbols-rounded text-lg">
+                  {pending ? "undo" : "delete"}
+                </span>
+              </button>
+            </>
+          )}
+        </div>
       </td>
     </tr>
   );

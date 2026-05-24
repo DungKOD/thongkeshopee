@@ -19,6 +19,7 @@ import { useDbStats, todayIso, type DaysFilter } from "./hooks/useDbStats";
 import {
   LOAD_MORE_STEP,
   prevMonthRange,
+  currentMonthRange,
   useFilterMode,
 } from "./hooks/useFilterMode";
 import { SettingsProvider, useSettings } from "./hooks/useSettings";
@@ -60,6 +61,7 @@ function AppInner() {
   const setFilterMode = activeFilter.setMode;
   const setRecentDays = activeFilter.setRecent;
   const setPrevMonth = activeFilter.setPrevMonth;
+  const setCurrentMonth = activeFilter.setCurrentMonth;
   const setAllTime = activeFilter.setAllTime;
   const setDateFrom = activeFilter.setDateFrom;
   const setDateTo = activeFilter.setDateTo;
@@ -290,6 +292,12 @@ function AppInner() {
     filterMode.type === "range" &&
     filterMode.from === prevMonth.from &&
     filterMode.to === prevMonth.to;
+
+  const currentMonth = useMemo(() => currentMonthRange(), []);
+  const isCurrentMonthActive =
+    filterMode.type === "range" &&
+    filterMode.from === currentMonth.from &&
+    filterMode.to === currentMonth.to;
 
   const { dateFrom, dateTo } = useMemo<{ dateFrom: string; dateTo: string }>(() => {
     if (filterMode.type === "range") {
@@ -609,6 +617,12 @@ function AppInner() {
                     onClick={setPrevMonth}
                   >
                     Tháng trước
+                  </ShortcutButton>
+                  <ShortcutButton
+                    active={isCurrentMonthActive}
+                    onClick={setCurrentMonth}
+                  >
+                    Tháng này
                   </ShortcutButton>
                   <ShortcutButton
                     active={filterMode.type === "all"}

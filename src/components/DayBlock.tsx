@@ -19,6 +19,7 @@ import { Fragment } from "react";
 import { VideoRow } from "./VideoRow";
 import { FbHierarchyTree } from "./FbHierarchyTree";
 import { ProductDetailDialog } from "./ProductDetailDialog";
+import { ProductHistoryDialog } from "./ProductHistoryDialog";
 import { DayScreenshotDialog } from "./DayScreenshotDialog";
 
 interface DayBlockProps {
@@ -93,6 +94,7 @@ export function DayBlock({
   accountFilter,
 }: DayBlockProps) {
   const [detailRow, setDetailRow] = useState<UiRow | null>(null);
+  const [historyRow, setHistoryRow] = useState<UiRow | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
   const sectionRef = useRef<HTMLElement>(null);
@@ -410,6 +412,7 @@ export function DayBlock({
                         }
                       }}
                       onViewDetail={() => setDetailRow(r)}
+                      onViewHistory={() => setHistoryRow(r)}
                       readOnly={readOnly}
                     />
                     {hasFbBreakdown && (
@@ -507,6 +510,13 @@ export function DayBlock({
         row={detailRow}
         accountFilter={accountFilter}
         onClose={() => setDetailRow(null)}
+      />
+
+      <ProductHistoryDialog
+        isOpen={!!historyRow}
+        row={historyRow}
+        accountFilter={accountFilter}
+        onClose={() => setHistoryRow(null)}
       />
 
       <DayScreenshotDialog

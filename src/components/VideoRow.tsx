@@ -9,6 +9,7 @@ interface CampaignRowProps {
   onEdit: () => void;
   onToggleDelete: () => void;
   onViewDetail: () => void;
+  onViewHistory?: () => void;
   readOnly?: boolean;
   showAccount?: boolean;
   deleteBlocked?: boolean;
@@ -33,6 +34,7 @@ export function VideoRow({
   onEdit,
   onToggleDelete,
   onViewDetail,
+  onViewHistory,
   readOnly = false,
   showAccount = false,
   deleteBlocked = false,
@@ -172,53 +174,68 @@ export function VideoRow({
         {row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
       </td>
       <td className={`${cellCls} col-actions`}>
-        {!readOnly && (
-          <div className="flex justify-center gap-0.5">
+        <div className="flex justify-center gap-0.5">
+          {onViewHistory && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                if (!pending) onEdit();
+                onViewHistory();
               }}
-              disabled={pending}
-              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-                pending
-                  ? "cursor-not-allowed text-white/20"
-                  : "text-shopee-400 hover:bg-shopee-500/10"
-              }`}
-              title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
-              aria-label="Sửa"
+              className="btn-ripple flex h-8 w-8 items-center justify-center rounded-full text-white/40 hover:bg-shopee-500/10 hover:text-shopee-300"
+              title="Xem lịch sử theo ngày"
+              aria-label="Lịch sử"
             >
-              <span className="material-symbols-rounded text-lg">edit</span>
+              <span className="material-symbols-rounded text-lg">timeline</span>
             </button>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                if (deleteBlocked && !pending) return;
-                onToggleDelete();
-              }}
-              disabled={deleteBlocked && !pending}
-              className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
-                deleteBlocked && !pending
-                  ? "cursor-not-allowed text-white/20"
-                  : pending
-                  ? "text-amber-400 hover:bg-amber-500/10"
-                  : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
-              }`}
-              title={
-                deleteBlocked && !pending
-                  ? "Sub_id này có data ở ≥2 TK Shopee — chuyển dropdown TK sang TK cụ thể trước khi xóa (BE hiện xóa theo tuple sẽ wipe cả TK khác)"
-                  : pending
-                  ? "Khôi phục"
-                  : "Đánh dấu xóa"
-              }
-              aria-label={pending ? "Khôi phục" : "Đánh dấu xóa"}
-            >
-              <span className="material-symbols-rounded text-lg">
-                {pending ? "undo" : "delete"}
-              </span>
-            </button>
-          </div>
-        )}
+          )}
+          {!readOnly && (
+            <>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!pending) onEdit();
+                }}
+                disabled={pending}
+                className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                  pending
+                    ? "cursor-not-allowed text-white/20"
+                    : "text-shopee-400 hover:bg-shopee-500/10"
+                }`}
+                title={pending ? "Đã đánh dấu xóa — bỏ để sửa" : "Sửa"}
+                aria-label="Sửa"
+              >
+                <span className="material-symbols-rounded text-lg">edit</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (deleteBlocked && !pending) return;
+                  onToggleDelete();
+                }}
+                disabled={deleteBlocked && !pending}
+                className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
+                  deleteBlocked && !pending
+                    ? "cursor-not-allowed text-white/20"
+                    : pending
+                    ? "text-amber-400 hover:bg-amber-500/10"
+                    : "text-white/60 hover:bg-red-500/10 hover:text-red-400"
+                }`}
+                title={
+                  deleteBlocked && !pending
+                    ? "Sub_id này có data ở ≥2 TK Shopee — chuyển dropdown TK sang TK cụ thể trước khi xóa (BE hiện xóa theo tuple sẽ wipe cả TK khác)"
+                    : pending
+                    ? "Khôi phục"
+                    : "Đánh dấu xóa"
+                }
+                aria-label={pending ? "Khôi phục" : "Đánh dấu xóa"}
+              >
+                <span className="material-symbols-rounded text-lg">
+                  {pending ? "undo" : "delete"}
+                </span>
+              </button>
+            </>
+          )}
+        </div>
       </td>
     </tr>
   );

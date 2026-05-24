@@ -62,6 +62,19 @@ export function prevMonthRange(): { from: string; to: string } {
   return { from: fmt(start), to: fmt(end) };
 }
 
+/** Đầu tháng này → hôm nay local. Trả YYYY-MM-DD. */
+export function currentMonthRange(): { from: string; to: string } {
+  const now = new Date();
+  const fmt = (d: Date) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  };
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  return { from: fmt(start), to: fmt(now) };
+}
+
 /**
  * State + handlers của filter bar cho 1 scope (tab). Mọi tab dùng **cùng
  * logic** — chỉ khác state instance. Callers gọi hook cho mỗi scope, route
@@ -81,6 +94,8 @@ export interface UseFilterModeResult {
   setRecent: (n: number) => void;
   /** Shortcut: tháng trước (range). */
   setPrevMonth: () => void;
+  /** Shortcut: tháng này (range từ đầu tháng → hôm nay). */
+  setCurrentMonth: () => void;
   /** Shortcut: từ trước đến nay (all). */
   setAllTime: () => void;
   /** Về default (1 ngày gần nhất). */
@@ -100,6 +115,10 @@ export function useFilterMode(_scope: FilterScope): UseFilterModeResult {
   );
   const setPrevMonth = useCallback(() => {
     const r = prevMonthRange();
+    setMode({ type: "range", from: r.from, to: r.to });
+  }, []);
+  const setCurrentMonth = useCallback(() => {
+    const r = currentMonthRange();
     setMode({ type: "range", from: r.from, to: r.to });
   }, []);
   const setAllTime = useCallback(() => setMode({ type: "all" }), []);
@@ -124,6 +143,7 @@ export function useFilterMode(_scope: FilterScope): UseFilterModeResult {
     setMode,
     setRecent,
     setPrevMonth,
+    setCurrentMonth,
     setAllTime,
     clear,
     setDateFrom,
