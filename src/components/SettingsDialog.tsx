@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import type {
   ProfitFees,
   Settings,
@@ -82,6 +83,60 @@ export function SettingsDialog({
       setSourcesLocked(true);
     }
   }, [isOpen]);
+
+  const [exportState, setExportState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const handleExportDb = async () => {
+    setExportError(null);
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+    const destPath = await dialogSave({
+      title: "Xuất Database",
+      defaultPath: `thongkeshopee_backup_${stamp}.db`,
+      filters: [{ name: "SQLite Database", extensions: ["db"] }],
+    });
+    if (!destPath) return;
+    setExportState("busy");
+    try {
+      await invoke("export_db", { destPath });
+      setExportState("ok");
+      setTimeout(() => setExportState("idle"), 2500);
+    } catch (e) {
+      setExportError(String(e));
+      setExportState("err");
+    }
+  };
+
+  const [importConfirmOpen, setImportConfirmOpen] = useState(false);
+  const [pendingImportPath, setPendingImportPath] = useState<string | null>(null);
+  const [importState, setImportState] = useState<"idle" | "busy" | "err">("idle");
+  const [importError, setImportError] = useState<string | null>(null);
+
+  const handlePickImport = async () => {
+    setImportError(null);
+    const selected = await dialogOpen({
+      title: "Chọn file Database",
+      multiple: false,
+      filters: [{ name: "SQLite Database", extensions: ["db"] }],
+    });
+    if (!selected || typeof selected !== "string") return;
+    setPendingImportPath(selected);
+    setImportConfirmOpen(true);
+  };
+
+  const handleConfirmImport = async () => {
+    if (!pendingImportPath) return;
+    setImportConfirmOpen(false);
+    setImportState("busy");
+    try {
+      await invoke("import_db", { srcPath: pendingImportPath });
+      window.location.reload();
+    } catch (e) {
+      setImportError(String(e));
+      setImportState("err");
+    }
+  };
 
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -404,6 +459,53 @@ export function SettingsDialog({
 
           <section>
             <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+              <span className="material-symbols-rounded text-base text-blue-400">
+                database
+              </span>
+              Sao lưu &amp; Khôi phục
+            </h3>
+            <p className="mb-3 text-xs text-white/50">
+              Xuất toàn bộ database ra file <span className="font-mono">.db</span> để backup hoặc chuyển máy.
+              Nhập file backup để khôi phục — app sẽ tự khởi động lại.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleExportDb}
+                disabled={exportState === "busy"}
+                className={`btn-ripple flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                  exportState === "ok"
+                    ? "border-green-500/40 bg-green-500/10 text-green-300"
+                    : "border-blue-500/40 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20"
+                }`}
+              >
+                <span className="material-symbols-rounded text-base">
+                  {exportState === "busy" ? "hourglass_empty" : exportState === "ok" ? "check" : "download"}
+                </span>
+                {exportState === "busy" ? "Đang xuất…" : exportState === "ok" ? "Đã xuất thành công" : "Xuất DB"}
+              </button>
+              <button
+                type="button"
+                onClick={handlePickImport}
+                disabled={importState === "busy"}
+                className="btn-ripple flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm font-semibold text-amber-300 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <span className="material-symbols-rounded text-base">
+                  {importState === "busy" ? "hourglass_empty" : "upload"}
+                </span>
+                {importState === "busy" ? "Đang nhập…" : "Nhập DB"}
+              </button>
+            </div>
+            {exportState === "err" && exportError && (
+              <p className="mt-2 text-xs text-red-300">Lỗi xuất: {exportError}</p>
+            )}
+            {importState === "err" && importError && (
+              <p className="mt-2 text-xs text-red-300">Lỗi nhập: {importError}</p>
+            )}
+          </section>
+
+          <section>
+            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
               <span className="material-symbols-rounded text-base text-red-400">
                 delete_forever
               </span>
@@ -458,6 +560,26 @@ export function SettingsDialog({
       danger
       onConfirm={handleClearData}
       onClose={() => setClearConfirmOpen(false)}
+    />
+    <ConfirmDialog
+      isOpen={importConfirmOpen}
+      title="Nhập Database?"
+      message={
+        <span>
+          Toàn bộ dữ liệu hiện tại sẽ bị thay thế bằng file backup. App sẽ tự
+          khởi động lại sau khi nhập.
+          {pendingImportPath && (
+            <span className="mt-2 block truncate font-mono text-xs text-white/60">
+              {pendingImportPath}
+            </span>
+          )}
+        </span>
+      }
+      confirmLabel="Nhập & Khởi động lại"
+      cancelLabel="Hủy"
+      danger
+      onConfirm={handleConfirmImport}
+      onClose={() => { setImportConfirmOpen(false); setPendingImportPath(null); }}
     />
     </>
   );

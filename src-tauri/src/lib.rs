@@ -76,6 +76,8 @@ pub fn run() {
             commands::app_util::restart_app,
             commands::app_util::get_app_data_paths,
             commands::app_util::clear_app_data,
+            commands::db_transfer::export_db,
+            commands::db_transfer::import_db,
             commands::screenshot::save_png,
         ])
         .run(tauri::generate_context!())
