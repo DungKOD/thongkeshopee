@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { UiDay, UiRow } from "../types";
 import {
   buildDayTsv,
@@ -97,7 +98,17 @@ export function DayBlock({
   const [historyRow, setHistoryRow] = useState<UiRow | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null);
+  const [hiddenCols, setHiddenCols] = useState<Set<string>>(new Set());
+  const toggleCol = (label: string) =>
+    setHiddenCols((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label); else next.add(label);
+      return next;
+    });
   const sectionRef = useRef<HTMLElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
+  const tfootRef = useRef<HTMLTableSectionElement>(null);
+  const [showFloating, setShowFloating] = useState(false);
   const { settings } = useSettings();
 
   // Cột "TK Shopee" chỉ render khi user đang xem tất cả account (filter All).
@@ -129,6 +140,27 @@ export function DayBlock({
     return multi;
   }, [day.rows]);
   const hasAnyMultiAccount = multiAccountTuples.size > 0;
+
+  // Floating nav: hiện khi section nằm trong viewport nhưng header VÀ tfoot
+  // đều đã cuộn ra ngoài (user đang ở giữa bảng dài).
+  useEffect(() => {
+    const headerEl = headerRef.current;
+    const tfootEl = tfootRef.current;
+    const sectionEl = sectionRef.current;
+    if (!headerEl || !tfootEl || !sectionEl) return;
+    const vis = new Set<Element>();
+    const obs = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) vis.add(e.target);
+        else vis.delete(e.target);
+      }
+      setShowFloating(vis.has(sectionEl) && !vis.has(headerEl) && !vis.has(tfootEl));
+    }, { threshold: 0 });
+    obs.observe(headerEl);
+    obs.observe(tfootEl);
+    obs.observe(sectionEl);
+    return () => obs.disconnect();
+  }, []);
 
   // Copy TSV → clipboard. Hiện icon "done" 1.5s rồi revert.
   const [copied, setCopied] = useState(false);
@@ -180,17 +212,33 @@ export function DayBlock({
     settings.profitFees,
   );
 
+  const accountCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const r of day.rows) {
+      const key = r.accountName ?? "FB chung";
+      map.set(key, (map.get(key) ?? 0) + 1);
+    }
+    return map;
+  }, [day.rows]);
+
   // Sort rows theo Lợi nhuận giảm dần (cao → thấp). Profit phụ thuộc fees
   // (tax/reserve) nên phải compute FE-side, Rust sort fallback theo tên
   // (query.rs) — ở đây override.
-  const sortedRows = useMemo(() => {
-    return [...day.rows].sort((a, b) => {
-      const shopeeA = sumFiltered(a.shopeeClicksByReferrer, settings.clickSources);
-      const shopeeB = sumFiltered(b.shopeeClicksByReferrer, settings.clickSources);
-      const profitA = computeUiRow(a, settings.profitFees, shopeeA).profit;
-      const profitB = computeUiRow(b, settings.profitFees, shopeeB).profit;
-      return profitB - profitA;
+  const { sortedRows, totalGain, totalLoss, gainCount, lossCount } = useMemo(() => {
+    const computed = day.rows.map((r) => {
+      const shopee = sumFiltered(r.shopeeClicksByReferrer, settings.clickSources);
+      return { row: r, profit: computeUiRow(r, settings.profitFees, shopee).profit };
     });
+    computed.sort((a, b) => b.profit - a.profit);
+    let gain = 0;
+    let loss = 0;
+    let gainCount = 0;
+    let lossCount = 0;
+    for (const { profit } of computed) {
+      if (profit > 0) { gain += profit; gainCount++; }
+      else if (profit < 0) { loss += profit; lossCount++; }
+    }
+    return { sortedRows: computed.map((c) => c.row), totalGain: gain, totalLoss: loss, gainCount, lossCount };
   }, [day.rows, settings.clickSources, settings.profitFees]);
   const totalsProfitCls =
     totals.profit > 0
@@ -198,6 +246,10 @@ export function DayBlock({
       : totals.profit < 0
       ? "text-red-400"
       : "text-gray-300";
+
+  const MASK = (
+    <span className="select-none tracking-widest text-white/20">••••</span>
+  );
 
   const dayPending = pendingDayDeletes.has(day.date);
   // "All rows pending" = user đã chọn xóa từng dòng cho đến hết → visual
@@ -213,11 +265,11 @@ export function DayBlock({
   return (
     <section
       ref={sectionRef}
-      className={`mb-6 overflow-hidden rounded-xl shadow-elev-2 transition-shadow hover:shadow-elev-4 ${
+      className={`mb-6 [overflow:clip] rounded-xl shadow-elev-2 transition-shadow hover:shadow-elev-4 ${
         effectiveDayPending ? "bg-surface-2/60" : "bg-surface-2"
       } ${capturing ? "capture-mode" : ""}`}
     >
-      <header className="flex items-center justify-between border-b border-surface-8 px-5 py-3">
+      <header ref={headerRef} className="flex items-center justify-between border-b border-surface-8 px-5 py-3">
         <div className="flex items-center gap-3">
           <span className="material-symbols-rounded text-shopee-400">
             event
@@ -250,7 +302,52 @@ export function DayBlock({
             </span>
           )}
         </div>
-        <div className="capture-hide flex items-center gap-1">
+        <div className="capture-hide flex items-center gap-2">
+          {!effectiveDayPending && day.rows.length > 0 && (totalGain > 0 || totalLoss < 0) && (() => {
+            const net = totalGain + totalLoss;
+            const netPositive = net > 0;
+            return (
+              <div className="mr-1 flex flex-col items-end gap-1">
+                {/* Dòng trên: tổng net cả ngày */}
+                <div
+                  className={`inline-flex items-center gap-1 rounded-full px-3 py-0.5 text-sm font-bold tabular-nums ${
+                    netPositive
+                      ? "bg-green-500/20 text-green-300"
+                      : "bg-red-500/20 text-red-300"
+                  }`}
+                  title={`Tổng kết ngày = Σ lãi + Σ lỗ\n= ${fmtVnd(totalGain)} + ${fmtVnd(totalLoss)}`}
+                >
+                  <span className="material-symbols-rounded text-sm">
+                    {netPositive ? "savings" : "money_off"}
+                  </span>
+                  {fmtVnd(net)}
+                </div>
+                {/* Dòng dưới: chip lãi + chip lỗ kèm số sản phẩm */}
+                <div className="flex items-center gap-1.5">
+                  {totalGain > 0 && (
+                    <div
+                      className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2.5 py-0.5 text-xs font-semibold tabular-nums text-green-400"
+                      title={`${gainCount} sản phẩm có lãi / ${day.rows.length} sản phẩm`}
+                    >
+                      <span className="material-symbols-rounded text-xs">trending_up</span>
+                      {fmtVnd(totalGain)}
+                      <span className="text-green-400/60">· {gainCount}/{day.rows.length}</span>
+                    </div>
+                  )}
+                  {totalLoss < 0 && (
+                    <div
+                      className="inline-flex items-center gap-1 rounded-full bg-red-500/15 px-2.5 py-0.5 text-xs font-semibold tabular-nums text-red-400"
+                      title={`${lossCount} sản phẩm lỗ / ${day.rows.length} sản phẩm`}
+                    >
+                      <span className="material-symbols-rounded text-xs">trending_down</span>
+                      {fmtVnd(totalLoss)}
+                      <span className="text-red-400/60">· {lossCount}/{day.rows.length}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
           <button
             onClick={handleCopy}
             disabled={day.rows.length === 0}
@@ -336,14 +433,16 @@ export function DayBlock({
           </span>
         </div>
       )}
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto overflow-y-clip">
         <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="border-b-2 border-shopee-500/50 bg-gradient-to-b from-shopee-900/35 to-shopee-900/15 text-shopee-100">
+          <thead className="sticky top-0 z-20 shadow-[0_2px_8px_rgba(0,0,0,0.45)]">
+            <tr className="border-b border-shopee-500/40 bg-[#1a0c10] text-shopee-100">
               {headers.map((h, i) => {
                 const isIndex = i === 0;
                 const isProduct = i === 1;
                 const isAction = i === headers.length - 1;
+                const canToggle = !isIndex && !isAction && !!h.label;
+                const colHidden = canToggle && hiddenCols.has(h.label);
                 const alignCls = isIndex
                   ? "w-12 px-2 text-center"
                   : isProduct
@@ -352,16 +451,52 @@ export function DayBlock({
                 return (
                   <th
                     key={i}
-                    title={h.tooltip}
                     className={`py-3.5 text-xs font-bold uppercase tracking-wider whitespace-nowrap ${alignCls} ${
-                      h.tooltip ? "cursor-help" : ""
-                    } ${isAction ? "col-actions" : ""}`}
+                      isAction ? "col-actions" : ""
+                    }`}
                   >
-                    <span className="inline-flex items-center gap-1">
-                      <span>{h.label}</span>
-                      {h.tooltip && (
-                        <span className="text-[11px] leading-none text-shopee-300/60">
-                          ⓘ
+                    <span className="inline-flex flex-col items-center gap-0.5">
+                      <span className="inline-flex items-center gap-1">
+                        <span
+                          className={`inline-flex items-center gap-1 ${h.tooltip ? "cursor-help" : ""} ${colHidden ? "opacity-35" : ""}`}
+                          title={h.tooltip}
+                        >
+                          <span>{h.label}</span>
+                          {h.tooltip && (
+                            <span className="text-[11px] leading-none text-shopee-300/60">
+                              ⓘ
+                            </span>
+                          )}
+                        </span>
+                        {canToggle && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); toggleCol(h.label); }}
+                            className={`flex h-4 w-4 items-center justify-center rounded transition-colors ${
+                              colHidden
+                                ? "text-shopee-400"
+                                : "text-white/20 hover:text-white/55"
+                            }`}
+                            title={colHidden ? "Hiện cột" : "Ẩn cột"}
+                            aria-label={colHidden ? "Hiện cột" : "Ẩn cột"}
+                          >
+                            <span className="material-symbols-rounded text-[11px]">
+                              {colHidden ? "visibility_off" : "visibility"}
+                            </span>
+                          </button>
+                        )}
+                      </span>
+                      {h.label === "TK Shopee" && accountCounts.size > 0 && (
+                        <span className="flex flex-wrap justify-center gap-x-2 gap-y-0.5 normal-case">
+                          {Array.from(accountCounts.entries()).map(([name, count]) => (
+                            <span
+                              key={name}
+                              className="inline-flex items-center gap-0.5 text-[10px] font-medium text-white/50"
+                              title={`${name}: ${count} dòng`}
+                            >
+                              <span className="max-w-[80px] truncate text-white/70">{name}</span>
+                              <span className="tabular-nums text-shopee-300/80">{count}</span>
+                            </span>
+                          ))}
                         </span>
                       )}
                     </span>
@@ -369,6 +504,17 @@ export function DayBlock({
                 );
               })}
             </tr>
+            {day.rows.length > 0 && (
+              <TotalsRow
+                totals={totals}
+                totalsProfitCls={totalsProfitCls}
+                orderValueTotal={day.totals.orderValueTotal}
+                showAccount={showAccount}
+                hiddenCols={hiddenCols}
+                MASK={MASK}
+                compact
+              />
+            )}
           </thead>
           <tbody>
             {day.rows.length === 0 ? (
@@ -396,6 +542,7 @@ export function DayBlock({
                       showAccount={showAccount}
                       pending={effectiveDayPending || pendingRowDeletes.has(key)}
                       deleteBlocked={deleteBlocked}
+                      hiddenCols={hiddenCols}
                       onEdit={() => onEditRow(r)}
                       onToggleDelete={() => {
                         if (dayPending) {
@@ -419,6 +566,7 @@ export function DayBlock({
                       <FbHierarchyTree
                         breakdown={r.fbBreakdown!}
                         showAccount={showAccount}
+                        hiddenCols={hiddenCols}
                       />
                     )}
                   </Fragment>
@@ -427,57 +575,15 @@ export function DayBlock({
             )}
           </tbody>
           {day.rows.length > 0 && (
-            <tfoot>
-              <tr className="border-t-2 border-shopee-500 bg-shopee-900/25 text-base font-bold text-white">
-                <td />
-                <td className="px-4 py-4 text-left text-sm uppercase tracking-wider text-shopee-300">
-                  Tổng
-                </td>
-                {showAccount && <td />}
-                <td className="px-3 py-4 text-center tabular-nums">
-                  {fmtInt(totals.clicks)}
-                </td>
-                <td className="px-3 py-4 text-center tabular-nums">
-                  {fmtInt(totals.shopeeClicks)}
-                </td>
-                <td />
-                <td className="px-3 py-4 text-center tabular-nums text-blue-400">
-                  {fmtVnd(totals.totalSpend)}
-                </td>
-                <td className="px-3 py-4 text-center tabular-nums">
-                  {fmtInt(totals.orders)}
-                </td>
-                <td
-                  className="px-3 py-4 text-center tabular-nums"
-                  title={
-                    totals.shopeeClicks === 0
-                      ? "Không có Click Shopee → không tính được CR"
-                      : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
-                  }
-                >
-                  {totals.shopeeClicks > 0
-                    ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
-                    : "—"}
-                </td>
-                <td
-                  className="px-3 py-4 text-center tabular-nums"
-                  title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
-                >
-                  {totals.orders > 0
-                    ? fmtVnd(day.totals.orderValueTotal / totals.orders)
-                    : "—"}
-                </td>
-                <td className="px-3 py-4 text-center tabular-nums text-shopee-400">
-                  {fmtVnd(totals.commission)}
-                </td>
-                <td
-                  className={`px-3 py-4 text-center tabular-nums ${totalsProfitCls}`}
-                >
-                  {fmtVnd(totals.profit)}
-                </td>
-                <td />
-                <td className="col-actions" />
-              </tr>
+            <tfoot ref={tfootRef}>
+              <TotalsRow
+                totals={totals}
+                totalsProfitCls={totalsProfitCls}
+                orderValueTotal={day.totals.orderValueTotal}
+                showAccount={showAccount}
+                hiddenCols={hiddenCols}
+                MASK={MASK}
+              />
             </tfoot>
           )}
         </table>
@@ -526,6 +632,144 @@ export function DayBlock({
         dateLabel={fmtDate(day.date)}
         onClose={handleScreenshotClose}
       />
+
+      {showFloating && createPortal(
+        <div className="capture-hide fixed bottom-6 right-6 z-50 flex flex-col items-center gap-0.5 rounded-2xl border border-surface-8/60 bg-surface-2/90 px-1 py-2 shadow-elev-4 backdrop-blur-sm">
+          <button
+            onClick={() => sectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
+            className="btn-ripple flex h-9 w-9 items-center justify-center rounded-full text-white/60 hover:bg-shopee-500/10 hover:text-shopee-400"
+            title="Lên đầu sell"
+            aria-label="Lên đầu sell"
+          >
+            <span className="material-symbols-rounded">vertical_align_top</span>
+          </button>
+          <span className="select-none px-1 text-center text-[10px] tabular-nums leading-tight text-white/30">
+            {fmtDate(day.date)}
+          </span>
+          <button
+            onClick={() => sectionRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })}
+            className="btn-ripple flex h-9 w-9 items-center justify-center rounded-full text-white/60 hover:bg-shopee-500/10 hover:text-shopee-400"
+            title="Xuống cuối sell"
+            aria-label="Xuống cuối sell"
+          >
+            <span className="material-symbols-rounded">vertical_align_bottom</span>
+          </button>
+        </div>,
+        document.body,
+      )}
     </section>
+  );
+}
+
+// =========================================================
+// TotalsRow — dùng chung cho tfoot (bottom) và top summary
+// =========================================================
+
+type TotalsRowProps = {
+  totals: ReturnType<typeof computeUiDayTotals>;
+  totalsProfitCls: string;
+  orderValueTotal: number;
+  showAccount: boolean;
+  hiddenCols: Set<string>;
+  MASK: React.ReactNode;
+  /** true = hàng tóm tắt trên đầu tbody (padding nhỏ hơn, bg khác). */
+  compact?: boolean;
+};
+
+function TotalsRow({
+  totals,
+  totalsProfitCls,
+  orderValueTotal,
+  showAccount,
+  hiddenCols,
+  MASK,
+  compact = false,
+}: TotalsRowProps) {
+  const py = compact ? "py-2" : "py-4";
+  const rowCls = compact
+    ? "border-b-2 border-shopee-500/50 bg-[#140810] text-sm font-bold text-white/90"
+    : "border-t-2 border-shopee-500 bg-shopee-900/25 text-base font-bold text-white";
+
+  return (
+    <tr className={rowCls}>
+      <td />
+      <td className={`px-4 ${py} text-left text-xs uppercase tracking-wider text-shopee-300/80`}>
+        {compact ? "↑ Tổng" : "Tổng"}
+      </td>
+      {showAccount && <td />}
+      <td className={`px-3 ${py} text-center tabular-nums`}>
+        {hiddenCols.has("Click ADS") ? MASK : fmtInt(totals.clicks)}
+      </td>
+      <td className={`px-3 ${py} text-center tabular-nums`}>
+        {hiddenCols.has("Click Shopee") ? MASK : fmtInt(totals.shopeeClicks)}
+      </td>
+      <td
+        className={`px-3 ${py} text-center tabular-nums text-gray-400`}
+        title={
+          totals.clicks > 0
+            ? `CPC TB = Tổng tiền chạy / Tổng click ADS\n= ${fmtVnd(totals.totalSpend)} / ${fmtInt(totals.clicks)}`
+            : "Không có click ADS"
+        }
+      >
+        {hiddenCols.has("Đơn giá click")
+          ? MASK
+          : totals.clicks > 0
+          ? fmtVnd(totals.totalSpend / totals.clicks)
+          : "—"}
+      </td>
+      <td className={`px-3 ${py} text-center tabular-nums text-blue-400`}>
+        {hiddenCols.has("Tổng tiền chạy") ? MASK : fmtVnd(totals.totalSpend)}
+      </td>
+      <td className={`px-3 ${py} text-center tabular-nums`}>
+        {hiddenCols.has("Số lượng đơn") ? MASK : fmtInt(totals.orders)}
+      </td>
+      <td
+        className={`px-3 ${py} text-center tabular-nums`}
+        title={
+          totals.shopeeClicks === 0
+            ? "Không có Click Shopee → không tính được CR"
+            : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
+        }
+      >
+        {hiddenCols.has("Tỷ lệ chuyển đổi")
+          ? MASK
+          : totals.shopeeClicks > 0
+          ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
+          : "—"}
+      </td>
+      <td
+        className={`px-3 ${py} text-center tabular-nums`}
+        title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
+      >
+        {hiddenCols.has("Giá trị đơn hàng")
+          ? MASK
+          : totals.orders > 0
+          ? fmtVnd(orderValueTotal / totals.orders)
+          : "—"}
+      </td>
+      <td className={`px-3 ${py} text-center tabular-nums text-shopee-400`}>
+        {hiddenCols.has("Hoa hồng") ? MASK : fmtVnd(totals.commission)}
+      </td>
+      <td className={`px-3 ${py} text-center tabular-nums ${totalsProfitCls}`}>
+        {hiddenCols.has("Lợi nhuận") ? MASK : fmtVnd(totals.profit)}
+      </td>
+      <td
+        className={`px-3 ${py} text-center tabular-nums ${
+          totals.totalSpend > 0 ? totalsProfitCls : "text-white/30"
+        }`}
+        title={
+          totals.totalSpend > 0
+            ? `ROI TB = (Hoa hồng ròng − Tiền ads) / Tiền ads\n= ${fmtVnd(totals.profit)} / ${fmtVnd(totals.totalSpend)}`
+            : "Không có tiền ads"
+        }
+      >
+        {hiddenCols.has("ROI")
+          ? MASK
+          : totals.totalSpend > 0
+          ? fmtPct((totals.profit / totals.totalSpend) * 100)
+          : "—"}
+      </td>
+      <td className="col-actions" />
+    </tr>
   );
 }

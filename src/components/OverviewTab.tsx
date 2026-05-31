@@ -617,25 +617,44 @@ function BigKpi({
   sub?: string;
   tone: Tone;
 }) {
+  const [hidden, setHidden] = useState(false);
   return (
     <div className="rounded-xl bg-surface-4 p-5 shadow-elev-2 transition-shadow hover:shadow-elev-4">
       <div className="flex items-center gap-2">
         <span className={`material-symbols-rounded text-lg ${toneIconClass(tone)}`}>
           {icon}
         </span>
-        <p className="text-xs font-semibold uppercase tracking-wider text-white/55">
+        <p className="flex-1 text-xs font-semibold uppercase tracking-wider text-white/55">
           {label}
         </p>
+        <button
+          onClick={() => setHidden((h) => !h)}
+          className="flex h-5 w-5 items-center justify-center rounded text-white/25 hover:text-white/60"
+          title={hidden ? "Hiện" : "Ẩn"}
+          aria-label={hidden ? "Hiện" : "Ẩn"}
+        >
+          <span className="material-symbols-rounded text-[14px]">
+            {hidden ? "visibility_off" : "visibility"}
+          </span>
+        </button>
       </div>
       <p
         className={`num-glow mt-2 truncate text-3xl font-bold tabular-nums ${toneTextClass(tone)}`}
-        title={value}
+        title={hidden ? undefined : value}
       >
-        {value}
+        {hidden ? (
+          <span className="select-none tracking-widest text-white/20">••••</span>
+        ) : (
+          value
+        )}
       </p>
       {sub && (
-        <p className="mt-1 truncate text-xs text-white/50" title={sub}>
-          {sub}
+        <p className="mt-1 truncate text-xs text-white/50" title={hidden ? undefined : sub}>
+          {hidden ? (
+            <span className="select-none tracking-widest text-white/20">••</span>
+          ) : (
+            sub
+          )}
         </p>
       )}
     </div>
@@ -658,28 +677,47 @@ function SmallKpi({
   /** Brand tone — spend/commission color icon. Default neutral (white/40). */
   tone?: Tone;
 }) {
+  const [hidden, setHidden] = useState(false);
   const iconCls =
     tone === "neutral" ? "text-white/35" : toneIconClass(tone);
   return (
-    <div
-      className="rounded-lg bg-surface-2 px-4 py-3 shadow-elev-1"
-      title={tooltip}
-    >
+    <div className="rounded-lg bg-surface-2 px-4 py-3 shadow-elev-1">
       <div className="flex items-center gap-1.5">
         <span className={`material-symbols-rounded text-sm ${iconCls}`}>{icon}</span>
-        <p className={`text-[11px] font-medium uppercase tracking-wider text-white/55 ${tooltip ? "cursor-help" : ""}`}>
+        <p
+          className={`flex-1 text-[11px] font-medium uppercase tracking-wider text-white/55 ${tooltip ? "cursor-help" : ""}`}
+          title={tooltip}
+        >
           {label}
         </p>
+        <button
+          onClick={() => setHidden((h) => !h)}
+          className="flex h-5 w-5 items-center justify-center rounded text-white/25 hover:text-white/60"
+          title={hidden ? "Hiện" : "Ẩn"}
+          aria-label={hidden ? "Hiện" : "Ẩn"}
+        >
+          <span className="material-symbols-rounded text-[13px]">
+            {hidden ? "visibility_off" : "visibility"}
+          </span>
+        </button>
       </div>
       <p
         className="num-glow mt-1 truncate text-xl font-bold tabular-nums text-white/95"
-        title={value}
+        title={hidden ? undefined : value}
       >
-        {value}
+        {hidden ? (
+          <span className="select-none tracking-widest text-white/20">••••</span>
+        ) : (
+          value
+        )}
       </p>
       {sub && (
-        <p className="mt-0.5 truncate text-[11px] text-white/45" title={sub}>
-          {sub}
+        <p className="mt-0.5 truncate text-[11px] text-white/45" title={hidden ? undefined : sub}>
+          {hidden ? (
+            <span className="select-none tracking-widest text-white/20">••</span>
+          ) : (
+            sub
+          )}
         </p>
       )}
     </div>
@@ -782,6 +820,7 @@ function ProductRow({
   showAds: boolean;
   onClick: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
   const cr =
     row.shopeeClicks > 0 ? (row.ordersCount / row.shopeeClicks) * 100 : null;
   const roi = row.totalSpend > 0 ? (row.profit / row.totalSpend) * 100 : null;
@@ -793,6 +832,16 @@ function ProductRow({
       : "text-gray-400";
   const cellCls = "px-3 py-2.5 text-center";
   const naCls = "text-white/30";
+
+  function handleCopy(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!row.displayName) return;
+    navigator.clipboard.writeText(row.displayName).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
   return (
     <tr
       onClick={() => {
@@ -808,12 +857,32 @@ function ProductRow({
         {index}
       </td>
       <td
-        className="max-w-[280px] truncate px-4 py-2.5 text-left text-sm font-semibold text-white"
+        className="max-w-[280px] px-4 py-2.5 text-left text-sm font-semibold text-white"
         title={row.displayName}
       >
-        {row.displayName || (
-          <span className="italic font-normal text-gray-500">(chưa đặt tên)</span>
-        )}
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate">
+            {row.displayName || (
+              <span className="italic font-normal text-gray-500">(chưa đặt tên)</span>
+            )}
+          </span>
+          {row.displayName && (
+            <button
+              type="button"
+              onClick={handleCopy}
+              title={copied ? "Đã copy!" : "Copy tên sản phẩm"}
+              className={`flex-none flex h-5 w-5 items-center justify-center rounded transition-all ${
+                copied
+                  ? "text-green-400"
+                  : "text-white/20 hover:text-white/80"
+              }`}
+            >
+              <span className="material-symbols-rounded text-[13px]">
+                {copied ? "check" : "content_copy"}
+              </span>
+            </button>
+          )}
+        </div>
       </td>
       <td className={`${cellCls} tabular-nums text-white/60`}>{row.daysActive}</td>
       {showAds && (

@@ -89,7 +89,9 @@ pub fn init_db_at(path: &Path) -> Result<Connection> {
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
          PRAGMA synchronous = NORMAL;
-         PRAGMA temp_store = MEMORY;",
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -32768;
+         PRAGMA mmap_size = 268435456;",
     )
     .context("không apply được PRAGMA")?;
 
@@ -97,6 +99,11 @@ pub fn init_db_at(path: &Path) -> Result<Connection> {
         .context("không apply được schema")?;
 
     seed_default_account(&conn).context("seed default account thất bại")?;
+
+    // Cập nhật statistics cho query planner — giúp chọn đúng index khi data lớn.
+    // Chạy sau schema/seed để stats có dữ liệu thực.
+    let _ = conn.execute_batch("ANALYZE");
+
 
     Ok(conn)
 }

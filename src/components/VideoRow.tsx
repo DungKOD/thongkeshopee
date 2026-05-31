@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { UiRow } from "../types";
 import { computeUiRow, fmtInt, fmtPct, fmtVnd } from "../formulas";
 import { sumFiltered, useSettings } from "../hooks/useSettings";
@@ -13,6 +14,7 @@ interface CampaignRowProps {
   readOnly?: boolean;
   showAccount?: boolean;
   deleteBlocked?: boolean;
+  hiddenCols?: Set<string>;
 }
 
 const cellCls = "px-3 py-2.5 text-center";
@@ -38,7 +40,10 @@ export function VideoRow({
   readOnly = false,
   showAccount = false,
   deleteBlocked = false,
+  hiddenCols,
 }: CampaignRowProps) {
+  const h = (col: string) => hiddenCols?.has(col) ?? false;
+  const [copied, setCopied] = useState(false);
   const { settings } = useSettings();
   const shopeeClicks = sumFiltered(
     row.shopeeClicksByReferrer,
@@ -56,6 +61,10 @@ export function VideoRow({
   const spendCell = fmtOrNa(row.totalSpend, fmtVnd);
   const clicksCell = fmtOrNa(row.adsClicks, fmtInt);
   const cpcCell = fmtOrNa(c.cpc > 0 ? c.cpc : null, fmtVnd);
+
+  const MASK = (
+    <span className="select-none tracking-widest text-white/20">••••</span>
+  );
 
   // Không trigger onViewDetail khi user đang bôi đen text trong row.
   const handleRowClick = () => {
@@ -81,18 +90,44 @@ export function VideoRow({
         {index}
       </td>
       <td
-        className={`max-w-[280px] truncate px-4 py-2.5 text-left text-sm font-semibold text-white ${dataCellPending}`}
-        title={row.displayName}
+        className={`max-w-[280px] px-4 py-2.5 text-left text-sm font-semibold text-white ${dataCellPending}`}
+        title={h("Sản phẩm") ? undefined : row.displayName}
       >
-        {row.displayName || (
-          <span className="italic font-normal text-gray-500">
-            (chưa đặt tên)
-          </span>
+        {h("Sản phẩm") ? MASK : (
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate">
+              {row.displayName || (
+                <span className="italic font-normal text-gray-500">
+                  (chưa đặt tên)
+                </span>
+              )}
+            </span>
+            {row.displayName && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  navigator.clipboard.writeText(row.displayName).then(() => {
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 1500);
+                  });
+                }}
+                title={copied ? "Đã copy!" : "Copy tên sản phẩm"}
+                className={`flex-none flex h-5 w-5 items-center justify-center rounded transition-all ${
+                  copied ? "text-green-400" : "text-white/20 hover:text-white/80"
+                }`}
+              >
+                <span className="material-symbols-rounded text-[13px]">
+                  {copied ? "check" : "content_copy"}
+                </span>
+              </button>
+            )}
+          </div>
         )}
       </td>
       {showAccount && (
         <td className={`${cellCls} ${dataCellPending}`}>
-          {row.accountName ? (
+          {h("TK Shopee") ? MASK : row.accountName ? (
             <span
               className="inline-block max-w-[140px] truncate rounded-md bg-shopee-900/40 px-2 py-0.5 text-xs font-medium text-shopee-200"
               title={row.accountName}
@@ -110,23 +145,23 @@ export function VideoRow({
         </td>
       )}
       <td className={`${cellCls} tabular-nums ${clicksCell.cls} ${dataCellPending}`}>
-        {clicksCell.text}
+        {h("Click ADS") ? MASK : clicksCell.text}
       </td>
       <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
-        {fmtInt(shopeeClicks)}
+        {h("Click Shopee") ? MASK : fmtInt(shopeeClicks)}
       </td>
       <td className={`${cellCls} tabular-nums text-gray-400 ${cpcCell.cls} ${dataCellPending}`}>
-        {cpcCell.text}
+        {h("Đơn giá click") ? MASK : cpcCell.text}
       </td>
       <td
         className={`${cellCls} tabular-nums ${
           spendCell.cls === "" ? "text-blue-400" : spendCell.cls
         } ${dataCellPending}`}
       >
-        {spendCell.text}
+        {h("Tổng tiền chạy") ? MASK : spendCell.text}
       </td>
       <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
-        {fmtInt(row.ordersCount)}
+        {h("Số lượng đơn") ? MASK : fmtInt(row.ordersCount)}
       </td>
       <td
         className={`${cellCls} tabular-nums text-gray-400 ${
@@ -138,22 +173,22 @@ export function VideoRow({
             : `CR = Số đơn / Click Shopee × 100% (${row.ordersCount}/${shopeeClicks})`
         }
       >
-        {shopeeClicks > 0 ? fmtPct(c.conversionRate) : "—"}
+        {h("Tỷ lệ chuyển đổi") ? MASK : shopeeClicks > 0 ? fmtPct(c.conversionRate) : "—"}
       </td>
       <td
         className={`${cellCls} tabular-nums text-gray-400 ${
           row.ordersCount === 0 ? naCls : ""
         } ${dataCellPending}`}
       >
-        {row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
+        {h("Giá trị đơn hàng") ? MASK : row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
       </td>
       <td className={`${cellCls} tabular-nums text-shopee-400 ${dataCellPending}`}>
-        {fmtVnd(row.commissionTotal)}
+        {h("Hoa hồng") ? MASK : fmtVnd(row.commissionTotal)}
       </td>
       <td
         className={`${cellCls} tabular-nums font-medium ${profitCls} ${dataCellPending}`}
       >
-        {fmtVnd(c.profit)}
+        {h("Lợi nhuận") ? MASK : fmtVnd(c.profit)}
       </td>
       <td
         className={`${cellCls} tabular-nums ${
@@ -171,7 +206,7 @@ export function VideoRow({
               }`
         }
       >
-        {row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
+        {h("ROI") ? MASK : row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
       </td>
       <td className={`${cellCls} col-actions`}>
         <div className="flex justify-center gap-0.5">

@@ -5,11 +5,13 @@ import { fmtInt, fmtVnd } from "../formulas";
 interface FbHierarchyTreeProps {
   breakdown: FbBreakdown;
   showAccount: boolean;
+  hiddenCols?: Set<string>;
 }
 
 const NA = "—";
 const naCls = "text-white/30";
 const cell = "px-3 py-1.5 text-center tabular-nums text-sm";
+const MASK = <span className="select-none tracking-widest text-white/20">••••</span>;
 
 function VndCell({ v, cls = "" }: { v: number | null | undefined; cls?: string }) {
   if (!v) return <td className={`${cell} ${naCls}`}>{NA}</td>;
@@ -58,13 +60,34 @@ function FbDataCols({
   spend,
   cpcCls,
   spendCls,
+  hiddenCols,
 }: {
   clicks: number | null | undefined;
   cpc: number | null | undefined;
   spend: number;
   cpcCls: string;
   spendCls: string;
+  hiddenCols?: Set<string>;
 }) {
+  const hClicks = hiddenCols?.has("Click ADS") ?? false;
+  const hCpc = hiddenCols?.has("Đơn giá click") ?? false;
+  const hSpend = hiddenCols?.has("Tổng tiền chạy") ?? false;
+  if (hClicks || hCpc || hSpend) {
+    return (
+      <>
+        {hClicks ? <td className={cell}>{MASK}</td> : <IntCell v={clicks} />}  {/* Click ADS   */}
+        <NaCell />                               {/* Click Shopee   */}
+        {hCpc ? <td className={cell}>{MASK}</td> : <VndCell v={cpc} cls={cpcCls} />}   {/* CPC       */}
+        {hSpend ? <td className={cell}>{MASK}</td> : <VndCell v={spend} cls={spendCls} />} {/* Spend  */}
+        <NaCell />                               {/* Số đơn        */}
+        <NaCell />                               {/* CR             */}
+        <NaCell />                               {/* GMV            */}
+        <NaCell />                               {/* Hoa hồng      */}
+        <NaCell />                               {/* Lợi nhuận     */}
+        <NaCell />                               {/* ROI            */}
+      </>
+    );
+  }
   return (
     <>
       <IntCell v={clicks} />                    {/* Click ADS      */}
@@ -85,21 +108,27 @@ function AdRow({
   ad,
   showAccount,
   indentCls,
+  hiddenCols,
 }: {
   ad: FbAdLeaf;
   showAccount: boolean;
   indentCls: string;
+  hiddenCols?: Set<string>;
 }) {
   return (
     <tr className="border-b border-surface-8/20">
       <td />
       <td className="px-4 py-1.5 text-left">
-        <div className={`flex items-center gap-1.5 truncate ${indentCls}`} title={ad.adName}>
+        <div className={`flex items-center gap-1.5 truncate ${indentCls}`} title={(hiddenCols?.has("Sản phẩm") ?? false) ? undefined : ad.adName}>
           <span className="material-symbols-rounded text-[13px] text-emerald-300">ads_click</span>
           <span className="truncate text-sm text-white/70">
-            {ad.adName}
-            {ad.occurrenceIdx > 0 && (
-              <span className="ml-1 text-white/40">(#{ad.occurrenceIdx + 1})</span>
+            {(hiddenCols?.has("Sản phẩm") ?? false) ? MASK : (
+              <>
+                {ad.adName}
+                {ad.occurrenceIdx > 0 && (
+                  <span className="ml-1 text-white/40">(#{ad.occurrenceIdx + 1})</span>
+                )}
+              </>
             )}
           </span>
           <span className="shrink-0 rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">
@@ -114,6 +143,7 @@ function AdRow({
         spend={ad.spend}
         cpcCls="text-gray-400"
         spendCls="text-blue-200"
+        hiddenCols={hiddenCols}
       />
       <td className="col-actions" />
     </tr>
@@ -125,23 +155,27 @@ function AdSetRow({
   showAccount,
   showAd,
   indentCls,
+  hiddenCols,
 }: {
   adset: FbAdSetGroup;
   showAccount: boolean;
   showAd: boolean;
   indentCls: string;
+  hiddenCols?: Set<string>;
 }) {
   return (
     <tr className="border-b border-surface-8/40 bg-surface-1/25">
       <td />
       <td className="px-4 py-1.5 text-left">
-        <div className={`flex items-center gap-1.5 truncate ${indentCls}`} title={adset.adSetName}>
+        <div className={`flex items-center gap-1.5 truncate ${indentCls}`} title={(hiddenCols?.has("Sản phẩm") ?? false) ? undefined : adset.adSetName}>
           <span className="material-symbols-rounded text-[13px] text-amber-300">folder</span>
-          <span className="truncate text-sm text-white/85">{adset.adSetName}</span>
+          <span className="truncate text-sm text-white/85">
+            {(hiddenCols?.has("Sản phẩm") ?? false) ? MASK : adset.adSetName}
+          </span>
           <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-amber-300">
             Nhóm
           </span>
-          {!showAd && adset.ads[0] && (
+          {!showAd && adset.ads[0] && !(hiddenCols?.has("Sản phẩm") ?? false) && (
             <span className="ml-1 shrink-0 truncate text-[11px] text-white/30" title={adset.ads[0].adName}>
               · {adset.ads[0].adName}
             </span>
@@ -155,13 +189,14 @@ function AdSetRow({
         spend={adset.spend}
         cpcCls="text-gray-400"
         spendCls="text-blue-300"
+        hiddenCols={hiddenCols}
       />
       <td className="col-actions" />
     </tr>
   );
 }
 
-export function FbHierarchyTree({ breakdown, showAccount }: FbHierarchyTreeProps) {
+export function FbHierarchyTree({ breakdown, showAccount, hiddenCols }: FbHierarchyTreeProps) {
   if (!breakdown.campaigns.length) return null;
 
   const { showCampaign, showAdSet, showAd } = computeLevels(breakdown);
@@ -189,10 +224,10 @@ export function FbHierarchyTree({ breakdown, showAccount }: FbHierarchyTreeProps
               <tr className="border-b border-surface-8/60 bg-shopee-900/20">
                 <td />
                 <td className="px-4 py-1.5 text-left">
-                  <div className="flex items-center gap-1.5 truncate pl-4" title={camp.campaignName}>
+                  <div className="flex items-center gap-1.5 truncate pl-4" title={(hiddenCols?.has("Sản phẩm") ?? false) ? undefined : camp.campaignName}>
                     <span className="material-symbols-rounded text-[13px] text-shopee-400">campaign</span>
                     <span className="truncate text-sm font-semibold text-white">
-                      {camp.campaignName}
+                      {(hiddenCols?.has("Sản phẩm") ?? false) ? MASK : camp.campaignName}
                     </span>
                     <span className="shrink-0 rounded bg-shopee-900/40 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-shopee-300">
                       Camp
@@ -206,6 +241,7 @@ export function FbHierarchyTree({ breakdown, showAccount }: FbHierarchyTreeProps
                   spend={camp.spend}
                   cpcCls="text-gray-400"
                   spendCls="font-semibold text-blue-400"
+                  hiddenCols={hiddenCols}
                 />
                 <td className="col-actions" />
               </tr>
@@ -220,6 +256,7 @@ export function FbHierarchyTree({ breakdown, showAccount }: FbHierarchyTreeProps
                     showAccount={showAccount}
                     showAd={showAd}
                     indentCls={adsetIndent}
+                    hiddenCols={hiddenCols}
                   />
                   {showAd &&
                     adset.ads.map((ad) => (
@@ -228,6 +265,7 @@ export function FbHierarchyTree({ breakdown, showAccount }: FbHierarchyTreeProps
                         ad={ad}
                         showAccount={showAccount}
                         indentCls={adUnderAdsetIndent}
+                        hiddenCols={hiddenCols}
                       />
                     ))}
                 </Fragment>
@@ -240,6 +278,7 @@ export function FbHierarchyTree({ breakdown, showAccount }: FbHierarchyTreeProps
                 ad={ad}
                 showAccount={showAccount}
                 indentCls={adFlatIndent}
+                hiddenCols={hiddenCols}
               />
             ))}
           </Fragment>

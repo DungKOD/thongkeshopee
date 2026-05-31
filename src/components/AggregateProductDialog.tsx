@@ -268,6 +268,10 @@ export function AggregateProductDialog({
     product.totalSpend > 0
       ? (product.profit / product.totalSpend) * 100
       : null;
+  const roasPct =
+    product.totalSpend > 0
+      ? (product.netCommission / product.totalSpend) * 100
+      : null;
   const avgOrderValue =
     product.ordersCount > 0 ? product.orderValueTotal / product.ordersCount : null;
   const avgCommission =
@@ -455,6 +459,13 @@ export function AggregateProductDialog({
                 value={fmtVnd(product.netCommission)}
                 tooltip="Gross × (1 − thuế − dự phòng)"
               />
+              {showAds && (
+                <MetricRow
+                  label="ROI (HH/Ads)"
+                  value={roasPct !== null ? fmtPct(roasPct) : "—"}
+                  tooltip="ROI = Hoa hồng ròng / Tiền ads × 100%"
+                />
+              )}
             </div>
           </Section>
 
@@ -763,25 +774,44 @@ function KpiCard({
   sub?: string;
   tone?: Tone;
 }) {
+  const [hidden, setHidden] = useState(false);
   return (
     <div className="rounded-xl bg-surface-4 p-4 shadow-elev-2 transition-shadow hover:shadow-elev-4">
       <div className="flex items-center gap-1.5">
         <span className={`material-symbols-rounded text-base ${toneIconClass(tone)}`}>
           {icon}
         </span>
-        <p className="text-[11px] font-medium uppercase tracking-wider text-white/55">
+        <p className="flex-1 text-[11px] font-medium uppercase tracking-wider text-white/55">
           {label}
         </p>
+        <button
+          onClick={() => setHidden((h) => !h)}
+          className="flex h-5 w-5 items-center justify-center rounded text-white/25 hover:text-white/60"
+          title={hidden ? "Hiện" : "Ẩn"}
+          aria-label={hidden ? "Hiện" : "Ẩn"}
+        >
+          <span className="material-symbols-rounded text-[14px]">
+            {hidden ? "visibility_off" : "visibility"}
+          </span>
+        </button>
       </div>
       <p
         className={`num-glow mt-1.5 truncate text-2xl font-bold tabular-nums ${toneTextClass(tone)}`}
-        title={value}
+        title={hidden ? undefined : value}
       >
-        {value}
+        {hidden ? (
+          <span className="select-none tracking-widest text-white/20">••••</span>
+        ) : (
+          value
+        )}
       </p>
       {sub && (
-        <p className="mt-0.5 truncate text-[11px] text-white/45" title={sub}>
-          {sub}
+        <p className="mt-0.5 truncate text-[11px] text-white/45" title={hidden ? undefined : sub}>
+          {hidden ? (
+            <span className="select-none tracking-widest text-white/20">••</span>
+          ) : (
+            sub
+          )}
         </p>
       )}
     </div>
@@ -797,17 +827,34 @@ function MetricRow({
   value: string;
   tooltip?: string;
 }) {
+  const [hidden, setHidden] = useState(false);
   return (
-    <div className="detail-row -mx-2 flex items-baseline justify-between gap-2 rounded-md border-b border-dashed border-surface-6 px-2 py-1 last:border-b-0">
+    <div className="detail-row -mx-2 flex items-center justify-between gap-2 rounded-md border-b border-dashed border-surface-6 px-2 py-1 last:border-b-0">
       <span
         className={`detail-row-label text-sm text-white/60 ${tooltip ? "cursor-help" : ""}`}
         title={tooltip}
       >
         {label}
       </span>
-      <span className="detail-row-value text-base font-bold tabular-nums text-white/95">
-        {value}
-      </span>
+      <div className="flex items-center gap-1">
+        <span className="detail-row-value text-base font-bold tabular-nums text-white/95">
+          {hidden ? (
+            <span className="select-none tracking-widest text-white/20">••••</span>
+          ) : (
+            value
+          )}
+        </span>
+        <button
+          onClick={() => setHidden((h) => !h)}
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-white/25 hover:text-white/60"
+          title={hidden ? "Hiện" : "Ẩn"}
+          aria-label={hidden ? "Hiện" : "Ẩn"}
+        >
+          <span className="material-symbols-rounded text-[13px]">
+            {hidden ? "visibility_off" : "visibility"}
+          </span>
+        </button>
+      </div>
     </div>
   );
 }
