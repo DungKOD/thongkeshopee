@@ -34,7 +34,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "1"
 reqwest = { version = "0.12", features = ["json", "cookies", "stream"] }
-tokio = { version = "1", features = ["fs", "io-util", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt", "macros", "time", "sync"] }
 futures-util = "0.3"
 base64 = "0.22"
 
