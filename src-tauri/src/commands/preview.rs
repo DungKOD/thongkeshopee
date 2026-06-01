@@ -111,8 +111,7 @@ fn any_day_has_data(conn: &rusqlite::Connection, dates: &[String]) -> CmdResult<
         return Ok(false);
     }
     // Build placeholder string "?,?,?" cho IN clause.
-    let placeholders = std::iter::repeat("?")
-        .take(dates.len())
+    let placeholders = std::iter::repeat_n("?", dates.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT COUNT(*) FROM days WHERE date IN ({placeholders})");
@@ -188,7 +187,7 @@ pub fn preview_import_shopee_clicks(
     let mut existing: HashSet<String> = HashSet::new();
     const CHUNK: usize = 500;
     for chunk in file_click_ids.chunks(CHUNK) {
-        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT click_id FROM raw_shopee_clicks WHERE click_id IN ({placeholders})"
         );
@@ -267,8 +266,7 @@ pub fn preview_import_shopee_orders(
     let mut existing: HashSet<(String, String, String)> = HashSet::new();
     const CHUNK: usize = 500;
     for chunk in file_keys.chunks(CHUNK) {
-        let placeholders =
-            std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT checkout_id, item_id, model_id FROM raw_shopee_order_items
              WHERE checkout_id || '|' || item_id || '|' || model_id IN ({placeholders})"

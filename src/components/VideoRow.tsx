@@ -1,7 +1,8 @@
 import { useState } from "react";
 import type { UiRow } from "../types";
-import { computeUiRow, fmtInt, fmtPct, fmtVnd } from "../formulas";
+import { computeUiRow, fmtInt, fmtPct, fmtVnd, uiRowKey } from "../formulas";
 import { sumFiltered, useSettings } from "../hooks/useSettings";
+import { useBookmark } from "../hooks/useBookmark";
 
 interface CampaignRowProps {
   row: UiRow;
@@ -17,7 +18,7 @@ interface CampaignRowProps {
   hiddenCols?: Set<string>;
 }
 
-const cellCls = "px-3 py-2.5 text-center";
+const cellCls = "px-3 py-2.5 text-center whitespace-nowrap";
 const naCls = "text-white/30";
 
 function fmtOrNa(
@@ -45,6 +46,9 @@ export function VideoRow({
   const h = (col: string) => hiddenCols?.has(col) ?? false;
   const [copied, setCopied] = useState(false);
   const { settings } = useSettings();
+  const { isBookmarked, toggle: toggleBookmark } = useBookmark(
+    uiRowKey(row.dayDate, row.subIds, row.accountId),
+  );
   const shopeeClicks = sumFiltered(
     row.shopeeClicksByReferrer,
     settings.clickSources,
@@ -77,20 +81,24 @@ export function VideoRow({
   return (
     <tr
       onClick={handleRowClick}
-      className={`h-[52px] border-b border-surface-8 text-white/80 transition-colors ${
-        pending
-          ? "bg-surface-2/50"
-          : "cursor-pointer hover:bg-shopee-500/15 hover:shadow-[inset_3px_0_0_0] hover:shadow-shopee-500"
+      className={`h-[52px] border-b text-white/80 transition-colors ${
+        isBookmarked
+          ? "border-amber-500/40 bg-amber-500/10 shadow-[inset_4px_0_0_0_theme(colors.amber.400)] cursor-pointer"
+          : pending
+          ? "border-surface-8 bg-surface-2/50"
+          : "border-surface-8 cursor-pointer hover:bg-shopee-500/15 hover:shadow-[inset_3px_0_0_0] hover:shadow-shopee-500"
       }`}
       title={row.displayName}
     >
       <td
-        className={`w-12 px-2 py-2.5 text-center text-sm tabular-nums text-white/50 ${dataCellPending}`}
+        className={`w-12 px-2 py-2.5 text-center text-sm tabular-nums sticky left-0 z-10 ${isBookmarked ? "text-amber-400 bg-[#2b2212]" : "text-white/50 bg-[#222222]"} ${dataCellPending}`}
       >
-        {index}
+        {isBookmarked
+          ? <span className="material-symbols-rounded text-base leading-none">bookmark</span>
+          : index}
       </td>
       <td
-        className={`max-w-[280px] px-4 py-2.5 text-left text-sm font-semibold text-white ${dataCellPending}`}
+        className={`max-w-[280px] px-4 py-2.5 text-left text-sm font-semibold text-white sticky left-12 z-[9] shadow-[2px_0_8px_rgba(0,0,0,0.5)] ${isBookmarked ? "bg-[#2b2212]" : "bg-[#222222]"} ${dataCellPending}`}
         title={h("Sản phẩm") ? undefined : row.displayName}
       >
         {h("Sản phẩm") ? MASK : (
@@ -208,8 +216,22 @@ export function VideoRow({
       >
         {h("ROI") ? MASK : row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
       </td>
-      <td className={`${cellCls} col-actions`}>
+      <td className={`${cellCls} col-actions sticky right-0 z-10 bg-[#222222] shadow-[-2px_0_8px_rgba(0,0,0,0.5)]`}>
         <div className="flex justify-center gap-0.5">
+          <button
+            onClick={(e) => { e.stopPropagation(); toggleBookmark(); }}
+            className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
+              isBookmarked
+                ? "text-amber-400 hover:bg-amber-500/20"
+                : "text-white/30 hover:bg-amber-500/10 hover:text-amber-300"
+            }`}
+            title={isBookmarked ? "Bỏ đánh dấu" : "Đánh dấu đang check SP này"}
+            aria-label="Đánh dấu"
+          >
+            <span className="material-symbols-rounded text-lg">
+              {isBookmarked ? "bookmark" : "bookmark_border"}
+            </span>
+          </button>
           {onViewHistory && (
             <button
               onClick={(e) => {

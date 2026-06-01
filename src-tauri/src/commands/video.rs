@@ -9,9 +9,12 @@
 //!
 //! Không cần OAuth/API key — dùng API public + HTML scraping.
 
+use std::sync::OnceLock;
+
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
+use tokio::sync::Semaphore;
 
 use crate::db::VideoDbState;
 
@@ -42,12 +45,15 @@ pub struct VideoInfo {
 
 // ===== Cobalt API (đa nền tảng) =====
 
+// Cobalt trả `error` là object {"code": "..."}, không phải string
+// → dùng Value để tránh parse fail
 #[derive(Debug, Deserialize)]
 struct CobaltResponse {
     status: Option<String>,
     url: Option<String>,
     filename: Option<String>,
-    error: Option<String>,
+    #[serde(default)]
+    error: serde_json::Value,
     picker: Option<Vec<CobaltPicker>>,
 }
 
@@ -61,6 +67,7 @@ struct CobaltPicker {
 #[derive(Debug, Deserialize)]
 struct TikwmResponse {
     code: i32,
+    msg: Option<String>,
     data: Option<TikwmData>,
 }
 
@@ -107,7 +114,39 @@ fn detect_platform(url: &str) -> &str {
     else { "Khác" }
 }
 
+static COBALT_SEM: OnceLock<Semaphore> = OnceLock::new();
+fn cobalt_sem() -> &'static Semaphore {
+    COBALT_SEM.get_or_init(|| Semaphore::new(2))
+}
+
+// ===== TikTok multi-API rotation =====
+
+/// Round-robin counter — xen kẽ TikWM / tiklydown để phân tải.
+static TIKTOK_API_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Rate limiter TikWM: free tier chỉ cho 1 req/sec.
+static TIKWM_LAST: OnceLock<tokio::sync::Mutex<std::time::Instant>> = OnceLock::new();
+fn tikwm_mutex() -> &'static tokio::sync::Mutex<std::time::Instant> {
+    TIKWM_LAST.get_or_init(|| {
+        tokio::sync::Mutex::new(
+            std::time::Instant::now() - std::time::Duration::from_secs(2),
+        )
+    })
+}
+async fn tikwm_wait() {
+    let mut last = tikwm_mutex().lock().await;
+    let elapsed = last.elapsed();
+    const GAP: std::time::Duration = std::time::Duration::from_millis(1100);
+    if elapsed < GAP {
+        tokio::time::sleep(GAP - elapsed).await;
+    }
+    *last = std::time::Instant::now();
+}
+
 async fn fetch_cobalt(url: &str) -> Result<VideoInfo, String> {
+    // Tối đa 2 request Cobalt song song — tránh rate limit khi tải hàng loạt
+    let _permit = cobalt_sem().acquire().await.ok();
+
     let client = http_client()?;
 
     let body = serde_json::json!({
@@ -125,15 +164,43 @@ async fn fetch_cobalt(url: &str) -> Result<VideoInfo, String> {
         .await
         .map_err(|e| format!("Lỗi kết nối Cobalt: {}", e))?;
 
-    let data: CobaltResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Lỗi parse Cobalt: {}", e))?;
+    if resp.status() == 429 {
+        return Err("Cobalt API bị rate limit, thử lại sau vài giây.".to_string());
+    }
+
+    // Đọc text trước để có thể log nếu parse JSON thất bại
+    let text = resp.text().await.map_err(|e| format!("Lỗi đọc Cobalt: {}", e))?;
+    let data: CobaltResponse = serde_json::from_str(&text).map_err(|e| {
+        let preview = &text[..text.len().min(200)];
+        format!("Cobalt trả về không hợp lệ ({e}): {preview}")
+    })?;
 
     let status = data.status.unwrap_or_default();
 
     if status == "error" {
-        return Err(data.error.unwrap_or("Cobalt API lỗi".to_string()));
+        let code = match &data.error {
+            serde_json::Value::Object(o) => o
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error.unknown")
+                .to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            _ => "error.unknown".to_string(),
+        };
+        let msg = match code.as_str() {
+            "error.api.auth.jwt.missing" | "error.api.auth.jwt.invalid" =>
+                "Cobalt API yêu cầu xác thực (instance công khai đã bị khoá). Video không tải được qua Cobalt.".to_string(),
+            "error.api.content.video.unavailable" =>
+                "Video không tồn tại hoặc đã bị gỡ.".to_string(),
+            "error.api.content.video.private" =>
+                "Video riêng tư, không tải được.".to_string(),
+            "error.api.content.video.age" =>
+                "Video giới hạn độ tuổi, không tải được.".to_string(),
+            "error.api.link.unsupported" =>
+                "Link này chưa được Cobalt hỗ trợ.".to_string(),
+            _ => code,
+        };
+        return Err(msg);
     }
 
     let download_url = if let Some(u) = data.url {
@@ -162,13 +229,31 @@ async fn fetch_cobalt(url: &str) -> Result<VideoInfo, String> {
 
 async fn fetch_tikwm(url: &str) -> Result<VideoInfo, String> {
     let api_url = format!("https://www.tikwm.com/api/?url={}&hd=1", urlencoding(url));
-
     let client = http_client()?;
-    let resp = client.get(&api_url).send().await.map_err(|e| e.to_string())?;
-    let body: TikwmResponse = resp.json().await.map_err(|e| e.to_string())?;
+
+    // snaptik.vn retry pattern: TikWM free tier 1 req/sec → retry ≤10 lần, delay 1.2s
+    let mut body: TikwmResponse;
+    let mut attempts = 0u32;
+    loop {
+        let resp = client.get(&api_url).send().await.map_err(|e| e.to_string())?;
+        body = resp.json().await.map_err(|e| e.to_string())?;
+        attempts += 1;
+        let is_rate_limit = body.code == -1
+            && body
+                .msg
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("free api limit");
+        if !is_rate_limit || attempts >= 10 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    }
 
     if body.code != 0 {
-        return Err("TikWM API lỗi".to_string());
+        let msg = body.msg.unwrap_or_else(|| format!("code {}", body.code));
+        return Err(format!("TikWM: {}", msg));
     }
 
     let data = body.data.ok_or("Không có data")?;
@@ -188,6 +273,211 @@ async fn fetch_tikwm(url: &str) -> Result<VideoInfo, String> {
         download_url,
         filename: String::new(),
     })
+}
+
+/// API phụ: tiklydown.eu.org — không cần auth, rate limit riêng.
+async fn fetch_tiklydown(url: &str) -> Result<VideoInfo, String> {
+    let api_url = format!(
+        "https://api.tiklydown.eu.org/api/download?url={}",
+        urlencoding(url)
+    );
+    let client = http_client()?;
+    let resp = client
+        .get(&api_url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("tiklydown: {}", e))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("tiklydown parse: {}", e))?;
+
+    let download_url = body
+        .pointer("/video/noWatermark")
+        .or_else(|| body.pointer("/video/noWatermark2"))
+        .or_else(|| body.pointer("/video/play"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if download_url.is_empty() {
+        return Err("tiklydown: không tìm thấy link tải".to_string());
+    }
+
+    Ok(VideoInfo {
+        title: body
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        author: body
+            .pointer("/author/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        cover: body
+            .pointer("/video/cover")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        duration: body
+            .get("duration")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        platform: "TikTok".to_string(),
+        download_url,
+        filename: String::new(),
+    })
+}
+
+/// Lấy title + cover từ TikTok oEmbed — dùng sau khi zcdn trả videoId.
+async fn fetch_tiktok_oembed(video_id: &str) -> (String, String) {
+    let oembed_url = format!(
+        "https://www.tiktok.com/oembed?url={}",
+        urlencoding(&format!("https://www.tiktok.com/video/{}", video_id))
+    );
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return (String::new(), String::new()),
+    };
+    match client.get(&oembed_url).send().await {
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .map(|d| {
+                let title = d
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let cover = d
+                    .get("thumbnail_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (title, cover)
+            })
+            .unwrap_or_default(),
+        Err(_) => (String::new(), String::new()),
+    }
+}
+
+/// Fallback snaptik: gọi d.zcdn.top/api/tiktok không cần CF token.
+/// snaptik.vn dùng endpoint này làm secondary — truyền cf_token: null khi không có captcha.
+async fn fetch_zcdn(url: &str) -> Result<VideoInfo, String> {
+    let client = http_client()?;
+    let resp = client
+        .post("https://d.zcdn.top/api/tiktok")
+        .header("Content-Type", "application/json")
+        .header("Referer", "https://snaptik.vn/")
+        .header("Origin", "https://snaptik.vn")
+        .json(&serde_json::json!({"url": url, "cf_token": null}))
+        .send()
+        .await
+        .map_err(|e| format!("zcdn: {}", e))?;
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("zcdn parse: {}", e))?;
+
+    // {"errors": {"field": "message"}}
+    if let Some(errs) = data.get("errors").and_then(|v| v.as_object()) {
+        let msg = errs
+            .values()
+            .next()
+            .and_then(|v| v.as_str())
+            .unwrap_or("zcdn error");
+        return Err(format!("zcdn: {}", msg));
+    }
+
+    let video_id = data
+        .get("videoId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let links = data
+        .get("links")
+        .and_then(|v| v.as_array())
+        .ok_or("zcdn: no links")?;
+
+    if video_id.is_empty() {
+        return Err("zcdn: no videoId".to_string());
+    }
+
+    // {"label": "No Watermark", "url": "..."}
+    let find_link = |keyword: &str| -> String {
+        links
+            .iter()
+            .find(|l| {
+                l.get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase().contains(keyword))
+                    .unwrap_or(false)
+            })
+            .and_then(|l| l.get("url").and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let download_url = {
+        let u = find_link("no watermark");
+        if u.is_empty() { find_link("with watermark") } else { u }
+    };
+
+    if download_url.is_empty() {
+        return Err("zcdn: không có link tải".to_string());
+    }
+
+    let (title, cover) = fetch_tiktok_oembed(video_id).await;
+
+    Ok(VideoInfo {
+        title,
+        author: String::new(),
+        cover,
+        duration: 0,
+        platform: "TikTok".to_string(),
+        download_url,
+        filename: String::new(),
+    })
+}
+
+/// Tải TikTok với xen kẽ TikWM / tiklydown để tránh rate limit.
+async fn fetch_tiktok(url: &str) -> Result<VideoInfo, String> {
+    use std::sync::atomic::Ordering;
+    let use_tikwm_first = TIKTOK_API_IDX.fetch_add(1, Ordering::Relaxed).is_multiple_of(2);
+
+    // Thử API thứ nhất
+    let first = if use_tikwm_first {
+        tikwm_wait().await;
+        fetch_tikwm(url).await
+    } else {
+        fetch_tiklydown(url).await
+    };
+
+    if let Ok(ref info) = first {
+        if !info.download_url.is_empty() {
+            return first;
+        }
+    }
+
+    // Fallback sang API thứ hai
+    let second = if use_tikwm_first {
+        fetch_tiklydown(url).await
+    } else {
+        tikwm_wait().await;
+        fetch_tikwm(url).await
+    };
+
+    if let Ok(ref info) = second {
+        if !info.download_url.is_empty() {
+            return second;
+        }
+    }
+
+    // Tầng cuối: d.zcdn.top — backend của snaptik.vn, thử không cần CF token
+    fetch_zcdn(url).await
 }
 
 fn xhs_manual_hint() -> &'static str {
@@ -470,7 +760,7 @@ async fn fetch_douyin_savetik(url: &str) -> Result<VideoInfo, String> {
         cover,
         duration: 0,
         platform: "Douyin".to_string(),
-        download_url: download_urls.last().unwrap().clone(),
+        download_url: download_urls.first().unwrap().clone(),
         filename: String::new(),
     })
 }
@@ -585,9 +875,14 @@ fn find_in_json(val: &serde_json::Value, video_url: &mut String, title: &mut Str
                     }
                 }
             }
-            for v in map.values() {
-                if !video_url.is_empty() { break; }
-                find_in_json(v, video_url, title, author, cover, depth + 1);
+            let all_found = !video_url.is_empty() && !title.is_empty() && !author.is_empty() && !cover.is_empty();
+            if !all_found {
+                for v in map.values() {
+                    find_in_json(v, video_url, title, author, cover, depth + 1);
+                    if !video_url.is_empty() && !title.is_empty() && !author.is_empty() && !cover.is_empty() {
+                        break;
+                    }
+                }
             }
         }
         serde_json::Value::Array(arr) => {
@@ -601,19 +896,21 @@ fn find_in_json(val: &serde_json::Value, video_url: &mut String, title: &mut Str
 }
 
 fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
+    let src = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'%' && i + 2 < src.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
             }
-        } else {
-            result.push(c);
         }
+        out.push(src[i]);
+        i += 1;
     }
-    result
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn extract_url(input: &str) -> String {
@@ -626,42 +923,120 @@ fn extract_url(input: &str) -> String {
     input.trim().to_string()
 }
 
+/// Resolve short URL bằng cách follow redirect — dùng cho vt.tiktok.com / vm.tiktok.com.
+async fn resolve_short_url(url: &str) -> String {
+    let client = match reqwest::Client::builder()
+        .user_agent(MOBILE_UA)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return url.to_string(),
+    };
+    match client.get(url).send().await {
+        Ok(resp) => resp.url().to_string(),
+        Err(_) => url.to_string(),
+    }
+}
+
+/// Thử lại async fn tối đa `max` lần với delay `delay_ms` ms giữa các lần.
+/// Dừng sớm nếu gặp lỗi permanent (video riêng tư, JWT auth, v.v.).
+async fn retry<F, Fut, T>(max: u32, delay_ms: u64, f: F) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last_err = String::new();
+    for i in 0..max {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if is_permanent_error(&e) {
+                    return Err(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Lỗi permanent — không nên retry: video riêng tư, auth, link hết hạn, v.v.
+fn is_permanent_error(e: &str) -> bool {
+    let e = e.to_lowercase();
+    e.contains("jwt")
+        || e.contains("auth")
+        || e.contains("riêng tư")
+        || e.contains("private")
+        || e.contains("không tồn tại")
+        || e.contains("bị gỡ")
+        || e.contains("hết hạn")
+        || e.contains("unavailable")
+        || e.contains("độ tuổi")
+        || e.contains("age restrict")
+        || e.contains("unsupported")
+}
+
 /// Lấy info video — support TikTok, Douyin, Xiaohongshu, YouTube, FB, IG, X, Reddit, v.v.
 #[tauri::command]
 pub async fn get_video_info(url: String) -> Result<VideoInfo, String> {
     let url = extract_url(&url);
+
+    // vt.tiktok.com / vm.tiktok.com là short link — resolve về full URL trước
+    // để TikWM xử lý được (cần dạng /video/{id})
+    let url = if url.contains("vt.tiktok.com") || url.contains("vm.tiktok.com") {
+        resolve_short_url(&url).await
+    } else {
+        url
+    };
+
     let platform = detect_platform(&url);
 
     match platform {
-        "Douyin" => fetch_douyin(&url).await,
-        "TikTok" => match fetch_tikwm(&url).await {
-            Ok(info) if !info.download_url.is_empty() => Ok(info),
-            _ => fetch_cobalt(&url).await,
-        },
-        "Xiaohongshu" => match fetch_xiaohongshu(&url).await {
-            Ok(info) if !info.download_url.is_empty() => Ok(info),
-            Ok(_) => Err(format!("Không lấy được URL video.\n\n{}", xhs_manual_hint())),
-            Err(e) => Err(format!("{}\n\n{}", e, xhs_manual_hint())),
-        },
-        _ => fetch_cobalt(&url).await,
+        // TikTok: fetch_tiktok đã có retry nội bộ (TikWM ×10 + tiklydown + zcdn)
+        "TikTok" => fetch_tiktok(&url).await,
+
+        // Douyin: 3 lần retry, delay 2s
+        "Douyin" => retry(3, 2_000, || fetch_douyin(&url)).await,
+
+        // Xiaohongshu: 2 lần retry, delay 3s (token xhslink hết hạn nhanh nên ít retry)
+        "Xiaohongshu" => {
+            let result = retry(2, 3_000, || fetch_xiaohongshu(&url)).await;
+            match result {
+                Ok(info) if !info.download_url.is_empty() => Ok(info),
+                Ok(_) => Err(format!("Không lấy được URL video.\n\n{}", xhs_manual_hint())),
+                Err(e) => Err(format!("{}\n\n{}", e, xhs_manual_hint())),
+            }
+        }
+
+        // YouTube / Facebook / Instagram / Twitter / Reddit / Vimeo / Khác: Cobalt, 3 lần retry, delay 2s
+        _ => retry(3, 2_000, || fetch_cobalt(&url)).await,
     }
 }
 
-/// Payload event `download-progress` (Tauri) để UI hiển thị thanh % real-time.
+/// Payload event `download-progress`. `download_id` dùng để frontend route đúng item khi tải hàng loạt.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProgress {
+    pub download_id: String,
     pub downloaded: u64,
-    /// Có thể là 0 nếu server không trả `Content-Length` → UI fallback indeterminate.
+    /// 0 nếu server không trả `Content-Length` → UI fallback indeterminate.
     pub total: u64,
 }
 
 /// Tải video về máy — stream bytes + emit `download-progress` event mỗi chunk.
+/// `download_id` là ID do frontend tạo (dùng cho batch), forward vào payload để UI route đúng item.
+/// Retry tối đa 3 lần khi gặp lỗi mạng/stream tạm thời.
 #[tauri::command]
 pub async fn download_video(
     app: tauri::AppHandle,
     download_url: String,
     save_path: String,
+    download_id: String,
 ) -> Result<String, String> {
     use futures_util::StreamExt;
     use tauri::Emitter;
@@ -669,7 +1044,7 @@ pub async fn download_video(
 
     let client = http_client()?;
 
-    let referer = if download_url.contains("xhscdn.com") {
+    let referer: &str = if download_url.contains("xhscdn.com") {
         "https://www.xiaohongshu.com/"
     } else if download_url.contains("douyinvod.com") || download_url.contains("douyin") {
         "https://www.douyin.com/"
@@ -679,67 +1054,105 @@ pub async fn download_video(
         ""
     };
 
-    let mut req = client.get(&download_url);
-    if !referer.is_empty() {
-        req = req.header("Referer", referer);
-    }
+    const MAX_RETRIES: u32 = 3;
+    let mut last_err = String::new();
 
-    let resp = req.send().await.map_err(|e| {
-        format!(
-            "Lỗi tải video ({}): {}",
-            &download_url[..60.min(download_url.len())],
-            e
-        )
-    })?;
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+            // Reset progress về 0 để frontend biết đang retry
+            let _ = app.emit("download-progress", DownloadProgress {
+                download_id: download_id.clone(),
+                downloaded: 0,
+                total: 0,
+            });
+        }
 
-    if !resp.status().is_success() {
-        return Err(format!("Server trả lỗi: {}", resp.status()));
-    }
+        let mut req = client.get(&download_url);
+        if !referer.is_empty() {
+            req = req.header("Referer", referer);
+        }
 
-    let total = resp.content_length().unwrap_or(0);
-    let mut file = tokio::fs::File::create(&save_path)
-        .await
-        .map_err(|e| format!("Lỗi tạo file: {}", e))?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("Lỗi kết nối (lần {}): {}", attempt + 1, e);
+                continue;
+            }
+        };
 
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    // Throttle emit: chỉ emit khi download thêm >=64KB hoặc xong, tránh spam event.
-    let mut last_emit: u64 = 0;
-    const EMIT_STEP: u64 = 64 * 1024;
+        // 4xx = lỗi permanent (link hết hạn, 403...), không retry
+        if resp.status().is_client_error() {
+            return Err(format!("Server từ chối: {}", resp.status()));
+        }
+        if !resp.status().is_success() {
+            last_err = format!("Server lỗi {} (lần {})", resp.status(), attempt + 1);
+            continue;
+        }
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Lỗi đọc stream: {}", e))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("Lỗi ghi file: {}", e))?;
-        downloaded += chunk.len() as u64;
+        let total = resp.content_length().unwrap_or(0);
+        let mut file = match tokio::fs::File::create(&save_path).await {
+            Ok(f) => f,
+            Err(e) => return Err(format!("Lỗi tạo file: {}", e)),
+        };
 
-        if downloaded - last_emit >= EMIT_STEP {
-            let _ = app.emit("download-progress", DownloadProgress { downloaded, total });
-            last_emit = downloaded;
+        let mut stream = resp.bytes_stream();
+        let mut downloaded: u64 = 0;
+        let mut last_emit: u64 = 0;
+        const EMIT_STEP: u64 = 64 * 1024;
+
+        let stream_result: Result<(), String> = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| format!("Lỗi đọc stream: {}", e))?;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| format!("Lỗi ghi file: {}", e))?;
+                downloaded += chunk.len() as u64;
+
+                if downloaded - last_emit >= EMIT_STEP {
+                    let _ = app.emit("download-progress", DownloadProgress {
+                        download_id: download_id.clone(),
+                        downloaded,
+                        total,
+                    });
+                    last_emit = downloaded;
+                }
+            }
+            file.flush().await.map_err(|e| format!("Lỗi flush file: {}", e))?;
+            Ok(())
+        }
+        .await;
+
+        match stream_result {
+            Ok(()) => {
+                let _ = app.emit("download-progress", DownloadProgress {
+                    download_id,
+                    downloaded,
+                    total: if total > 0 { total } else { downloaded },
+                });
+                return Ok(save_path);
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&save_path).await;
+                last_err = format!("{} (lần {})", e, attempt + 1);
+            }
         }
     }
 
-    file.flush()
-        .await
-        .map_err(|e| format!("Lỗi flush file: {}", e))?;
-
-    // Emit final 100%
-    let _ = app.emit(
-        "download-progress",
-        DownloadProgress { downloaded, total: if total > 0 { total } else { downloaded } },
-    );
-
-    Ok(save_path)
+    Err(last_err)
 }
 
 fn urlencoding(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u32),
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
 }
 
 // ============================================================

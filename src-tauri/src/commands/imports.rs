@@ -116,7 +116,7 @@ pub struct ImportResult {
     pub skipped: i64,
     /// Shopee commission only: số row có `net_commission ≠ order_commission_total
     /// - mcn_fee` (tolerance 0.5đ). 0 cho các kind khác. FE hiện warning banner
-    /// nếu > 0 để user biết export có thể lỗi, không silent trong stderr.
+    ///   nếu > 0 để user biết export có thể lỗi, không silent trong stderr.
     #[serde(default)]
     pub mcn_mismatch_count: i64,
 }
@@ -447,7 +447,7 @@ pub struct ImportShopeeOrdersPayload {
     /// ID của `shopee_accounts`. Optional cho preview command share struct.
     /// Import bắt buộc có. Nếu row đã tồn tại (UPSERT theo checkout_id + item_id
     /// + model_id), account_id **cập nhật** theo file mới — ưu tiên intention mới.
-    /// FE gửi string (content_id hash > 2^53).
+    ///   FE gửi string (content_id hash > 2^53).
     #[serde(default, deserialize_with = "deser_opt_i64_flexible")]
     pub shopee_account_id: Option<i64>,
 }

@@ -70,9 +70,10 @@ pub struct DaysFilter {
 ///   **Account id=1 ("Mặc định")** là bucket catch-all: FB không match account
 ///   nào trên cùng ngày cũng rơi vào Mặc định. Logic: Mặc định filter matches
 ///   owners.is_empty() OR owners.contains(1).
+///
 /// Custom deserializer — chấp nhận cả JSON number và JSON string cho id,
-/// parse về i64. FE gửi string (vì content_id > 2^53 JS precision loss),
-/// nhưng cũng tolerant với number cho backward compat + tests.
+///   parse về i64. FE gửi string (vì content_id > 2^53 JS precision loss),
+///   nhưng cũng tolerant với number cho backward compat + tests.
 fn deser_id_flexible<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -86,20 +87,15 @@ fn deser_id_flexible<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::E
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AccountFilterMode {
+    #[default]
     All,
     Account {
         #[serde(deserialize_with = "deser_id_flexible")]
         id: i64,
     },
-}
-
-impl Default for AccountFilterMode {
-    fn default() -> Self {
-        AccountFilterMode::All
-    }
 }
 
 /// Tên reserved cho account "Mặc định" — catch-all bucket cho sub_id chưa

@@ -15,6 +15,7 @@ import { RulesDialog } from "./components/RulesDialog";
 import { PendingChangesBar } from "./components/PendingChangesBar";
 import { ImportPreviewDialog } from "./components/ImportPreviewDialog";
 import { DownloadVideoPage } from "./components/DownloadVideoPage";
+import { UploadVideoPage } from "./components/UploadVideoPage";
 import { useDbStats, todayIso, type DaysFilter } from "./hooks/useDbStats";
 import {
   LOAD_MORE_STEP,
@@ -50,7 +51,7 @@ import "./App.css";
 function AppInner() {
   const { signOut: authSignOut } = useAuth();
   const [activeTab, setActiveTab] = useState<
-    "stats" | "overview" | "download"
+    "stats" | "overview" | "download" | "upload"
   >("stats");
 
   const statsFilter = useFilterMode("stats");
@@ -476,6 +477,12 @@ function AppInner() {
             icon="download"
             label="Download video"
           />
+          <TabButton
+            active={activeTab === "upload"}
+            onClick={() => setActiveTab("upload")}
+            icon="upload"
+            label="Upload Page"
+          />
         </nav>
       </header>
 
@@ -491,6 +498,8 @@ function AppInner() {
       <div className="p-6">
         {activeTab === "download" ? (
           <DownloadVideoPage />
+        ) : activeTab === "upload" ? (
+          <UploadVideoPage />
         ) : loading ? (
           <div className="mx-auto flex max-w-xl flex-col items-center gap-3 py-16 text-center text-white/60">
             <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">

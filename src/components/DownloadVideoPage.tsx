@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
 import {
@@ -9,12 +9,6 @@ import {
 } from "../lib/video";
 import { fmtBytes, fmtHistoryTime } from "../formulas";
 
-/**
- * Tải video từ nhiều nền tảng (TikTok, Douyin, Xiaohongshu, FB, IG, YouTube...).
- * Flow: user dán URL → getVideoInfo → hiển thị thumbnail + metadata →
- *       user bấm Tải → save dialog → downloadVideo ghi file.
- */
-
 interface VideoInfo {
   title: string;
   author: string;
@@ -23,6 +17,23 @@ interface VideoInfo {
   platform: string;
   downloadUrl: string;
   filename: string;
+}
+
+interface ProgressPayload {
+  downloadId: string;
+  downloaded: number;
+  total: number;
+}
+
+type ItemStatus = "fetching" | "ready" | "downloading" | "done" | "failed";
+
+interface BatchItem {
+  id: string;
+  url: string;
+  status: ItemStatus;
+  info: VideoInfo | null;
+  progress: ProgressPayload | null;
+  error: string;
 }
 
 interface PlatformChip {
@@ -46,6 +57,25 @@ const PLATFORMS: PlatformChip[] = [
   { name: "Reddit", icon: "forum", gradient: "from-orange-500 to-orange-700" },
 ];
 
+const MAX_CONCURRENT = 3;
+const MAX_CONCURRENT_FETCH = 2;
+const HISTORY_PAGE_SIZE = 50;
+
+function genId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function parseUrls(text: string): string[] {
+  return [
+    ...new Set(
+      text
+        .split(/[\n,\s]+/)
+        .map((s) => s.trim())
+        .filter((s) => s.startsWith("http://") || s.startsWith("https://")),
+    ),
+  ];
+}
+
 function fmtDuration(seconds: number): string {
   if (seconds <= 0) return "";
   const m = Math.floor(seconds / 60);
@@ -53,151 +83,201 @@ function fmtDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-interface Progress {
-  downloaded: number;
-  total: number;
-}
-
-const HISTORY_PAGE_SIZE = 50;
-
 export function DownloadVideoPage() {
-  const [url, setUrl] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [downloading, setDownloading] = useState(false);
-  const [progress, setProgress] = useState<Progress | null>(null);
-  const [info, setInfo] = useState<VideoInfo | null>(null);
-  const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
-
-  // Lịch sử tải local — user xem lại các URL đã search/download.
+  const [urlsText, setUrlsText] = useState("");
+  const [items, setItems] = useState<BatchItem[]>([]);
+  const [saveDir, setSaveDir] = useState("");
+  const [fetchingAll, setFetchingAll] = useState(false);
+  const [downloadingCount, setDownloadingCount] = useState(0);
   const [history, setHistory] = useState<VideoDownloadLog[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
   const refreshHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
-      const rows = await listVideoDownloads(HISTORY_PAGE_SIZE, 0);
-      setHistory(rows);
-    } catch (e) {
-      console.error("[video history] load failed:", e);
+      setHistory(await listVideoDownloads(HISTORY_PAGE_SIZE, 0));
+    } catch {
+      /* ignore */
     } finally {
       setHistoryLoading(false);
     }
   }, []);
 
-  // Listen Tauri event cho download progress.
   useEffect(() => {
-    const unlisten = listen<Progress>("download-progress", (event) => {
-      setProgress(event.payload);
+    void refreshHistory();
+  }, [refreshHistory]);
+
+  // 1 listener toàn cục, route theo downloadId trong payload
+  useEffect(() => {
+    const unlisten = listen<ProgressPayload>("download-progress", (e) => {
+      const p = e.payload;
+      setItems((prev) =>
+        prev.map((item) =>
+          item.id === p.downloadId ? { ...item, progress: p } : item,
+        ),
+      );
     });
     return () => {
       unlisten.then((fn) => fn());
     };
   }, []);
 
-  // Load lịch sử lần đầu mount.
-  useEffect(() => {
-    void refreshHistory();
-  }, [refreshHistory]);
+  const downloadOne = useCallback(async (item: BatchItem, dir: string) => {
+    if (!item.info) return;
+    const filename =
+      item.info.filename ||
+      `${item.info.platform.toLowerCase()}_${Date.now()}.mp4`;
+    const savePath = `${dir}/${filename}`;
 
-  const handleFetch = async () => {
-    if (!url.trim()) return;
-    setLoading(true);
-    setError("");
-    setInfo(null);
-    setSuccess("");
-    const sourceUrl = url.trim();
+    setItems((prev) =>
+      prev.map((i) =>
+        i.id === item.id
+          ? {
+              ...i,
+              status: "downloading",
+              progress: { downloadId: item.id, downloaded: 0, total: 0 },
+              error: "",
+            }
+          : i,
+      ),
+    );
+    setDownloadingCount((n) => n + 1);
+
     try {
-      const data = await invoke<VideoInfo>("get_video_info", {
-        url: sourceUrl,
-      });
-      setInfo(data);
-      // Log search success — AS upsert theo URL, mỗi URL chỉ 1 row với status cuối.
-      void logStatus(sourceUrl, "success");
-    } catch (e) {
-      setError(String(e));
-      void logStatus(sourceUrl, "failed");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleDownload = async () => {
-    if (!info) return;
-    const defaultName =
-      info.filename || `${info.platform.toLowerCase()}_${Date.now()}.mp4`;
-    const savePath = await save({
-      defaultPath: defaultName,
-      filters: [{ name: "Video", extensions: ["mp4", "webm", "mkv", "jpg"] }],
-    });
-    if (!savePath) return;
-
-    setDownloading(true);
-    setProgress({ downloaded: 0, total: 0 });
-    setError("");
-    setSuccess("");
-    const sourceUrl = url.trim();
-    try {
-      const path = await invoke<string>("download_video", {
-        downloadUrl: info.downloadUrl,
+      await invoke<string>("download_video", {
+        downloadUrl: item.info.downloadUrl,
         savePath,
+        downloadId: item.id,
       });
-      setSuccess(`Đã lưu: ${path}`);
-      void logStatus(sourceUrl, "success");
+      setItems((prev) =>
+        prev.map((i) =>
+          i.id === item.id ? { ...i, status: "done", progress: null } : i,
+        ),
+      );
+      void logVideoDownload(item.url, "success").catch(() => {});
     } catch (e) {
-      setError(String(e));
-      void logStatus(sourceUrl, "failed");
+      setItems((prev) =>
+        prev.map((i) =>
+          i.id === item.id
+            ? { ...i, status: "failed", error: String(e), progress: null }
+            : i,
+        ),
+      );
+      void logVideoDownload(item.url, "failed").catch(() => {});
     } finally {
-      setDownloading(false);
-      setProgress(null);
+      setDownloadingCount((n) => n - 1);
     }
+  }, []);
+
+  const fetchOne = useCallback(async (item: BatchItem) => {
+    setItems((prev) =>
+      prev.map((i) =>
+        i.id === item.id ? { ...i, status: "fetching", error: "" } : i,
+      ),
+    );
+    try {
+      const info = await invoke<VideoInfo>("get_video_info", { url: item.url });
+      setItems((prev) =>
+        prev.map((i) =>
+          i.id === item.id ? { ...i, status: "ready", info } : i,
+        ),
+      );
+      void logVideoDownload(item.url, "success").catch(() => {});
+    } catch (e) {
+      setItems((prev) =>
+        prev.map((i) =>
+          i.id === item.id ? { ...i, status: "failed", error: String(e) } : i,
+        ),
+      );
+      void logVideoDownload(item.url, "failed").catch(() => {});
+    }
+  }, []);
+
+  const handleFetchAll = async () => {
+    const urls = parseUrls(urlsText);
+    if (urls.length === 0 || downloadingCount > 0) return;
+
+    const newItems: BatchItem[] = urls.map((url) => ({
+      id: genId(),
+      url,
+      status: "fetching" as ItemStatus,
+      info: null,
+      progress: null,
+      error: "",
+    }));
+    setItems(newItems);
+    setFetchingAll(true);
+
+    // Pool pattern: tối đa MAX_CONCURRENT_FETCH đồng thời — tránh rate limit API
+    const pool = new Set<Promise<void>>();
+    for (const item of newItems) {
+      const p: Promise<void> = fetchOne(item).finally(() => pool.delete(p));
+      pool.add(p);
+      if (pool.size >= MAX_CONCURRENT_FETCH) await Promise.race(pool);
+    }
+    await Promise.all(pool);
+
+    setFetchingAll(false);
+    void refreshHistory();
   };
 
-  const logStatus = async (
-    sourceUrl: string,
-    status: "success" | "failed",
-  ) => {
-    try {
-      await logVideoDownload(sourceUrl, status);
-    } catch {
-      /* silent */
+  const handleDownloadAll = async () => {
+    if (!saveDir || downloadingCount > 0) return;
+    const readyItems = items.filter((i) => i.status === "ready");
+    if (readyItems.length === 0) return;
+
+    // Pool pattern: tối đa MAX_CONCURRENT luồng đồng thời
+    const pool = new Set<Promise<void>>();
+    for (const item of readyItems) {
+      const p: Promise<void> = downloadOne(item, saveDir).finally(() =>
+        pool.delete(p),
+      );
+      pool.add(p);
+      if (pool.size >= MAX_CONCURRENT) await Promise.race(pool);
     }
+    await Promise.all(pool);
     void refreshHistory();
+  };
+
+  const handlePickFolder = async () => {
+    const result = await open({
+      directory: true,
+      title: "Chọn thư mục lưu video",
+    });
+    if (typeof result === "string") setSaveDir(result);
   };
 
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText();
-      if (text.trim()) setUrl(text.trim());
+      if (text.trim())
+        setUrlsText((prev) => (prev ? `${prev}\n${text.trim()}` : text.trim()));
     } catch {
       /* clipboard blocked */
     }
   };
 
-  const handleClear = () => {
-    setUrl("");
-    setInfo(null);
-    setError("");
-    setSuccess("");
-  };
+  const urlCount = parseUrls(urlsText).length;
+  const readyCount = items.filter((i) => i.status === "ready").length;
+  const doneCount = items.filter((i) => i.status === "done").length;
+  const failedCount = items.filter((i) => i.status === "failed").length;
+  const fetchingCount = items.filter((i) => i.status === "fetching").length;
 
   return (
     <div className="mx-auto max-w-3xl space-y-5">
-      {/* ============ Hero card ============ */}
+      {/* ===== Hero ===== */}
       <section className="overflow-hidden rounded-2xl bg-gradient-to-br from-shopee-700 via-shopee-600 to-shopee-500 shadow-elev-4">
         <div className="flex items-center gap-4 px-6 py-5">
           <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white/15 text-white shadow-inner">
             <span className="material-symbols-rounded text-2xl">download</span>
           </span>
           <div className="min-w-0 flex-1">
-            <h1 className="text-xl font-bold text-white">Tải video</h1>
+            <h1 className="text-xl font-bold text-white">Tải video hàng loạt</h1>
             <p className="mt-0.5 text-xs text-white/75">
-              Hỗ trợ TikTok · Douyin · Xiaohongshu · YouTube · FB · IG · X · Reddit
+              Dán nhiều link cùng lúc · Tối đa {MAX_CONCURRENT} luồng song song · Hỗn hợp nền tảng
             </p>
           </div>
         </div>
-
-        {/* Platform chips - scroll ngang nếu tràn */}
         <div className="border-t border-white/10 bg-black/10 px-6 py-2.5">
           <div className="flex flex-wrap gap-1.5">
             {PLATFORMS.map((p) => (
@@ -205,9 +285,7 @@ export function DownloadVideoPage() {
                 key={p.name}
                 className={`inline-flex items-center gap-1 rounded-full bg-gradient-to-r ${p.gradient} px-2.5 py-1 text-[11px] font-medium text-white shadow-elev-1`}
               >
-                <span className="material-symbols-rounded text-sm">
-                  {p.icon}
-                </span>
+                <span className="material-symbols-rounded text-sm">{p.icon}</span>
                 {p.name}
               </span>
             ))}
@@ -215,217 +293,162 @@ export function DownloadVideoPage() {
         </div>
       </section>
 
-      {/* ============ Input card ============ */}
-      <section className="rounded-2xl bg-surface-2 p-4 shadow-elev-2">
-        <label className="mb-2 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wider text-white/60">
+      {/* ===== URL input ===== */}
+      <section className="space-y-3 rounded-2xl bg-surface-2 p-4 shadow-elev-2">
+        <label className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wider text-white/60">
           <span className="material-symbols-rounded text-base">link</span>
-          Link video
+          Links video (mỗi link 1 dòng, hỗ trợ nhiều nền tảng)
         </label>
-        <div className="flex flex-nowrap items-stretch gap-2">
-          {/* Input + icon dùng flex container thay vì absolute → icon luôn
-              nằm gọn trong khung bo tròn, cùng hàng với text input. */}
-          <div className="flex h-12 min-w-0 flex-1 items-center rounded-xl border border-surface-8 bg-surface-1 pr-2 transition-colors focus-within:border-shopee-500 focus-within:ring-2 focus-within:ring-shopee-500/30">
-            <input
-              type="text"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleFetch()}
-              placeholder="Dán link vào đây..."
-              className="h-full min-w-0 flex-1 bg-transparent pl-4 pr-2 text-sm text-white/90 placeholder:text-white/30 focus:outline-none"
-            />
-            {url ? (
-              <button
-                type="button"
-                onClick={handleClear}
-                className="btn-ripple flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-white/50 transition-colors hover:bg-white/10 hover:text-white"
-                title="Xóa"
-                aria-label="Xóa"
-              >
-                <span className="material-symbols-rounded text-base">
-                  close
-                </span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={handlePaste}
-                className="btn-ripple flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-white/50 transition-colors hover:bg-shopee-500/20 hover:text-shopee-300"
-                title="Dán từ clipboard"
-                aria-label="Dán"
-              >
-                <span className="material-symbols-rounded text-base">
-                  content_paste
-                </span>
-              </button>
-            )}
-          </div>
-          <button
-            onClick={handleFetch}
-            disabled={loading || !url.trim()}
-            className="btn-ripple flex h-12 shrink-0 items-center gap-2 whitespace-nowrap rounded-xl bg-shopee-500 px-5 text-sm font-semibold text-white shadow-elev-2 transition-all hover:bg-shopee-600 hover:shadow-elev-4 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
-          >
-            <span
-              className={`material-symbols-rounded text-base ${
-                loading ? "animate-spin" : ""
-              }`}
-            >
-              {loading ? "sync" : "search"}
+        <textarea
+          value={urlsText}
+          onChange={(e) => setUrlsText(e.target.value)}
+          rows={4}
+          placeholder={
+            "https://tiktok.com/...\nhttps://youtube.com/...\nhttps://douyin.com/..."
+          }
+          className="w-full resize-none rounded-xl border border-surface-8 bg-surface-1 px-4 py-3 font-mono text-sm text-white/90 placeholder:text-white/25 focus:border-shopee-500 focus:outline-none focus:ring-2 focus:ring-shopee-500/30"
+        />
+        {urlCount > 0 && (
+          <div className="flex items-center gap-1.5 text-xs text-white/50">
+            <span className="material-symbols-rounded text-sm text-shopee-400">
+              tag
             </span>
-            {loading ? "Đang tìm..." : "Tìm video"}
-          </button>
-        </div>
-
-        {/* Indeterminate progress bar khi fetch */}
-        {loading && (
-          <div className="mt-3 flex items-center gap-2">
-            <div className="relative h-1 flex-1 overflow-hidden rounded-full bg-shopee-500/20">
-              <div className="animate-progress-indeterminate absolute inset-y-0 w-1/3 rounded-full bg-shopee-500" />
-            </div>
-            <span className="text-[11px] text-white/50">
-              Đang lấy info từ platform...
+            <span>
+              Đã nhận{" "}
+              <span className="font-semibold text-shopee-300">{urlCount}</span>{" "}
+              link hợp lệ
             </span>
           </div>
         )}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handlePaste}
+            className="btn-ripple flex items-center gap-1.5 rounded-lg bg-surface-4 px-3 py-1.5 text-xs font-medium text-white/80 hover:bg-surface-6"
+          >
+            <span className="material-symbols-rounded text-sm">content_paste</span>
+            Dán
+          </button>
+          <button
+            onClick={() => {
+              setUrlsText("");
+              setItems([]);
+            }}
+            disabled={!urlsText && items.length === 0}
+            className="btn-ripple flex items-center gap-1.5 rounded-lg bg-surface-4 px-3 py-1.5 text-xs font-medium text-white/60 hover:bg-surface-6 disabled:opacity-40"
+          >
+            <span className="material-symbols-rounded text-sm">close</span>
+            Xóa
+          </button>
+          <div className="flex-1" />
+          <button
+            onClick={handleFetchAll}
+            disabled={urlCount === 0 || fetchingAll || downloadingCount > 0}
+            className="btn-ripple flex items-center gap-2 rounded-xl bg-shopee-500 px-5 py-2 text-sm font-semibold text-white shadow-elev-2 transition-all hover:bg-shopee-600 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <span
+              className={`material-symbols-rounded text-base ${fetchingAll ? "animate-spin" : ""}`}
+            >
+              {fetchingAll ? "sync" : "search"}
+            </span>
+            {fetchingAll
+              ? `Đang lấy info... (${items.length - fetchingCount}/${items.length})`
+              : `Lấy thông tin (${urlCount} link)`}
+          </button>
+        </div>
       </section>
 
-      {/* ============ Error / Success banners ============ */}
-      {error && (
-        <div className="flex items-start gap-3 rounded-xl border border-red-500/40 bg-red-950/40 px-4 py-3 shadow-elev-1">
-          <span className="material-symbols-rounded mt-0.5 shrink-0 text-red-400">
-            error
-          </span>
-          <div className="min-w-0 flex-1 text-sm text-red-100">
-            <p className="font-semibold text-red-300">Không tải được</p>
-            <p className="mt-0.5 whitespace-pre-line text-red-200/90">{error}</p>
-          </div>
-        </div>
-      )}
-
-      {success && (
-        <div className="flex items-start gap-3 rounded-xl border border-green-500/40 bg-green-950/40 px-4 py-3 shadow-elev-1">
-          <span className="material-symbols-rounded mt-0.5 shrink-0 text-green-400">
-            task_alt
-          </span>
-          <div className="min-w-0 flex-1 text-sm">
-            <p className="font-semibold text-green-300">Tải thành công</p>
-            <p
-              className="mt-0.5 break-all font-mono text-xs text-green-200/80"
-              title={success}
-            >
-              {success.replace("Đã lưu: ", "")}
-            </p>
-          </div>
-        </div>
-      )}
-
-
-      {/* ============ Video preview card ============ */}
-      {info && (
-        <section className="overflow-hidden rounded-2xl bg-surface-2 shadow-elev-4">
-          {/* Card header */}
-          <div className="flex items-center justify-between gap-3 border-b border-surface-8 bg-surface-4 px-5 py-3">
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-shopee-500/20 px-2.5 py-1 text-xs font-semibold text-shopee-300">
-              <span className="material-symbols-rounded text-sm">
-                verified
+      {/* ===== Items + folder + download ===== */}
+      {items.length > 0 && (
+        <section className="overflow-hidden rounded-2xl bg-surface-2 shadow-elev-2">
+          {/* Folder + action bar */}
+          <div className="flex flex-wrap items-center gap-3 border-b border-surface-8 px-5 py-3">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="material-symbols-rounded shrink-0 text-base text-white/40">
+                folder
               </span>
-              {info.platform}
-            </span>
-            {info.duration > 0 && (
-              <span className="inline-flex items-center gap-1 text-xs text-white/60">
-                <span className="material-symbols-rounded text-sm">
-                  schedule
-                </span>
-                <span className="tabular-nums">
-                  {fmtDuration(info.duration)}
-                </span>
+              <span
+                className={`truncate text-sm ${
+                  saveDir
+                    ? "font-mono text-white/80"
+                    : "italic text-white/35"
+                }`}
+              >
+                {saveDir || "Chưa chọn thư mục lưu"}
               </span>
-            )}
-          </div>
-
-          {/* Card body */}
-          <div className="flex flex-col gap-5 p-5 md:flex-row">
-            {info.cover ? (
-              <div className="shrink-0 self-start">
-                <img
-                  src={info.cover}
-                  alt="Cover"
-                  className="h-60 w-[150px] rounded-xl object-cover shadow-elev-8"
-                  referrerPolicy="no-referrer"
-                  onError={(e) => {
-                    (e.currentTarget as HTMLImageElement).style.display =
-                      "none";
-                  }}
-                />
-              </div>
-            ) : (
-              <div className="flex h-60 w-[150px] shrink-0 items-center justify-center rounded-xl bg-surface-6">
-                <span className="material-symbols-rounded text-4xl text-white/20">
-                  image
-                </span>
-              </div>
-            )}
-
-            <div className="flex min-w-0 flex-1 flex-col justify-between gap-4">
-              <div className="space-y-3">
-                {info.title ? (
-                  <h2 className="text-base font-semibold leading-snug text-white/95">
-                    {info.title}
-                  </h2>
-                ) : (
-                  <h2 className="italic text-sm text-white/40">
-                    (Không có tiêu đề)
-                  </h2>
-                )}
-
-                {info.author && (
-                  <div className="flex items-center gap-1.5 text-sm text-white/70">
-                    <span className="material-symbols-rounded text-base text-white/40">
-                      person
-                    </span>
-                    <span>{info.author}</span>
-                  </div>
-                )}
-
-                {info.filename && (
-                  <div
-                    className="flex items-start gap-1.5 text-xs text-white/45"
-                    title={info.filename}
-                  >
-                    <span className="material-symbols-rounded mt-0.5 text-sm text-white/30">
-                      description
-                    </span>
-                    <span className="truncate font-mono">{info.filename}</span>
-                  </div>
-                )}
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <button
-                  onClick={handleDownload}
-                  disabled={downloading}
-                  className="btn-ripple flex w-full items-center justify-center gap-2 rounded-xl bg-green-500 px-5 py-3 text-sm font-semibold text-white shadow-elev-2 transition-all hover:bg-green-600 hover:shadow-elev-4 disabled:cursor-not-allowed disabled:opacity-50 md:w-auto md:self-start md:px-8"
-                >
-                  <span
-                    className={`material-symbols-rounded text-base ${
-                      downloading ? "animate-spin" : ""
-                    }`}
-                  >
-                    {downloading ? "sync" : "download"}
-                  </span>
-                  {downloading ? "Đang tải..." : "Tải video HD"}
-                </button>
-
-                {downloading && progress && (
-                  <DownloadProgressBar progress={progress} />
-                )}
-              </div>
             </div>
+            <button
+              onClick={handlePickFolder}
+              className="btn-ripple flex shrink-0 items-center gap-1.5 rounded-lg bg-surface-4 px-3 py-1.5 text-xs font-medium text-white/80 hover:bg-surface-6"
+            >
+              <span className="material-symbols-rounded text-sm">folder_open</span>
+              Chọn thư mục
+            </button>
+            <button
+              onClick={handleDownloadAll}
+              disabled={readyCount === 0 || !saveDir || downloadingCount > 0}
+              className="btn-ripple flex shrink-0 items-center gap-2 rounded-xl bg-green-500 px-4 py-2 text-sm font-semibold text-white shadow-elev-2 transition-all hover:bg-green-600 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <span
+                className={`material-symbols-rounded text-base ${
+                  downloadingCount > 0 ? "animate-spin" : ""
+                }`}
+              >
+                {downloadingCount > 0 ? "sync" : "download"}
+              </span>
+              {downloadingCount > 0
+                ? `Đang tải (${downloadingCount} luồng)...`
+                : `Tải tất cả (${readyCount} video)`}
+            </button>
           </div>
+
+          {/* Stats bar */}
+          {(doneCount > 0 || failedCount > 0 || downloadingCount > 0) && (
+            <div className="flex items-center gap-4 border-b border-surface-8 bg-surface-1 px-5 py-2 text-xs text-white/55">
+              {doneCount > 0 && (
+                <span className="flex items-center gap-1">
+                  <span className="material-symbols-rounded text-sm text-green-400">
+                    check_circle
+                  </span>
+                  {doneCount} xong
+                </span>
+              )}
+              {downloadingCount > 0 && (
+                <span className="flex items-center gap-1">
+                  <span className="material-symbols-rounded animate-spin text-sm text-shopee-400">
+                    sync
+                  </span>
+                  {downloadingCount} đang tải
+                </span>
+              )}
+              {failedCount > 0 && (
+                <span className="flex items-center gap-1">
+                  <span className="material-symbols-rounded text-sm text-red-400">
+                    error
+                  </span>
+                  {failedCount} lỗi
+                </span>
+              )}
+              <span className="ml-auto text-white/30">{items.length} tổng</span>
+            </div>
+          )}
+
+          {/* Item rows */}
+          <ul className="divide-y divide-surface-8">
+            {items.map((item) => (
+              <BatchItemRow
+                key={item.id}
+                item={item}
+                canRetryDownload={!!saveDir && !!item.info}
+                onRetryDownload={() => void downloadOne(item, saveDir)}
+                onRetryFetch={() => void fetchOne(item)}
+              />
+            ))}
+          </ul>
         </section>
       )}
 
-      {/* ============ How to use (khi idle, chưa có lịch sử) ============ */}
-      {!info && !loading && !error && history.length === 0 && (
+      {/* ===== How to use (idle) ===== */}
+      {items.length === 0 && !fetchingAll && history.length === 0 && (
         <section className="rounded-2xl border border-dashed border-surface-8 bg-surface-1 p-6">
           <div className="mb-4 flex items-center gap-2">
             <span className="material-symbols-rounded text-lg text-shopee-400">
@@ -436,20 +459,22 @@ export function DownloadVideoPage() {
             </h3>
           </div>
           <div className="space-y-2.5">
-            <Step n={1}>Copy link video từ một trong các nền tảng bên trên</Step>
-            <Step n={2}>
-              Dán vào ô link, bấm{" "}
-              <span className="rounded bg-surface-6 px-1.5 py-0.5 font-mono text-[11px] text-shopee-300">
-                Tìm video
-              </span>{" "}
-              hoặc Enter
+            <Step n={1}>
+              Dán một hoặc nhiều link vào ô trên (mỗi link 1 dòng, hỗn hợp nền tảng OK)
             </Step>
-            <Step n={3}>Xem trước thumbnail + thông tin, bấm "Tải video HD" để lưu</Step>
+            <Step n={2}>
+              Bấm{" "}
+              <span className="rounded bg-surface-6 px-1.5 py-0.5 font-mono text-[11px] text-shopee-300">
+                Lấy thông tin
+              </span>{" "}
+              để lấy metadata song song
+            </Step>
+            <Step n={3}>Chọn thư mục lưu, bấm "Tải tất cả" — tối đa {MAX_CONCURRENT} luồng đồng thời</Step>
           </div>
         </section>
       )}
 
-      {/* ============ Lịch sử tải (local, per-user) ============ */}
+      {/* ===== Lịch sử ===== */}
       {history.length > 0 && (
         <section className="rounded-2xl bg-surface-2 shadow-elev-2">
           <div className="flex items-center justify-between gap-3 border-b border-surface-8 px-5 py-3">
@@ -458,7 +483,7 @@ export function DownloadVideoPage() {
                 history
               </span>
               <h3 className="text-sm font-semibold text-white/85">
-                Lịch sử đã tìm / tải ({history.length}
+                Lịch sử ({history.length}
                 {history.length >= HISTORY_PAGE_SIZE ? "+" : ""})
               </h3>
             </div>
@@ -466,7 +491,6 @@ export function DownloadVideoPage() {
               onClick={() => void refreshHistory()}
               disabled={historyLoading}
               className="btn-ripple flex h-8 items-center gap-1.5 rounded-lg bg-surface-4 px-3 text-xs font-medium text-white/80 hover:bg-surface-6 disabled:opacity-50"
-              title="Tải lại lịch sử"
             >
               <span
                 className={`material-symbols-rounded text-base ${
@@ -488,27 +512,23 @@ export function DownloadVideoPage() {
                   className={`material-symbols-rounded shrink-0 text-base ${
                     row.status === "success" ? "text-green-400" : "text-red-400"
                   }`}
-                  title={row.status === "success" ? "Thành công" : "Thất bại"}
                 >
                   {row.status === "success" ? "check_circle" : "error"}
                 </span>
                 <button
                   type="button"
                   onClick={() => {
-                    setUrl(row.url);
-                    setInfo(null);
-                    setError("");
-                    setSuccess("");
+                    setUrlsText((prev) =>
+                      prev ? `${prev}\n${row.url}` : row.url,
+                    );
+                    setItems([]);
                   }}
                   className="min-w-0 flex-1 truncate text-left font-mono text-xs text-shopee-300 hover:underline"
                   title={row.url}
                 >
                   {row.url}
                 </button>
-                <span
-                  className="shrink-0 whitespace-nowrap text-[11px] tabular-nums text-white/40"
-                  title={fmtHistoryTime(row.downloaded_at_ms)}
-                >
+                <span className="shrink-0 whitespace-nowrap text-[11px] tabular-nums text-white/40">
                   {fmtHistoryTime(row.downloaded_at_ms)}
                 </span>
               </li>
@@ -519,6 +539,8 @@ export function DownloadVideoPage() {
     </div>
   );
 }
+
+// ===== Sub-components =====
 
 function Step({ n, children }: { n: number; children: React.ReactNode }) {
   return (
@@ -531,37 +553,165 @@ function Step({ n, children }: { n: number; children: React.ReactNode }) {
   );
 }
 
-function DownloadProgressBar({ progress }: { progress: Progress }) {
-  const hasTotal = progress.total > 0;
+interface BatchItemRowProps {
+  item: BatchItem;
+  canRetryDownload: boolean;
+  onRetryDownload: () => void;
+  onRetryFetch: () => void;
+}
+
+function BatchItemRow({
+  item,
+  canRetryDownload,
+  onRetryDownload,
+  onRetryFetch,
+}: BatchItemRowProps) {
+  const { status, info, progress, error, url } = item;
+
+  const hasTotal = (progress?.total ?? 0) > 0;
   const percent = hasTotal
-    ? Math.min(100, (progress.downloaded / progress.total) * 100)
+    ? Math.min(100, ((progress?.downloaded ?? 0) / (progress?.total ?? 1)) * 100)
     : 0;
 
+  const statusIcon: Record<ItemStatus, React.ReactNode> = {
+    fetching: (
+      <span className="material-symbols-rounded animate-spin text-base text-white/40">
+        sync
+      </span>
+    ),
+    ready: (
+      <span className="material-symbols-rounded text-base text-shopee-400">
+        play_circle
+      </span>
+    ),
+    downloading: (
+      <span className="material-symbols-rounded animate-spin text-base text-green-400">
+        sync
+      </span>
+    ),
+    done: (
+      <span className="material-symbols-rounded text-base text-green-400">
+        check_circle
+      </span>
+    ),
+    failed: (
+      <span className="material-symbols-rounded text-base text-red-400">
+        error
+      </span>
+    ),
+  };
+
   return (
-    <div className="w-full md:w-auto md:min-w-[360px]">
-      <div className="relative h-2 overflow-hidden rounded-full bg-green-500/20">
-        {hasTotal ? (
-          <div
-            className="h-full rounded-full bg-green-500 transition-[width] duration-150 ease-out"
-            style={{ width: `${percent}%` }}
-          />
-        ) : (
-          <div className="animate-progress-indeterminate absolute inset-y-0 w-1/3 rounded-full bg-green-500" />
-        )}
-      </div>
-      <div className="mt-1 flex items-center justify-between gap-2 text-[11px] tabular-nums text-white/55">
-        <span>
-          {fmtBytes(progress.downloaded)}
-          {hasTotal && ` / ${fmtBytes(progress.total)}`}
-        </span>
-        {hasTotal ? (
-          <span className="font-semibold text-green-300">
-            {percent.toFixed(1)}%
+    <li className="flex items-start gap-3 px-4 py-3">
+      {/* Status icon */}
+      <div className="mt-1 shrink-0">{statusIcon[status]}</div>
+
+      {/* Thumbnail */}
+      {info?.cover ? (
+        <img
+          src={info.cover}
+          alt=""
+          className="h-14 w-10 shrink-0 rounded object-cover"
+          referrerPolicy="no-referrer"
+          onError={(e) => {
+            (e.currentTarget as HTMLImageElement).style.display = "none";
+          }}
+        />
+      ) : (
+        <div className="flex h-14 w-10 shrink-0 items-center justify-center rounded bg-surface-6">
+          <span className="material-symbols-rounded text-lg text-white/20">
+            {status === "fetching" ? "hourglass_empty" : "image"}
           </span>
-        ) : (
-          <span>Đang tải...</span>
+        </div>
+      )}
+
+      {/* Content */}
+      <div className="min-w-0 flex-1 space-y-1">
+        {/* Platform + title */}
+        <div className="flex items-center gap-2">
+          {info?.platform && (
+            <span className="shrink-0 rounded bg-shopee-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-shopee-300">
+              {info.platform}
+            </span>
+          )}
+          <span className="truncate text-sm text-white/85">
+            {info?.title ||
+              (status === "fetching" ? "Đang lấy thông tin..." : "")}
+          </span>
+        </div>
+
+        {/* Author + duration */}
+        {info && (info.author || info.duration > 0) && (
+          <div className="flex items-center gap-3 text-xs text-white/40">
+            {info.author && <span>{info.author}</span>}
+            {info.duration > 0 && <span>{fmtDuration(info.duration)}</span>}
+          </div>
         )}
+
+        {/* Progress bar (khi đang tải) */}
+        {status === "downloading" && progress && (
+          <div className="space-y-0.5">
+            <div className="relative h-1.5 overflow-hidden rounded-full bg-green-500/20">
+              {hasTotal ? (
+                <div
+                  className="h-full rounded-full bg-green-500 transition-[width] duration-150 ease-out"
+                  style={{ width: `${percent}%` }}
+                />
+              ) : (
+                <div className="animate-progress-indeterminate absolute inset-y-0 w-1/3 rounded-full bg-green-500" />
+              )}
+            </div>
+            <div className="flex justify-between text-[10px] tabular-nums text-white/40">
+              <span>
+                {fmtBytes(progress.downloaded)}
+                {hasTotal && ` / ${fmtBytes(progress.total)}`}
+              </span>
+              {hasTotal && (
+                <span className="font-semibold text-green-400">
+                  {percent.toFixed(1)}%
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Error */}
+        {status === "failed" && error && (
+          <p className="line-clamp-2 text-xs text-red-300/80">{error}</p>
+        )}
+
+        {/* URL */}
+        <p
+          className="truncate font-mono text-[10px] text-white/25"
+          title={url}
+        >
+          {url}
+        </p>
       </div>
-    </div>
+
+      {/* Retry buttons */}
+      {status === "failed" && (
+        <div className="flex shrink-0 flex-col gap-1">
+          {info && canRetryDownload && (
+            <button
+              onClick={onRetryDownload}
+              className="btn-ripple flex items-center gap-1 rounded-lg bg-green-500/15 px-2 py-1 text-[11px] font-medium text-green-300 hover:bg-green-500/25"
+            >
+              <span className="material-symbols-rounded text-sm">download</span>
+              Tải lại
+            </button>
+          )}
+          {!info && (
+            <button
+              onClick={onRetryFetch}
+              className="btn-ripple flex items-center gap-1 rounded-lg bg-shopee-500/15 px-2 py-1 text-[11px] font-medium text-shopee-300 hover:bg-shopee-500/25"
+            >
+              <span className="material-symbols-rounded text-sm">refresh</span>
+              Tìm lại
+            </button>
+          )}
+        </div>
+      )}
+    </li>
   );
 }

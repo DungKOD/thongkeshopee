@@ -222,7 +222,8 @@ tbody td.tabular-nums:hover,
   text-shadow: none;
 }
 /* Bỏ scrollbar ngang của table wrapper khi chụp — tránh thanh scroll hiện trong ảnh. */
-.capture-mode .overflow-x-auto {
+.capture-mode .overflow-x-auto,
+.capture-mode .overflow-x-scroll {
   overflow: visible !important;
 }
 .capture-mode ::-webkit-scrollbar {
@@ -236,4 +237,37 @@ tbody td.tabular-nums:hover,
 .capture-mode .overflow-y-auto {
   overflow: visible !important;
   max-height: none !important;
+}
+
+/* ========================================================
+ * Floating horizontal scrollbar — thanh scroll nổi cố định
+ * ở đáy màn hình khi native scrollbar của bảng bị ẩn.
+ * Dùng scrollbar to hơn, dễ kéo hơn để user dễ thao tác.
+ * ======================================================== */
+.floating-hscroll::-webkit-scrollbar {
+  height: 16px;
+}
+.floating-hscroll::-webkit-scrollbar-track {
+  background: #1a1a1a;
+  border-radius: 0;
+}
+.floating-hscroll::-webkit-scrollbar-thumb {
+  background: #666;
+  border-radius: 8px;
+  border: 3px solid #1a1a1a;
+}
+.floating-hscroll::-webkit-scrollbar-thumb:hover {
+  background: #999;
+}
+.floating-hscroll::-webkit-scrollbar-thumb:active {
+  background: #bbb;
+}
+
+/* ========================================================
+ * Table sticky columns — separator shadow dừng lại khi
+ * capture-mode (html-to-image) để không hiện trong ảnh.
+ * ======================================================== */
+.capture-mode td.sticky,
+.capture-mode th.sticky {
+  box-shadow: none !important;
 }

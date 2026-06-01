@@ -108,7 +108,11 @@ export function DayBlock({
   const sectionRef = useRef<HTMLElement>(null);
   const headerRef = useRef<HTMLElement>(null);
   const tfootRef = useRef<HTMLTableSectionElement>(null);
+  const tableScrollRef = useRef<HTMLDivElement>(null);
+  const floatingScrollRef = useRef<HTMLDivElement>(null);
   const [showFloating, setShowFloating] = useState(false);
+  const [showFloatingScrollbar, setShowFloatingScrollbar] = useState(false);
+  const [floatingRect, setFloatingRect] = useState({ left: 0, width: 0, scrollWidth: 0 });
   const { settings } = useSettings();
 
   // Cột "TK Shopee" chỉ render khi user đang xem tất cả account (filter All).
@@ -141,8 +145,7 @@ export function DayBlock({
   }, [day.rows]);
   const hasAnyMultiAccount = multiAccountTuples.size > 0;
 
-  // Floating nav: hiện khi section nằm trong viewport nhưng header VÀ tfoot
-  // đều đã cuộn ra ngoài (user đang ở giữa bảng dài).
+  // Floating nav + floating scrollbar: quan sát 3 mốc để biết user đang ở đâu.
   useEffect(() => {
     const headerEl = headerRef.current;
     const tfootEl = tfootRef.current;
@@ -154,13 +157,57 @@ export function DayBlock({
         if (e.isIntersecting) vis.add(e.target);
         else vis.delete(e.target);
       }
-      setShowFloating(vis.has(sectionEl) && !vis.has(headerEl) && !vis.has(tfootEl));
+      const inSection = vis.has(sectionEl);
+      const tfootVisible = vis.has(tfootEl);
+      setShowFloating(inSection && !vis.has(headerEl) && !tfootVisible);
+      // Floating scrollbar: hiện khi đang trong bảng nhưng tfoot (chứa native scrollbar) đã ra khỏi viewport
+      setShowFloatingScrollbar(inSection && !tfootVisible);
     }, { threshold: 0 });
     obs.observe(headerEl);
     obs.observe(tfootEl);
     obs.observe(sectionEl);
     return () => obs.disconnect();
   }, []);
+
+  // Đo vị trí & kích thước scroll container để căn floating scrollbar đúng vị trí
+  useEffect(() => {
+    if (!showFloatingScrollbar) return;
+    const measure = () => {
+      const el = tableScrollRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setFloatingRect({ left: r.left, width: r.width, scrollWidth: el.scrollWidth });
+    };
+    measure();
+    window.addEventListener("resize", measure, { passive: true });
+    return () => window.removeEventListener("resize", measure);
+  }, [showFloatingScrollbar]);
+
+  // Đồng bộ 2 chiều: bảng ↔ floating scrollbar
+  useEffect(() => {
+    if (!showFloatingScrollbar) return;
+    const table = tableScrollRef.current;
+    const float = floatingScrollRef.current;
+    if (!table || !float) return;
+    float.scrollLeft = table.scrollLeft;
+    let lock = false;
+    const fromTable = () => {
+      if (lock) return; lock = true;
+      float.scrollLeft = table.scrollLeft;
+      lock = false;
+    };
+    const fromFloat = () => {
+      if (lock) return; lock = true;
+      table.scrollLeft = float.scrollLeft;
+      lock = false;
+    };
+    table.addEventListener("scroll", fromTable, { passive: true });
+    float.addEventListener("scroll", fromFloat, { passive: true });
+    return () => {
+      table.removeEventListener("scroll", fromTable);
+      float.removeEventListener("scroll", fromFloat);
+    };
+  }, [showFloatingScrollbar]);
 
   // Copy TSV → clipboard. Hiện icon "done" 1.5s rồi revert.
   const [copied, setCopied] = useState(false);
@@ -433,8 +480,8 @@ export function DayBlock({
           </span>
         </div>
       )}
-      <div className="overflow-x-auto overflow-y-clip">
-        <table className="w-full border-collapse text-sm">
+      <div ref={tableScrollRef} className="overflow-x-scroll overflow-y-clip">
+        <table className="min-w-full border-collapse text-sm">
           <thead className="sticky top-0 z-20 shadow-[0_2px_8px_rgba(0,0,0,0.45)]">
             <tr className="border-b border-shopee-500/40 bg-[#1a0c10] text-shopee-100">
               {headers.map((h, i) => {
@@ -444,15 +491,17 @@ export function DayBlock({
                 const canToggle = !isIndex && !isAction && !!h.label;
                 const colHidden = canToggle && hiddenCols.has(h.label);
                 const alignCls = isIndex
-                  ? "w-12 px-2 text-center"
+                  ? "w-12 px-2 text-center sticky left-0 z-30 bg-[#1a0c10]"
                   : isProduct
-                  ? "min-w-[220px] px-4 text-left"
-                  : "px-3 text-center";
+                  ? "min-w-[220px] px-4 text-left sticky left-12 z-[29] bg-[#1a0c10] shadow-[2px_0_8px_rgba(0,0,0,0.5)]"
+                  : isAction
+                  ? "min-w-[112px] px-3 text-center"
+                  : "min-w-[96px] px-3 text-center";
                 return (
                   <th
                     key={i}
                     className={`py-3.5 text-xs font-bold uppercase tracking-wider whitespace-nowrap ${alignCls} ${
-                      isAction ? "col-actions" : ""
+                      isAction ? "col-actions sticky right-0 z-30 bg-[#1a0c10] shadow-[-2px_0_8px_rgba(0,0,0,0.5)]" : ""
                     }`}
                   >
                     <span className="inline-flex flex-col items-center gap-0.5">
@@ -634,7 +683,7 @@ export function DayBlock({
       />
 
       {showFloating && createPortal(
-        <div className="capture-hide fixed bottom-6 right-6 z-50 flex flex-col items-center gap-0.5 rounded-2xl border border-surface-8/60 bg-surface-2/90 px-1 py-2 shadow-elev-4 backdrop-blur-sm">
+        <div className="capture-hide fixed right-4 z-50 flex flex-col items-center gap-0.5 rounded-2xl border border-surface-8/60 bg-surface-2/90 px-1 py-2 shadow-elev-4 backdrop-blur-sm" style={{ top: "50%", transform: "translateY(-50%)" }}>
           <button
             onClick={() => sectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
             className="btn-ripple flex h-9 w-9 items-center justify-center rounded-full text-white/60 hover:bg-shopee-500/10 hover:text-shopee-400"
@@ -654,6 +703,22 @@ export function DayBlock({
           >
             <span className="material-symbols-rounded">vertical_align_bottom</span>
           </button>
+        </div>,
+        document.body,
+      )}
+
+      {showFloatingScrollbar && createPortal(
+        <div
+          ref={floatingScrollRef}
+          className="capture-hide floating-hscroll fixed z-50 overflow-x-scroll overflow-y-hidden"
+          style={{
+            bottom: 0,
+            left: floatingRect.left,
+            width: floatingRect.width,
+            height: 20,
+          }}
+        >
+          <div style={{ width: floatingRect.scrollWidth, height: 1 }} />
         </div>,
         document.body,
       )}
@@ -690,21 +755,22 @@ function TotalsRow({
     ? "border-b-2 border-shopee-500/50 bg-[#140810] text-sm font-bold text-white/90"
     : "border-t-2 border-shopee-500 bg-shopee-900/25 text-base font-bold text-white";
 
+  const stickyBg = compact ? "bg-[#140810]" : "bg-[#1a0e0e]";
   return (
     <tr className={rowCls}>
-      <td />
-      <td className={`px-4 ${py} text-left text-xs uppercase tracking-wider text-shopee-300/80`}>
+      <td className={`w-12 sticky left-0 z-10 ${stickyBg}`} />
+      <td className={`px-4 ${py} text-left text-xs uppercase tracking-wider text-shopee-300/80 sticky left-12 z-[9] ${stickyBg} shadow-[2px_0_8px_rgba(0,0,0,0.5)]`}>
         {compact ? "↑ Tổng" : "Tổng"}
       </td>
       {showAccount && <td />}
-      <td className={`px-3 ${py} text-center tabular-nums`}>
+      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
         {hiddenCols.has("Click ADS") ? MASK : fmtInt(totals.clicks)}
       </td>
-      <td className={`px-3 ${py} text-center tabular-nums`}>
+      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
         {hiddenCols.has("Click Shopee") ? MASK : fmtInt(totals.shopeeClicks)}
       </td>
       <td
-        className={`px-3 ${py} text-center tabular-nums text-gray-400`}
+        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-gray-400`}
         title={
           totals.clicks > 0
             ? `CPC TB = Tổng tiền chạy / Tổng click ADS\n= ${fmtVnd(totals.totalSpend)} / ${fmtInt(totals.clicks)}`
@@ -717,14 +783,14 @@ function TotalsRow({
           ? fmtVnd(totals.totalSpend / totals.clicks)
           : "—"}
       </td>
-      <td className={`px-3 ${py} text-center tabular-nums text-blue-400`}>
+      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-blue-400`}>
         {hiddenCols.has("Tổng tiền chạy") ? MASK : fmtVnd(totals.totalSpend)}
       </td>
-      <td className={`px-3 ${py} text-center tabular-nums`}>
+      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
         {hiddenCols.has("Số lượng đơn") ? MASK : fmtInt(totals.orders)}
       </td>
       <td
-        className={`px-3 ${py} text-center tabular-nums`}
+        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}
         title={
           totals.shopeeClicks === 0
             ? "Không có Click Shopee → không tính được CR"
@@ -738,7 +804,7 @@ function TotalsRow({
           : "—"}
       </td>
       <td
-        className={`px-3 ${py} text-center tabular-nums`}
+        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}
         title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
       >
         {hiddenCols.has("Giá trị đơn hàng")
@@ -747,14 +813,14 @@ function TotalsRow({
           ? fmtVnd(orderValueTotal / totals.orders)
           : "—"}
       </td>
-      <td className={`px-3 ${py} text-center tabular-nums text-shopee-400`}>
+      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-shopee-400`}>
         {hiddenCols.has("Hoa hồng") ? MASK : fmtVnd(totals.commission)}
       </td>
-      <td className={`px-3 ${py} text-center tabular-nums ${totalsProfitCls}`}>
+      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap ${totalsProfitCls}`}>
         {hiddenCols.has("Lợi nhuận") ? MASK : fmtVnd(totals.profit)}
       </td>
       <td
-        className={`px-3 ${py} text-center tabular-nums ${
+        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap ${
           totals.totalSpend > 0 ? totalsProfitCls : "text-white/30"
         }`}
         title={
@@ -769,7 +835,7 @@ function TotalsRow({
           ? fmtPct((totals.profit / totals.totalSpend) * 100)
           : "—"}
       </td>
-      <td className="col-actions" />
+      <td className={`col-actions sticky right-0 z-10 ${stickyBg} shadow-[-2px_0_8px_rgba(0,0,0,0.5)]`} />
     </tr>
   );
 }
