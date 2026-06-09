@@ -6,6 +6,7 @@ import {
   browserLocalPersistence,
   setPersistence,
 } from "firebase/auth";
+import { getFirestore, type Firestore } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -18,6 +19,7 @@ const firebaseConfig = {
 
 export const firebaseApp: FirebaseApp = initializeApp(firebaseConfig);
 export const auth: Auth = getAuth(firebaseApp);
+export const db: Firestore = getFirestore(firebaseApp);
 export const googleProvider = new GoogleAuthProvider();
 
 void setPersistence(auth, browserLocalPersistence);

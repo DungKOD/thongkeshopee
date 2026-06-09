@@ -43,6 +43,9 @@ import {
 } from "./lib/screenshot";
 import { UpdatesDropdown } from "./components/UpdatesDropdown";
 import { LoginScreen } from "./components/LoginScreen";
+import { SessionKickedDialog } from "./components/SessionKickedDialog";
+import { PremiumLockedScreen } from "./components/PremiumLockedScreen";
+import { isPremiumActive } from "./lib/userProfile";
 import { UserMenu } from "./components/UserMenu";
 import { DevCredit } from "./components/DevCredit";
 import { SmartCalculator } from "./components/SmartCalculator";
@@ -974,7 +977,15 @@ function TabButton({ active, onClick, icon, label }: TabButtonProps) {
 }
 
 function AuthGate() {
-  const { user, loading: authLoading, authError } = useAuth();
+  const {
+    user,
+    loading: authLoading,
+    authError,
+    kickInfo,
+    acknowledgeKick,
+    userProfile,
+    profileLoading,
+  } = useAuth();
 
   if (authLoading) return <SplashScreen title="Đang tải..." />;
 
@@ -989,14 +1000,48 @@ function AuthGate() {
     );
   }
 
-  if (!user) return <LoginScreen />;
+  // Dialog overlay portal — render NGAY khi kickInfo set, kể cả khi user
+  // chưa kịp signOut. Tránh "flash" window vài chục ms user có thể tương tác
+  // với app sau khi đã bị kick mà chưa kịp hiển thị dialog.
+  const kickDialog = kickInfo ? (
+    <SessionKickedDialog info={kickInfo} onAcknowledge={acknowledgeKick} />
+  ) : null;
+
+  if (!user) {
+    return (
+      <>
+        <LoginScreen />
+        {kickDialog}
+      </>
+    );
+  }
+
+  // User đã login — check premium trước khi cho vào app:
+  // 1. profileLoading: đang fetch /users/{uid} lần đầu → splash.
+  // 2. !isPremiumActive: chưa có quyền premium hoặc đã hết hạn → khóa.
+  // 3. Active → vào app bình thường.
+  if (profileLoading) {
+    return <SplashScreen title="Đang kiểm tra quyền truy cập..." />;
+  }
+
+  if (!isPremiumActive(userProfile)) {
+    return (
+      <>
+        <PremiumLockedScreen />
+        {kickDialog}
+      </>
+    );
+  }
 
   return (
-    <SettingsProvider key={user.uid}>
-      <AccountProvider>
-        <AppInner />
-      </AccountProvider>
-    </SettingsProvider>
+    <>
+      <SettingsProvider key={user.uid}>
+        <AccountProvider>
+          <AppInner />
+        </AccountProvider>
+      </SettingsProvider>
+      {kickDialog}
+    </>
   );
 }
 

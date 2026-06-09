@@ -79,6 +79,7 @@ pub fn run() {
             commands::db_transfer::export_db,
             commands::db_transfer::import_db,
             commands::screenshot::save_png,
+            commands::device::get_device_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -10,6 +10,13 @@ import type {
 import { ImportHistorySection } from "./ImportHistorySection";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { invoke } from "../lib/tauri";
+import { useAuth } from "../contexts/AuthContext";
+import {
+  getDeviceInfo,
+  readSession,
+  type DeviceInfo,
+  type SessionDoc,
+} from "../lib/deviceSession";
 
 interface AppDataPaths {
   appDataDir: string;
@@ -140,6 +147,32 @@ export function SettingsDialog({
 
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
+
+  const { user } = useAuth();
+  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
+  const [sessionDoc, setSessionDoc] = useState<SessionDoc | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  useEffect(() => {
+    if (!isOpen || !user) return;
+    let cancelled = false;
+    setSessionLoading(true);
+    (async () => {
+      try {
+        const [info, doc] = await Promise.all([
+          getDeviceInfo(),
+          readSession(user.uid),
+        ]);
+        if (cancelled) return;
+        setDeviceInfo(info);
+        setSessionDoc(doc);
+      } finally {
+        if (!cancelled) setSessionLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, user]);
 
   const handleClearData = async () => {
     setClearConfirmOpen(false);
@@ -417,6 +450,12 @@ export function SettingsDialog({
           <ImportHistorySection
             reloadKey={importHistoryReloadKey}
             onReverted={onImportReverted}
+          />
+
+          <DeviceSessionSection
+            loading={sessionLoading}
+            deviceInfo={deviceInfo}
+            sessionDoc={sessionDoc}
           />
 
           {/* Đường dẫn data app — hữu ích cho support/debug/backup thủ công. */}
@@ -707,6 +746,105 @@ function FeeInput({ label, value, onChange, disabled = false }: FeeInputProps) {
         <span className="text-sm text-white/60">%</span>
       </div>
     </label>
+  );
+}
+
+interface DeviceSessionSectionProps {
+  loading: boolean;
+  deviceInfo: DeviceInfo | null;
+  sessionDoc: SessionDoc | null;
+}
+
+/// Section hiển thị thiết bị đang giữ session — read-only. Chính sách 1 tài
+/// khoản 1 máy: doc Firestore `/sessions/{uid}` luôn trỏ về máy active. Nếu
+/// `sessionDoc.deviceId` !== `deviceInfo.deviceId` → máy này đáng lẽ đã bị
+/// kick (watcher xử lý), section chỉ hiển thị warning đề phòng listener miss.
+function DeviceSessionSection({
+  loading,
+  deviceInfo,
+  sessionDoc,
+}: DeviceSessionSectionProps) {
+  const mismatched =
+    !!deviceInfo &&
+    !!sessionDoc &&
+    !!sessionDoc.deviceId &&
+    sessionDoc.deviceId !== deviceInfo.deviceId;
+
+  const loginAt =
+    sessionDoc?.loginAt && typeof sessionDoc.loginAt.seconds === "number"
+      ? new Date(sessionDoc.loginAt.seconds * 1000)
+      : null;
+
+  return (
+    <section>
+      <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+        <span className="material-symbols-rounded text-base text-shopee-400">
+          devices
+        </span>
+        Thiết bị đang đăng nhập
+      </h3>
+      <p className="mb-3 text-xs text-white/50">
+        Mỗi tài khoản chỉ được đăng nhập trên 1 thiết bị. Khi bạn đăng nhập trên
+        máy khác, máy này sẽ tự bị đăng xuất.
+      </p>
+
+      {loading ? (
+        <div className="rounded-xl border border-surface-8 bg-surface-6 px-4 py-3 text-xs text-white/40">
+          Đang tải thông tin thiết bị…
+        </div>
+      ) : !deviceInfo ? (
+        <div className="rounded-xl border border-red-500/30 bg-red-950/20 px-4 py-3 text-xs text-red-200">
+          Không lấy được thông tin máy.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <div className="rounded-xl border border-surface-8 bg-surface-6 px-4 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-white/90">
+                  <span className="material-symbols-rounded text-base text-shopee-400">
+                    computer
+                  </span>
+                  <span className="truncate" title={deviceInfo.deviceName}>
+                    {deviceInfo.deviceName}
+                  </span>
+                </div>
+                <div className="mt-1 text-[11px] uppercase tracking-wide text-white/45">
+                  {deviceInfo.platform}
+                  {deviceInfo.isFallback ? " · fallback ID" : ""}
+                </div>
+              </div>
+              <span className="shrink-0 rounded-full bg-green-500/20 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider text-green-300">
+                Máy này
+              </span>
+            </div>
+            {loginAt && (
+              <div className="mt-2 text-xs text-white/55">
+                Đăng nhập lúc:{" "}
+                <span className="font-mono text-white/75">
+                  {loginAt.toLocaleString("vi-VN")}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {mismatched && (
+            <div className="flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-950/20 px-4 py-3 text-xs text-amber-200">
+              <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
+                warning
+              </span>
+              <span>
+                Tài khoản đang giữ phiên trên thiết bị khác{" "}
+                <b className="text-amber-300">
+                  {sessionDoc?.deviceName || "không rõ"}
+                </b>
+                . Bạn sẽ bị đăng xuất ngay khi có kết nối ổn định.
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

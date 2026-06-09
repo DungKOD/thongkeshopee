@@ -228,11 +228,36 @@ export function OverviewTab({
   const [clickInsightsLoading, setClickInsightsLoading] = useState(false);
   useEffect(() => {
     let cancelled = false;
+
+    // Guard: days rỗng (chưa import / filter trả empty) → clear hết, tránh
+    // gọi BE với date range null (BE sẽ aggregate all-time).
+    if (days.length === 0) {
+      setHourlyOrders([]);
+      setHourlyClicks([]);
+      setReferrerEff([]);
+      setClickDelays([]);
+      setCancellationByDay([]);
+      setClickInsightsLoading(false);
+      return;
+    }
+
     setClickInsightsLoading(true);
+
+    // Khi user pick mode "Ngày gần nhất" (limit=N) thay vì range, currentFilter
+    // chỉ có `limit` — BE queries hourly/referrer/delay/cancellation KHÔNG hiểu
+    // `limit` (chỉ list_days_with_rows hiểu) → query trả all-time. Derive
+    // date range từ `days[]` (đã được FE filter đúng) để pass xuống BE.
+    let beFromDate = currentFilter.fromDate;
+    let beToDate = currentFilter.toDate;
+    if (!beFromDate || !beToDate) {
+      const sortedDates = days.map((d) => d.date).sort();
+      beFromDate = beFromDate ?? sortedDates[0];
+      beToDate = beToDate ?? sortedDates[sortedDates.length - 1];
+    }
+
     const beFilter: DaysFilter = {
-      fromDate: currentFilter.fromDate,
-      toDate: currentFilter.toDate,
-      limit: currentFilter.limit,
+      fromDate: beFromDate,
+      toDate: beToDate,
       accountFilter,
     };
     Promise.all([
@@ -284,7 +309,13 @@ export function OverviewTab({
     return () => {
       cancelled = true;
     };
-  }, [currentFilter.fromDate, currentFilter.toDate, currentFilter.limit, accountFilter]);
+  }, [
+    currentFilter.fromDate,
+    currentFilter.toDate,
+    currentFilter.limit,
+    accountFilter,
+    days,
+  ]);
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-6">

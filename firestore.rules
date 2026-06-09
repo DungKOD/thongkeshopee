@@ -1,0 +1,43 @@
+rules_version = '2';
+
+// Firestore Security Rules cho ThongKeShopee.
+//
+// Deploy bằng 1 trong 2 cách:
+// 1. Firebase Console → Firestore Database → Rules → paste nội dung file này
+//    → "Publish".
+// 2. Firebase CLI: `firebase deploy --only firestore:rules`
+//    (yêu cầu `firebase.json` có khai báo `"firestore": { "rules": "firestore.rules" }`).
+//
+// Mỗi user chỉ được đọc/ghi document session của chính mình. Không cho
+// list/query toàn collection để tránh enumerate uid của user khác.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /sessions/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // User profile (premium/admin flags). Quy tắc bảo mật:
+    // - Đọc: chỉ owner.
+    // - Tạo: owner được tạo nhưng PHẢI default premium=false, admin=false,
+    //   expiredAt=null — chống user tự gán quyền cho mình lúc signup.
+    // - Update/Delete: deny hẳn. Admin nâng cấp premium qua Firebase Console
+    //   (Console bypass rules).
+    match /users/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.data.premium == false
+        && request.resource.data.admin == false
+        && request.resource.data.expiredAt == null;
+      allow update, delete: if false;
+    }
+
+    // Mặc định deny tất cả path khác. Khi thêm collection mới, mở rule cụ thể
+    // ở trên — KHÔNG nới rule cuối này thành allow.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

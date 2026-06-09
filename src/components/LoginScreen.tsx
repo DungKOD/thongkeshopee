@@ -24,8 +24,14 @@ function parseAuthError(err: unknown): string {
 }
 
 export function LoginScreen() {
-  const { signInWithGoogle, signInWithEmail, signUpWithEmail, resetPassword } =
-    useAuth();
+  const {
+    signInWithGoogle,
+    signInWithEmail,
+    signUpWithEmail,
+    resetPassword,
+    lastSignInError,
+    clearLastSignInError,
+  } = useAuth();
   const [mode, setMode] = useState<Mode>("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -35,6 +41,7 @@ export function LoginScreen() {
 
   const handleGoogle = async () => {
     setError(null);
+    clearLastSignInError();
     setSubmitting(true);
     try {
       await signInWithGoogle();
@@ -49,6 +56,7 @@ export function LoginScreen() {
     e.preventDefault();
     setError(null);
     setResetInfo(null);
+    clearLastSignInError();
     setSubmitting(true);
     try {
       if (mode === "signin") await signInWithEmail(email, password);
@@ -140,6 +148,11 @@ export function LoginScreen() {
           {error && (
             <div className="rounded-md border border-red-500/40 bg-red-900/30 px-3 py-2 text-xs text-red-200">
               {error}
+            </div>
+          )}
+          {!error && lastSignInError && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-900/30 px-3 py-2 text-xs text-amber-200">
+              {lastSignInError}
             </div>
           )}
           {resetInfo && (

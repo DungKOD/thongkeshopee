@@ -1,6 +1,6 @@
 [package]
 name = "thongkeshopee"
-version = "0.9.4"
+version = "0.9.5"
 description = "Shopee Affiliate Tracker — Thống kê chạy ads FB hàng ngày"
 authors = ["dungnv92734"]
 edition = "2021"
@@ -37,6 +37,8 @@ reqwest = { version = "0.12", features = ["json", "cookies", "stream"] }
 tokio = { version = "1", features = ["fs", "io-util", "rt", "macros", "time", "sync"] }
 futures-util = "0.3"
 base64 = "0.22"
+machine-uid = "0.5"
+hostname = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
