@@ -24,6 +24,7 @@ import {
   useFilterMode,
 } from "./hooks/useFilterMode";
 import { SettingsProvider, useSettings } from "./hooks/useSettings";
+import { useDailyStatsSync } from "./hooks/useDailyStatsSync";
 import { useToast } from "./components/ToastProvider";
 import { commitCsvBatch, previewCsvBatch } from "./lib/dbImport";
 import type { PreviewBatch } from "./lib/dbImport";
@@ -131,6 +132,12 @@ function AppInner() {
     if (!settingsHydrated) return;
     if (referrers.length > 0) registerSources(referrers);
   }, [settingsHydrated, referrers, registerSources]);
+
+  // Sync {ngày, ads, hoa hồng, lãi} lên Google Sheet (tab {localPart}_stats)
+  // mỗi khi `days` thay đổi (sau import / save manual / batch delete). Hook
+  // tự debounce 2s + diff snapshot, chỉ ngày có giá trị đổi mới được upload.
+  // Disable khi settings chưa hydrate vì fees chưa stable → profit số sai.
+  useDailyStatsSync(days, settings.profitFees, settingsHydrated);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);

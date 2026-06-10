@@ -65,6 +65,8 @@ function doPost(e) {
           body.videoStatus,
           body.videoTimestamp,
         );
+      case 'logDailyStatsBatch':
+        return handleLogDailyStatsBatch(user, body.rows);
       case 'readUserVideoLog':
         return handleReadUserVideoLog(
           user,
@@ -773,6 +775,122 @@ function handleDeleteUserVideoLogSheet(user, idToken, targetUid, targetLocalPart
   }
   if (!deletedAny) return jsonOk({ deleted: false, reason: 'tab already missing' });
   return jsonOk({ deleted: true });
+}
+
+// ============================================================
+// Daily stats — tab `{localPart}_stats` cùng Spreadsheet
+// Cột: Ngày | Tiền ads | Hoa hồng | Lãi | Cập nhật lúc
+// Upsert theo Ngày, sort DESC sau mỗi batch.
+// ============================================================
+
+const DAILY_STATS_HEADER = ['Ngày', 'Tiền ads', 'Hoa hồng', 'Lãi', 'Cập nhật lúc'];
+const DAILY_STATS_TAB_SUFFIX = '_stats';
+
+/**
+ * Get-or-create tab daily stats cho user. Tên tab = localPart + suffix
+ * `_stats`. Ownership guard qua developer metadata `owner_uid` (giống
+ * pattern của video log) — cross-provider same-local-part bị reject sạch
+ * thay vì ghi đè im lặng.
+ */
+function getOrCreateDailyStatsSheet_(user) {
+  const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
+  const localPart = emailToLocalPart(user.email);
+  const tabName = localPart + DAILY_STATS_TAB_SUFFIX;
+
+  let sheet = ss.getSheetByName(tabName);
+  if (sheet) {
+    const claimed = getSheetOwnerUid_(sheet);
+    if (!claimed) {
+      setSheetOwnerUid_(sheet, user.uid);
+      return sheet;
+    }
+    if (claimed === user.uid) return sheet;
+    throw new Error(
+      'COLLISION: tab "' + tabName + '" đã thuộc user khác (uid=' + claimed + ').',
+    );
+  }
+
+  sheet = ss.insertSheet(tabName);
+  setSheetOwnerUid_(sheet, user.uid);
+  sheet
+    .getRange(1, 1, 1, DAILY_STATS_HEADER.length)
+    .setValues([DAILY_STATS_HEADER])
+    .setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(1, 110); // Ngày
+  sheet.setColumnWidth(2, 140); // Tiền ads
+  sheet.setColumnWidth(3, 140); // Hoa hồng
+  sheet.setColumnWidth(4, 140); // Lãi
+  sheet.setColumnWidth(5, 180); // Cập nhật lúc
+  // Number format cho cột B/C/D với hậu tố "đ" (VND). E giữ text (timestamp).
+  sheet.getRange('B:D').setNumberFormat('#,##0 "đ"');
+  sheet.getRange('A:A').setNumberFormat('@'); // ngày dạng YYYY-MM-DD plain text
+  sheet.getRange('E:E').setNumberFormat('@');
+  return sheet;
+}
+
+function nowVnTimestamp_() {
+  const d = new Date();
+  const pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+  return (
+    pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) +
+    ' ' + pad(d.getDate()) + '/' + pad(d.getMonth() + 1) + '/' + d.getFullYear()
+  );
+}
+
+/**
+ * Batch upsert daily stats. Input `rows` là mảng
+ * `[{date, spend, commission, profit}, ...]`. Số được round int (đ) phía
+ * client trước khi gửi.
+ *
+ * Upsert theo cột A (Ngày): row tồn tại → setValues đè; chưa có → appendRow.
+ * Sau khi xong, sort DESC theo cột A để view newest-first trong Sheet.
+ */
+function handleLogDailyStatsBatch(user, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return jsonError(400, 'Missing/empty rows');
+  }
+
+  const sheet = getOrCreateDailyStatsSheet_(user);
+  const updatedAt = nowVnTimestamp_();
+
+  // Build map date → 1-based row index từ data hiện tại.
+  const lastRow = sheet.getLastRow();
+  const existingMap = {};
+  if (lastRow > 1) {
+    const dates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (let i = 0; i < dates.length; i++) {
+      const d = String(dates[i][0] || '');
+      if (d) existingMap[d] = i + 2;
+    }
+  }
+
+  let upserted = 0;
+  let inserted = 0;
+  rows.forEach(function (r) {
+    const date = String(r.date || '');
+    if (!date) return;
+    const spend = Number(r.spend) || 0;
+    const commission = Number(r.commission) || 0;
+    const profit = Number(r.profit) || 0;
+    const values = [[date, spend, commission, profit, updatedAt]];
+    if (existingMap[date]) {
+      sheet.getRange(existingMap[date], 1, 1, 5).setValues(values);
+      upserted++;
+    } else {
+      sheet.appendRow(values[0]);
+      inserted++;
+    }
+  });
+
+  // Sort theo Ngày DESC để Sheet view newest-first. Rẻ vì < vài nghìn rows.
+  if (sheet.getLastRow() > 2) {
+    sheet
+      .getRange(2, 1, sheet.getLastRow() - 1, 5)
+      .sort({ column: 1, ascending: false });
+  }
+
+  return jsonOk({ upserted: upserted, inserted: inserted });
 }
 
 // ============================================================

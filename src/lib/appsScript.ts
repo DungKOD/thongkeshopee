@@ -58,6 +58,26 @@ export async function callAppsScript<T extends AppsScriptOk = AppsScriptOk>(
 }
 
 /**
+ * 1 row daily stats gửi lên Sheet. Số đã được round về VND nguyên (không
+ * thập phân), tránh sai lệch hiển thị do floating point.
+ */
+export interface DailyStatsRow {
+  date: string; // 'YYYY-MM-DD'
+  spend: number;
+  commission: number;
+  profit: number;
+}
+
+/**
+ * Batch upsert daily stats vào tab `{localPart}_stats`. Apps Script handler
+ * `handleLogDailyStatsBatch` upsert theo Ngày + sort DESC sau mỗi call.
+ * Không throw nếu URL chưa config — caller hook tự catch + warn.
+ */
+export function syncDailyStats(rows: DailyStatsRow[]): Promise<void> {
+  return callAppsScript("logDailyStatsBatch", { rows }).then(() => undefined);
+}
+
+/**
  * Format Date sang `"HH:MM:SS DD/MM/YYYY"` — định dạng Apps Script
  * (`parseTs_` trong Code.gs) parse được. Dùng giờ máy local (Asia/HCM mặc
  * định ở VN). Nếu user ở timezone khác, log vẫn theo giờ máy họ — hợp lý
