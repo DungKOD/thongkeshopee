@@ -3,7 +3,7 @@
 //! - `export_db`: backup DB đang chạy ra file do user chọn (WAL-safe).
 //! - `import_db`: nhận file `.db` mới, validate schema, thay thế, restart app.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{backup::Backup, Connection};
 use tauri::State;
@@ -43,6 +43,11 @@ pub fn export_db(db: State<'_, DbState>, dest_path: String) -> CmdResult<()> {
 /// Frontend gọi `window.location.reload()` sau khi nhận Ok — không dùng
 /// `app.restart()` vì tauri_plugin_single_instance gây race condition
 /// (process mới bị detect là "second instance" → tự thoát).
+///
+/// **Windows mmap quirk:** `init_db_at` set `PRAGMA mmap_size = 256MB` →
+/// connection memory-map file đích. `std::fs::copy` sang file đang được mmap
+/// fail với `ERROR_USER_MAPPED_FILE` (os error 1224). Bắt buộc phải drop
+/// connection cũ TRƯỚC khi copy, sau đó mở lại trên file mới.
 #[tauri::command]
 pub fn import_db(db: State<'_, DbState>, src_path: String) -> CmdResult<()> {
     let src = PathBuf::from(&src_path);
@@ -53,15 +58,38 @@ pub fn import_db(db: State<'_, DbState>, src_path: String) -> CmdResult<()> {
 
     validate_import_file(&src)?;
 
-    // Lock mutex, lấy path, copy, mở connection mới, swap — tất cả trong 1
+    // Lock mutex, đóng conn cũ, copy, mở conn mới, swap — tất cả trong 1
     // critical section để không có query nào chạy giữa chừng.
     let mut conn_guard = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
 
     let dest_path = resolve_active_db_path(&conn_guard)
         .map_err(|e| CmdError::msg(e.to_string()))?;
 
-    std::fs::copy(&src, &dest_path)
-        .map_err(|e| CmdError::msg(format!("không copy được file DB: {e}")))?;
+    // Thay connection hiện tại bằng dummy in-memory để drop conn cũ → release
+    // mmap section trên dest_path. Giữ invariant "*conn_guard luôn hợp lệ"
+    // (không thể drop MutexGuard giữa chừng vì borrow checker).
+    let dummy = Connection::open_in_memory()
+        .map_err(|e| CmdError::msg(format!("không tạo được dummy conn: {e}")))?;
+    let old_conn = std::mem::replace(&mut *conn_guard, dummy);
+    drop(old_conn);
+
+    // Best-effort cleanup WAL sidecar — SQLite checkpoint khi close conn,
+    // nhưng trên Windows shm có thể vẫn bị lock vài chục ms bởi indexer/AV.
+    // File mới sẽ tự tạo wal/shm khi connection mới mở.
+    let _ = std::fs::remove_file(sidecar_path(&dest_path, "-wal"));
+    let _ = std::fs::remove_file(sidecar_path(&dest_path, "-shm"));
+
+    if let Err(e) = std::fs::copy(&src, &dest_path) {
+        // Khôi phục: reopen file cũ tại dest_path. Có 2 case:
+        // - dest_path chưa bị ghi (copy fail trước khi mở dest): mở lại OK.
+        // - dest_path bị ghi 1 phần (rất hiếm vì copy mở dest trước khi
+        //   write): init_db_at có thể fail → conn_guard giữ dummy, user phải
+        //   restart app (đã có TaskOutput cảnh báo qua error message).
+        if let Ok(restored) = crate::db::init_db_at(&dest_path) {
+            *conn_guard = restored;
+        }
+        return Err(CmdError::msg(format!("không copy được file DB: {e}")));
+    }
 
     // Mở connection mới trên file vừa copy, apply PRAGMA + schema (idempotent).
     let new_conn = crate::db::init_db_at(&dest_path)
@@ -70,6 +98,19 @@ pub fn import_db(db: State<'_, DbState>, src_path: String) -> CmdResult<()> {
     *conn_guard = new_conn;
 
     Ok(())
+}
+
+/// Build sidecar path cho SQLite WAL/SHM: `thongkeshopee.db` + `-wal` →
+/// `thongkeshopee.db-wal`. Append vào filename (KHÔNG dùng `set_extension`
+/// vì `set_extension` thay extension hiện tại — `.db` → `.wal` → sai tên).
+fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = db_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("thongkeshopee.db")
+        .to_string();
+    name.push_str(suffix);
+    db_path.with_file_name(name)
 }
 
 /// Kiểm tra file SQLite hợp lệ và là DB của ThongKeShopee.
