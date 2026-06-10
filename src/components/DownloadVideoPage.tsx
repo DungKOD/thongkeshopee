@@ -45,6 +45,7 @@ interface PlatformChip {
 const PLATFORMS: PlatformChip[] = [
   { name: "TikTok", icon: "music_note", gradient: "from-gray-700 to-gray-900" },
   { name: "Douyin", icon: "videocam", gradient: "from-gray-800 to-black" },
+  { name: "Shopee", icon: "storefront", gradient: "from-orange-500 to-red-600" },
   { name: "Xiaohongshu", icon: "book", gradient: "from-red-500 to-red-700" },
   { name: "YouTube", icon: "smart_display", gradient: "from-red-600 to-red-800" },
   { name: "Facebook", icon: "thumb_up", gradient: "from-blue-600 to-blue-800" },

@@ -111,6 +111,10 @@ fn detect_platform(url: &str) -> &str {
     else if u.contains("reddit.com") { "Reddit" }
     else if u.contains("vimeo.com") { "Vimeo" }
     else if u.contains("xiaohongshu.com") || u.contains("xhslink.com") { "Xiaohongshu" }
+    // Shopee: domain quốc gia khác nhau (shopee.vn / shopee.com / shopee.com.my
+    // / shopee.co.id ...) — check prefix "shopee." chung. Cũng bắt link short
+    // shp.ee mà Shopee dùng để chia sẻ trong app.
+    else if u.contains("shopee.") || u.contains("shp.ee") { "Shopee" }
     else { "Khác" }
 }
 
@@ -965,6 +969,184 @@ where
     Err(last_err)
 }
 
+// ===== Shopee video — API qua 4anm.top =====
+//
+// 4anm.top/downloadshopee là front-end web cho phép paste link sản phẩm Shopee
+// (vd https://shopee.vn/product/...) hoặc link video, trả về URL trực tiếp
+// của file mp4. Endpoint nội bộ:
+//
+//   POST https://4anm.top/get_download_shopee.php
+//   Content-Type: application/json
+//   Body: { "urls": ["..."], "token": "<base64 từ <input name=token>>" }
+//   Response: { "download_link": [...] } hoặc { "error": "...", "message": "..." }
+//
+// Token là 1 base64 string ẩn trong HTML — không phải CSRF per-session mà có vẻ
+// là access token tĩnh per-instance, nhưng vẫn cache có TTL 1h + auto-refetch
+// khi API trả lỗi auth để app không kẹt khi 4anm.top rotate token.
+
+const SHOPEE_DL_PAGE: &str = "https://4anm.top/downloadshopee";
+const SHOPEE_DL_API: &str = "https://4anm.top/get_download_shopee.php";
+const SHOPEE_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[derive(Debug, Deserialize)]
+struct ShopeeApiResponse {
+    #[serde(default)]
+    download_link: Vec<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ShopeeApiRequest<'a> {
+    urls: Vec<&'a str>,
+    token: &'a str,
+}
+
+static SHOPEE_TOKEN_CACHE: OnceLock<
+    tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+> = OnceLock::new();
+
+fn shopee_token_cache() -> &'static tokio::sync::Mutex<Option<(String, std::time::Instant)>> {
+    SHOPEE_TOKEN_CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// Scrape token từ `<input type="hidden" name="token" value="...">`. Trang trả
+/// HTML đầy đủ → string-search nhanh hơn HTML parser cho 1 trường duy nhất.
+async fn fetch_shopee_token(client: &reqwest::Client) -> Result<String, String> {
+    let html = client
+        .get(SHOPEE_DL_PAGE)
+        .send()
+        .await
+        .map_err(|e| format!("Lỗi tải trang 4anm.top: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("Lỗi đọc HTML 4anm.top: {}", e))?;
+
+    let token = html
+        .split("name=\"token\"")
+        .nth(1)
+        .and_then(|s| s.split("value=\"").nth(1))
+        .and_then(|s| s.split('"').next())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Không tìm thấy token Shopee trong HTML 4anm.top".to_string())?;
+
+    Ok(token.to_string())
+}
+
+/// Trả token cached (fresh < 1h) hoặc refetch. `force_refresh=true` bỏ qua
+/// cache — dùng khi API trả lỗi token để retry với token mới.
+async fn get_shopee_token(client: &reqwest::Client, force_refresh: bool) -> Result<String, String> {
+    let cache = shopee_token_cache();
+    if !force_refresh {
+        let guard = cache.lock().await;
+        if let Some((token, at)) = guard.as_ref() {
+            if at.elapsed() < SHOPEE_TOKEN_TTL {
+                return Ok(token.clone());
+            }
+        }
+    }
+    let token = fetch_shopee_token(client).await?;
+    *cache.lock().await = Some((token.clone(), std::time::Instant::now()));
+    Ok(token)
+}
+
+/// Derive filename từ URL CDN (lấy basename + extension nếu có).
+/// Fallback: `shopee_video_{timestamp}.mp4`.
+fn shopee_filename_from(download_url: &str) -> String {
+    let basename = download_url
+        .rsplit('/')
+        .next()
+        .and_then(|last| last.split('?').next())
+        .unwrap_or("");
+    if !basename.is_empty() && basename.contains('.') {
+        return basename.to_string();
+    }
+    format!("shopee_video_{}.mp4", chrono::Utc::now().timestamp())
+}
+
+/// 1 request POST tới 4anm.top — tách thành helper để retry khi token sai.
+async fn call_shopee_api(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<ShopeeApiResponse, String> {
+    let payload = ShopeeApiRequest {
+        urls: vec![url],
+        token,
+    };
+    let resp = client
+        .post(SHOPEE_DL_API)
+        .header("Referer", SHOPEE_DL_PAGE)
+        .header("Origin", "https://4anm.top")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Lỗi gọi API 4anm.top: {}", e))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Lỗi đọc response 4anm.top: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("4anm.top HTTP {}: {}", status, text));
+    }
+
+    serde_json::from_str::<ShopeeApiResponse>(&text)
+        .map_err(|e| format!("Lỗi parse JSON 4anm.top: {} (body: {})", e, text))
+}
+
+async fn fetch_shopee(url: &str) -> Result<VideoInfo, String> {
+    let client = http_client()?;
+
+    // Lần 1: dùng token cached/fetch lần đầu.
+    let token = get_shopee_token(&client, false).await?;
+    let mut data = call_shopee_api(&client, url, &token).await?;
+
+    // Nếu API trả error liên quan token, refetch token + retry 1 lần. Các từ
+    // khoá bao quát các cách 4anm.top có thể báo lỗi auth.
+    let looks_like_token_error = |d: &ShopeeApiResponse| -> bool {
+        d.download_link.is_empty()
+            && d.error
+                .as_deref()
+                .or(d.message.as_deref())
+                .map(|s| {
+                    let s = s.to_lowercase();
+                    s.contains("token") || s.contains("auth") || s.contains("unauthorized")
+                })
+                .unwrap_or(false)
+    };
+
+    if looks_like_token_error(&data) {
+        let fresh_token = get_shopee_token(&client, true).await?;
+        data = call_shopee_api(&client, url, &fresh_token).await?;
+    }
+
+    if data.download_link.is_empty() {
+        let msg = data
+            .message
+            .or(data.error)
+            .unwrap_or_else(|| "API 4anm.top không trả URL nào".to_string());
+        return Err(format!("Shopee: {}", msg));
+    }
+
+    let download_url = data.download_link.into_iter().next().unwrap();
+    let filename = shopee_filename_from(&download_url);
+
+    Ok(VideoInfo {
+        title: "Video Shopee".to_string(),
+        author: "Shopee".to_string(),
+        cover: String::new(),
+        duration: 0,
+        platform: "Shopee".to_string(),
+        download_url,
+        filename,
+    })
+}
+
 /// Lỗi permanent — không nên retry: video riêng tư, auth, link hết hạn, v.v.
 fn is_permanent_error(e: &str) -> bool {
     let e = e.to_lowercase();
@@ -1002,6 +1184,9 @@ pub async fn get_video_info(url: String) -> Result<VideoInfo, String> {
 
         // Douyin: 3 lần retry, delay 2s
         "Douyin" => retry(3, 2_000, || fetch_douyin(&url)).await,
+
+        // Shopee: 2 lần retry, delay 3s (API 4anm.top có rate limit nhẹ)
+        "Shopee" => retry(2, 3_000, || fetch_shopee(&url)).await,
 
         // Xiaohongshu: 2 lần retry, delay 3s (token xhslink hết hạn nhanh nên ít retry)
         "Xiaohongshu" => {
@@ -1050,6 +1235,11 @@ pub async fn download_video(
         "https://www.douyin.com/"
     } else if download_url.contains("tiktok") || download_url.contains("tikwm") {
         "https://www.tiktok.com/"
+    } else if download_url.contains("shopee") || download_url.contains("cf.shopee") {
+        // Shopee CDN không bắt buộc referer cho hầu hết video, nhưng set sẵn
+        // phòng trường hợp họ siết kiểm tra. Dùng shopee.vn vì link product
+        // VN phổ biến nhất trong tệp user.
+        "https://shopee.vn/"
     } else {
         ""
     };
