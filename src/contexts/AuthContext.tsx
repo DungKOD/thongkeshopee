@@ -25,6 +25,7 @@ import {
   verifySession,
   watchSession,
 } from "../lib/deviceSession";
+import { clearCachedUserProfile } from "../lib/userProfile";
 import {
   ensureUserProfile,
   getCachedUserProfile,
@@ -146,6 +147,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
       stopWatcher();
       stopRetry();
       stopProfileWatcher();
+      // Clear cache validate ngay khi bị kick — nếu không, máy này có thể ngắt
+      // mạng + restart app, verifySession() offline đọc cache còn fresh và trả
+      // status="offline" → AuthContext bỏ qua → claim chạy lại → bypass kick.
+      // Cũng clear profile cache cùng uid để máy bị kick không "xem chùa"
+      // premium offline. uid lấy từ auth.currentUser tại thời điểm fire (trước
+      // khi fbSignOut clear).
+      clearSessionCache();
+      const uidBeforeSignOut = auth.currentUser?.uid;
+      if (uidBeforeSignOut) clearCachedUserProfile(uidBeforeSignOut);
       setKickInfo(info);
       // signOut Firebase nhưng GIỮ kickInfo để dialog hiện thị tên máy chiếm.
       // acknowledgeKick() sẽ clear sau khi user bấm "Đăng nhập lại".

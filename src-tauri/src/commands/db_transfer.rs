@@ -72,19 +72,27 @@ pub fn import_db(db: State<'_, DbState>, src_path: String) -> CmdResult<()> {
     Ok(())
 }
 
-/// Kiểm tra file SQLite hợp lệ và có đủ các bảng cốt lõi.
+/// Kiểm tra file SQLite hợp lệ và là DB của ThongKeShopee.
+///
+/// Chỉ require các bảng "fingerprint" tồn tại từ phiên bản đầu tiên
+/// (`days` + `raw_shopee_clicks` + `raw_shopee_order_items`) — đủ để chứng
+/// minh đây là DB của app, không phải file SQLite ngẫu nhiên.
+///
+/// Các bảng được thêm ở version sau (`shopee_accounts`, `manual_entries`,
+/// `app_settings`, `imported_files`, `raw_fb_ads`, `raw_fb_ads_hierarchy`, các
+/// mapping table) KHÔNG check ở đây — sau khi `import_db` copy file,
+/// `init_db_at` sẽ chạy `schema.sql` (toàn bộ `CREATE TABLE IF NOT EXISTS`)
+/// để tự tạo bảng thiếu. Cột mới trên bảng cũ (vd `shopee_account_id`) đều
+/// nullable nên data cũ không bị break. Cho phép import DB từ các bản cũ
+/// (v0.8.x trở xuống) mà không cần migrate tay.
 fn validate_import_file(path: &PathBuf) -> CmdResult<()> {
     let conn = Connection::open(path)
         .map_err(|e| CmdError::msg(format!("không mở được file DB: {e}")))?;
 
-    let required_tables = [
-        "shopee_accounts",
+    let fingerprint_tables = [
         "days",
-        "imported_files",
-        "raw_shopee_order_items",
         "raw_shopee_clicks",
-        "manual_entries",
-        "app_settings",
+        "raw_shopee_order_items",
     ];
 
     let existing: Vec<String> = conn
@@ -95,10 +103,11 @@ fn validate_import_file(path: &PathBuf) -> CmdResult<()> {
         .filter_map(|r| r.ok())
         .collect();
 
-    for table in required_tables {
+    for table in fingerprint_tables {
         if !existing.iter().any(|t| t == table) {
             return Err(CmdError::msg(format!(
-                "File DB không hợp lệ: thiếu bảng '{table}'"
+                "File DB không phải của ThongKeShopee (thiếu bảng '{table}'). \
+                 Hãy chọn file .db được Export từ chính app này."
             )));
         }
     }
