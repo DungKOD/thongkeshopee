@@ -10,8 +10,8 @@ use crate::db::DbState;
 
 use super::super::{CmdError, CmdResult};
 use super::aggregate::{
-    append_subid_prefilter, canonical_to_array, is_compatible, read_sub_id_match_mode,
-    to_canonical,
+    append_subid_prefilter, canonical_to_array, is_compatible, params_to_refs,
+    read_sub_id_match_mode, to_canonical,
 };
 
 /// Chi tiết 1 item trong order (từ raw_shopee_order_items) để hiển thị drill-down.
@@ -78,8 +78,7 @@ pub fn get_order_items_for_row(
     append_subid_prefilter(&mut sql, &mut params_vec, &target_subs, match_mode);
     sql.push_str(" ORDER BY order_time DESC");
     let mut stmt = conn.prepare_cached(&sql)?;
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+    let params_refs = params_to_refs(&params_vec);
 
     let iter = stmt.query_map(params_refs.as_slice(), |r| {
         let subs: [String; 5] = [

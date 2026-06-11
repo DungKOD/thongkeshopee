@@ -21,8 +21,8 @@ use crate::db::DbState;
 
 use super::super::{CmdError, CmdResult};
 use super::aggregate::{
-    canonical_to_array, default_name, read_sub_id_match_mode, representative, to_canonical,
-    Canonical, SubIdMatchMode,
+    canonical_to_array, default_name, params_to_refs, read_sub_id_match_mode, representative,
+    to_canonical, Canonical, SubIdMatchMode,
 };
 use super::{default_account_id_lookup, AccountFilterMode, DaysFilter};
 
@@ -79,8 +79,7 @@ pub(super) fn list_days_with_rows_impl(
     }
 
     let mut stmt = conn.prepare_cached(&sql)?;
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+    let params_refs = params_to_refs(&params_vec);
     let days: Vec<(String, Option<String>)> = stmt
         .query_map(params_refs.as_slice(), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
@@ -897,8 +896,7 @@ fn batch_fetch_shopee_clicks(
     sql.push_str(" GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, acc, ref");
 
     let mut all_params: Vec<&dyn rusqlite::ToSql> = date_params.to_vec();
-    let extra_refs: Vec<&dyn rusqlite::ToSql> =
-        extra_params.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+    let extra_refs = params_to_refs(&extra_params);
     all_params.extend(extra_refs.iter().copied());
 
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -952,8 +950,7 @@ fn batch_fetch_shopee_orders(
     );
 
     let mut all_params: Vec<&dyn rusqlite::ToSql> = date_params.to_vec();
-    let extra_refs: Vec<&dyn rusqlite::ToSql> =
-        extra_params.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+    let extra_refs = params_to_refs(&extra_params);
     all_params.extend(extra_refs.iter().copied());
 
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -1001,8 +998,7 @@ fn batch_fetch_manuals(
     }
 
     let mut all_params: Vec<&dyn rusqlite::ToSql> = date_params.to_vec();
-    let extra_refs: Vec<&dyn rusqlite::ToSql> =
-        extra_params.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+    let extra_refs = params_to_refs(&extra_params);
     all_params.extend(extra_refs.iter().copied());
 
     let mut stmt = conn.prepare_cached(&sql)?;

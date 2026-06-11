@@ -13,8 +13,8 @@ use crate::db::DbState;
 
 use super::super::{CmdError, CmdResult};
 use super::aggregate::{
-    append_subid_prefilter, is_prefix, read_sub_id_match_mode, sub_ids_match, to_canonical,
-    Canonical,
+    append_date_account_filters, append_subid_prefilter, is_prefix, params_to_refs,
+    read_sub_id_match_mode, sub_ids_match, to_canonical, Canonical,
 };
 use super::{AccountFilterMode, DaysFilter};
 
@@ -70,25 +70,11 @@ pub fn load_hourly_orders(
              WHERE order_time IS NOT NULL AND order_time != ''",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(v) = &f.from_date {
-            sql.push_str(" AND day_date >= ?");
-            params_vec.push(Box::new(v.clone()));
-        }
-        if let Some(v) = &f.to_date {
-            sql.push_str(" AND day_date <= ?");
-            params_vec.push(Box::new(v.clone()));
-        }
-        if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
-            sql.push_str(" AND shopee_account_id = ?");
-            params_vec.push(Box::new(*id));
-        }
+        append_date_account_filters(&mut sql, &mut params_vec, &f);
         sql.push_str(" GROUP BY hour ORDER BY hour ASC");
 
         let mut stmt = conn.prepare_cached(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
-            .iter()
-            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-            .collect();
+        let params_refs = params_to_refs(&params_vec);
         let rows: Vec<HourlyOrderBucket> = stmt
             .query_map(params_refs.as_slice(), |r| {
                 let hour_i: i64 = r.get(0)?;
@@ -115,25 +101,11 @@ pub fn load_hourly_orders(
          WHERE order_time IS NOT NULL AND order_time != ''",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(v) = &f.from_date {
-        sql.push_str(" AND day_date >= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(v) = &f.to_date {
-        sql.push_str(" AND day_date <= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
-        sql.push_str(" AND shopee_account_id = ?");
-        params_vec.push(Box::new(*id));
-    }
+    append_date_account_filters(&mut sql, &mut params_vec, &f);
     append_subid_prefilter(&mut sql, &mut params_vec, &target, match_mode);
 
     let mut stmt = conn.prepare_cached(&sql)?;
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
-        .iter()
-        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-        .collect();
+    let params_refs = params_to_refs(&params_vec);
     // Per-hour: (distinct_order_ids, sum_order_value, sum_commission).
     let mut buckets: [(std::collections::HashSet<String>, f64, f64); 24] =
         std::array::from_fn(|_| (std::collections::HashSet::new(), 0.0, 0.0));
@@ -224,25 +196,11 @@ pub fn load_hourly_clicks(
              WHERE click_time IS NOT NULL AND click_time != ''",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(v) = &f.from_date {
-            sql.push_str(" AND day_date >= ?");
-            params_vec.push(Box::new(v.clone()));
-        }
-        if let Some(v) = &f.to_date {
-            sql.push_str(" AND day_date <= ?");
-            params_vec.push(Box::new(v.clone()));
-        }
-        if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
-            sql.push_str(" AND shopee_account_id = ?");
-            params_vec.push(Box::new(*id));
-        }
+        append_date_account_filters(&mut sql, &mut params_vec, &f);
         sql.push_str(" GROUP BY hour ORDER BY hour ASC");
 
         let mut stmt = conn.prepare_cached(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
-            .iter()
-            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-            .collect();
+        let params_refs = params_to_refs(&params_vec);
         let rows: Vec<HourlyClickBucket> = stmt
             .query_map(params_refs.as_slice(), |r| {
                 let hour_i: i64 = r.get(0)?;
@@ -273,23 +231,9 @@ pub fn load_hourly_clicks(
          WHERE click_time IS NOT NULL AND click_time != ''",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(v) = &f.from_date {
-        sql.push_str(" AND day_date >= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(v) = &f.to_date {
-        sql.push_str(" AND day_date <= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
-        sql.push_str(" AND shopee_account_id = ?");
-        params_vec.push(Box::new(*id));
-    }
+    append_date_account_filters(&mut sql, &mut params_vec, &f);
     let mut stmt = conn.prepare_cached(&sql)?;
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
-        .iter()
-        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-        .collect();
+    let params_refs = params_to_refs(&params_vec);
     let mut counts = [0_i64; 24];
     for row in stmt.query_map(params_refs.as_slice(), |r| {
         Ok((
@@ -402,10 +346,7 @@ pub fn load_referrer_efficiency(
          GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, referrer"
     );
     let mut stmt = conn.prepare_cached(&clicks_sql)?;
-    let refs_clicks: Vec<&dyn rusqlite::ToSql> = params_vec
-        .iter()
-        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-        .collect();
+    let refs_clicks = params_to_refs(&params_vec);
     type ClickKey = (String, [String; 5]);
     let mut clicks_by_key: std::collections::HashMap<ClickKey, Vec<(String, i64)>> =
         std::collections::HashMap::new();
@@ -446,10 +387,7 @@ pub fn load_referrer_efficiency(
          GROUP BY click_day, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5"
     );
     let mut stmt = conn.prepare_cached(&orders_sql)?;
-    let refs_orders: Vec<&dyn rusqlite::ToSql> = params_orders
-        .iter()
-        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-        .collect();
+    let refs_orders = params_to_refs(&params_orders);
     type OrderAgg = (i64, f64, f64);
     let mut orders_by_key: std::collections::HashMap<ClickKey, OrderAgg> =
         std::collections::HashMap::new();
@@ -680,28 +618,14 @@ pub fn load_click_order_delays(
          WHERE order_time IS NOT NULL AND order_time != ''",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(v) = &f.from_date {
-        sql.push_str(" AND day_date >= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(v) = &f.to_date {
-        sql.push_str(" AND day_date <= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
-        sql.push_str(" AND shopee_account_id = ?");
-        params_vec.push(Box::new(*id));
-    }
+    append_date_account_filters(&mut sql, &mut params_vec, &f);
     let target = f.sub_ids.clone();
     if let Some(t) = target.as_ref() {
         append_subid_prefilter(&mut sql, &mut params_vec, t, match_mode);
     }
 
     let mut stmt = conn.prepare_cached(&sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = params_vec
-        .iter()
-        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-        .collect();
+    let refs = params_to_refs(&params_vec);
     // Distinct orders (1 order nhiều items) — dedupe qua HashMap<order_id, delay>.
     let mut by_order: std::collections::HashMap<String, Option<f64>> =
         std::collections::HashMap::new();
@@ -822,18 +746,7 @@ pub fn load_cancellation_by_subid(
             WHERE 1=1",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(v) = &f.from_date {
-        sql.push_str(" AND day_date >= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(v) = &f.to_date {
-        sql.push_str(" AND day_date <= ?");
-        params_vec.push(Box::new(v.clone()));
-    }
-    if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
-        sql.push_str(" AND shopee_account_id = ?");
-        params_vec.push(Box::new(*id));
-    }
+    append_date_account_filters(&mut sql, &mut params_vec, &f);
     sql.push_str(
         "    GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date, order_id
          )
@@ -841,10 +754,7 @@ pub fn load_cancellation_by_subid(
     );
 
     let mut stmt = conn.prepare_cached(&sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = params_vec
-        .iter()
-        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-        .collect();
+    let refs = params_to_refs(&params_vec);
     let rows: Vec<CancellationByDayBucket> = stmt
         .query_map(refs.as_slice(), |r| {
             Ok(CancellationByDayBucket {

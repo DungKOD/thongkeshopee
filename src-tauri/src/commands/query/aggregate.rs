@@ -143,6 +143,36 @@ pub(super) fn sub_ids_match(
     is_compatible(&row_canon, &target_canon, mode)
 }
 
+/// Append filter day_date BETWEEN + shopee_account_id từ DaysFilter vào SQL
+/// đang build. Pattern lặp 7+ lần trong insights/items — gộp lại 1 chỗ để
+/// thay đổi semantics (vd thêm IN-list account) chỉ cần sửa 1 fn.
+pub(super) fn append_date_account_filters(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    filter: &super::DaysFilter,
+) {
+    if let Some(v) = &filter.from_date {
+        sql.push_str(" AND day_date >= ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.to_date {
+        sql.push_str(" AND day_date <= ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(super::AccountFilterMode::Account { id }) = &filter.account_filter {
+        sql.push_str(" AND shopee_account_id = ?");
+        params.push(Box::new(*id));
+    }
+}
+
+/// Convert `Vec<Box<dyn ToSql>>` → `Vec<&dyn ToSql>` cho `query_map` arg.
+/// Pattern lặp 10+ lần trong query module.
+pub(super) fn params_to_refs(
+    params: &[Box<dyn rusqlite::ToSql>],
+) -> Vec<&dyn rusqlite::ToSql> {
+    params.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect()
+}
+
 /// Đẩy pre-filter sub_id xuống SQL để tận dụng `idx_orders_day_subid`. Logic
 /// pre-filter là điều kiện CẦN của `is_compatible` — Rust vẫn check post-filter
 /// cho chính xác.
