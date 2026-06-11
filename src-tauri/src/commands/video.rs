@@ -992,10 +992,18 @@ const SHOPEE_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(360
 struct ShopeeApiResponse {
     #[serde(default)]
     download_link: Vec<String>,
+    // 4anm.top trả `"error": false` khi success, `"error": "<msg>"` khi fail
+    // → dùng Value để không kẹt parse, rồi extract string qua `error_message()`.
     #[serde(default)]
-    error: Option<String>,
+    error: serde_json::Value,
     #[serde(default)]
     message: Option<String>,
+}
+
+impl ShopeeApiResponse {
+    fn error_message(&self) -> Option<&str> {
+        self.error.as_str().filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1110,8 +1118,7 @@ async fn fetch_shopee(url: &str) -> Result<VideoInfo, String> {
     // khoá bao quát các cách 4anm.top có thể báo lỗi auth.
     let looks_like_token_error = |d: &ShopeeApiResponse| -> bool {
         d.download_link.is_empty()
-            && d.error
-                .as_deref()
+            && d.error_message()
                 .or(d.message.as_deref())
                 .map(|s| {
                     let s = s.to_lowercase();
@@ -1128,7 +1135,8 @@ async fn fetch_shopee(url: &str) -> Result<VideoInfo, String> {
     if data.download_link.is_empty() {
         let msg = data
             .message
-            .or(data.error)
+            .clone()
+            .or_else(|| data.error_message().map(|s| s.to_string()))
             .unwrap_or_else(|| "API 4anm.top không trả URL nào".to_string());
         return Err(format!("Shopee: {}", msg));
     }
