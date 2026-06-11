@@ -1,0 +1,10 @@
+# Cargo runner: thay vì execute target/debug/exe trực tiếp, chuyển qua
+# PowerShell script sign-and-run.ps1. Script sign exe với self-signed cert
+# rồi run. Cách duy nhất "code-only" để workaround Smart App Control / WDAC
+# trên Windows 11 mà không tắt feature.
+#
+# Setup 1 lần (Admin PowerShell): scripts/setup-dev-cert.ps1
+# Sau đó `cargo run` / `npm run tauri dev` sẽ auto-sign mỗi build.
+
+[target.x86_64-pc-windows-msvc]
+runner = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/sign-and-run.ps1"]
