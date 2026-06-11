@@ -9,6 +9,7 @@
 pub mod accounts;
 pub mod app_settings;
 pub mod app_util;
+pub mod apps_script;
 pub mod batch;
 pub mod db_transfer;
 pub mod device;

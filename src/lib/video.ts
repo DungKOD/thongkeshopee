@@ -19,14 +19,20 @@ export function listVideoDownloads(
   });
 }
 
+export interface LogVideoResult {
+  sheetOk: boolean;
+  sheetError?: string;
+}
+
 /**
  * Log 1 lần download video — ghi 2 nơi:
  * 1. Local SQLite `video_logs.db` (qua Tauri command) — bắt buộc thành công,
  *    nếu fail thì throw để caller biết.
  * 2. Google Sheet (qua Apps Script `logVideoDownload` action) — best-effort,
- *    sync theo tab tên = email local-part. Lỗi mạng/auth chỉ log warning,
- *    KHÔNG throw — để 1 lần lỗi Sheet không khiến user thấy "tải fail" trong
- *    khi file đã có trên đĩa.
+ *    sync theo tab tên = email local-part. Lỗi mạng/auth/config được trả về
+ *    qua `sheetOk: false` + `sheetError` (KHÔNG throw) — để 1 lần lỗi Sheet
+ *    không khiến user thấy "tải fail" trong khi file đã có trên đĩa, nhưng
+ *    caller vẫn biết để show toast/notice thay vì im lặng.
  *
  * Apps Script upsert theo URL: cùng 1 video tải lại nhiều lần chỉ có 1 row
  * (giữ status + timestamp mới nhất). Đồng nhất với behavior local DB
@@ -35,7 +41,7 @@ export function listVideoDownloads(
 export async function logVideoDownload(
   videoUrl: string,
   status: "success" | "failed",
-): Promise<void> {
+): Promise<LogVideoResult> {
   await invoke<void>("log_video_download", {
     url: videoUrl,
     status,
@@ -46,7 +52,10 @@ export async function logVideoDownload(
       videoStatus: status,
       videoTimestamp: formatVnTimestamp(new Date()),
     });
+    return { sheetOk: true };
   } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
     console.warn("[video] sync log lên Google Sheet thất bại:", e);
+    return { sheetOk: false, sheetError: msg };
   }
 }

@@ -73,6 +73,7 @@ pub fn run() {
             commands::video::download_video,
             commands::video::log_video_download,
             commands::video::list_video_downloads,
+            commands::apps_script::proxy_apps_script,
             commands::app_util::restart_app,
             commands::app_util::get_app_data_paths,
             commands::app_util::clear_app_data,

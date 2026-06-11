@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
@@ -8,6 +8,7 @@ import {
   type VideoDownloadLog,
 } from "../lib/video";
 import { fmtBytes, fmtHistoryTime } from "../formulas";
+import { useToast } from "./ToastProvider";
 
 interface VideoInfo {
   title: string;
@@ -93,6 +94,22 @@ export function DownloadVideoPage() {
   const [history, setHistory] = useState<VideoDownloadLog[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
+  const { showToast } = useToast();
+  // Chỉ show toast 1 lần/session để không spam — khi sync nhiều video cùng lúc
+  // mà Sheet down, user chỉ cần biết 1 lần là đủ.
+  const sheetWarnedRef = useRef(false);
+  const warnSheetOnce = useCallback(
+    (err: string) => {
+      if (sheetWarnedRef.current) return;
+      sheetWarnedRef.current = true;
+      showToast({
+        message: `Lưu log lên Google Sheet thất bại: ${err}. File vẫn được tải về máy bình thường.`,
+        duration: 8000,
+      });
+    },
+    [showToast],
+  );
+
   const refreshHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
@@ -155,7 +172,9 @@ export function DownloadVideoPage() {
           i.id === item.id ? { ...i, status: "done", progress: null } : i,
         ),
       );
-      void logVideoDownload(item.url, "success").catch(() => {});
+      logVideoDownload(item.url, "success").then((r) => {
+        if (!r.sheetOk) warnSheetOnce(r.sheetError ?? "unknown");
+      });
     } catch (e) {
       setItems((prev) =>
         prev.map((i) =>
@@ -164,11 +183,13 @@ export function DownloadVideoPage() {
             : i,
         ),
       );
-      void logVideoDownload(item.url, "failed").catch(() => {});
+      logVideoDownload(item.url, "failed").then((r) => {
+        if (!r.sheetOk) warnSheetOnce(r.sheetError ?? "unknown");
+      });
     } finally {
       setDownloadingCount((n) => n - 1);
     }
-  }, []);
+  }, [warnSheetOnce]);
 
   const fetchOne = useCallback(async (item: BatchItem) => {
     setItems((prev) =>
@@ -183,16 +204,20 @@ export function DownloadVideoPage() {
           i.id === item.id ? { ...i, status: "ready", info } : i,
         ),
       );
-      void logVideoDownload(item.url, "success").catch(() => {});
+      logVideoDownload(item.url, "success").then((r) => {
+        if (!r.sheetOk) warnSheetOnce(r.sheetError ?? "unknown");
+      });
     } catch (e) {
       setItems((prev) =>
         prev.map((i) =>
           i.id === item.id ? { ...i, status: "failed", error: String(e) } : i,
         ),
       );
-      void logVideoDownload(item.url, "failed").catch(() => {});
+      logVideoDownload(item.url, "failed").then((r) => {
+        if (!r.sheetOk) warnSheetOnce(r.sheetError ?? "unknown");
+      });
     }
-  }, []);
+  }, [warnSheetOnce]);
 
   const handleFetchAll = async () => {
     const urls = parseUrls(urlsText);

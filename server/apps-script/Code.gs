@@ -1,8 +1,13 @@
 /**
  * ThongKe Shopee — Drive proxy + Admin endpoints + Video Log Sheet
  *
- * Deploy as Web App (execute as Me, access Anyone). Client gửi Firebase ID token;
- * script verify qua Firebase REST → thao tác Drive + Google Sheet dưới tài khoản owner.
+ * DEPLOY: Web App, execute as Me, access = "Anyone" (BẮT BUỘC, KHÔNG dùng
+ * "Anyone with Google account"). Auth app-level qua Firebase ID token trong
+ * body — `verifyFirebaseTokenVerbose` gọi Identity Toolkit `accounts:lookup`
+ * verify token rồi mới chạy handler. Lý do KHÔNG dùng "Anyone with Google
+ * account": Bearer Google OAuth TTL ~1h, Firebase `signInWithPopup` không
+ * expose refresh token → hết hạn user phải sign in lại thủ công, UX kém + Email/
+ * Password user không có Bearer luôn → 401 ngay từ HTTP layer.
  *
  * CONFIG: hardcoded dưới đây. Có thể override qua Script Properties nếu cần
  * (Project Settings → Script Properties → add key cùng tên).
@@ -31,7 +36,7 @@ const CONFIG_DEFAULTS = {
 const DB_FILENAME_SUFFIX = '.db';
 const MIME_SQLITE = 'application/vnd.sqlite3';
 
-const VIDEO_LOG_SHEET_ID = '1LcUA9kQRhWl_Hq7qi_fJ8zgTfUSneRzxNAEcm1iiYLI';
+const VIDEO_LOG_SHEET_ID = '1jF36B3wUJeT71toAu0f3L11i5avD21wsLaCIErjYrQE';
 const VIDEO_LOG_HEADER = ['Thời gian', 'Link', 'Trạng thái'];
 
 function doPost(e) {
@@ -42,8 +47,9 @@ function doPost(e) {
     if (!idToken) return jsonError(401, 'Missing idToken');
     if (!action) return jsonError(400, 'Missing action');
 
-    const user = verifyFirebaseToken(idToken);
-    if (!user) return jsonError(401, 'Invalid token');
+    const verifyResult = verifyFirebaseTokenVerbose(idToken);
+    if (!verifyResult.ok) return jsonError(401, 'Invalid token: ' + verifyResult.reason);
+    const user = verifyResult.user;
 
     switch (action) {
       case 'checkOrCreate':
@@ -114,6 +120,16 @@ function doGet() {
  * Trả về {uid, email} nếu hợp lệ, null nếu không.
  */
 function verifyFirebaseToken(idToken) {
+  const r = verifyFirebaseTokenVerbose(idToken);
+  return r.ok ? r.user : null;
+}
+
+/**
+ * Verbose verify — trả `{ok, user}` hoặc `{ok:false, reason}`. Reason chi tiết
+ * để debug 401: API key sai project, token expired, restriction block,
+ * Identity Toolkit chưa enable, v.v.
+ */
+function verifyFirebaseTokenVerbose(idToken) {
   const apiKey = getProp_('FIREBASE_API_KEY');
   const url =
     'https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' + apiKey;
@@ -125,14 +141,30 @@ function verifyFirebaseToken(idToken) {
     muteHttpExceptions: true,
   });
 
-  if (res.getResponseCode() !== 200) return null;
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code !== 200) {
+    // Trả 200 chars đầu của response để user thấy lý do (vd
+    // "API_KEY_INVALID", "TOKEN_EXPIRED", "API key has IP restriction", ...).
+    return { ok: false, reason: 'IDP ' + code + ': ' + text.slice(0, 200) };
+  }
 
-  const data = JSON.parse(res.getContentText());
-  if (!data.users || data.users.length === 0) return null;
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, reason: 'IDP body parse fail: ' + text.slice(0, 200) };
+  }
+
+  if (!data.users || data.users.length === 0) {
+    return { ok: false, reason: 'IDP empty users array' };
+  }
 
   const u = data.users[0];
-  if (!u.localId || !u.email) return null;
-  return { uid: u.localId, email: u.email };
+  if (!u.localId || !u.email) {
+    return { ok: false, reason: 'IDP user missing localId/email' };
+  }
+  return { ok: true, user: { uid: u.localId, email: u.email } };
 }
 
 /**
@@ -779,18 +811,25 @@ function handleDeleteUserVideoLogSheet(user, idToken, targetUid, targetLocalPart
 
 // ============================================================
 // Daily stats — tab `{localPart}_stats` cùng Spreadsheet
-// Cột: Ngày | Tiền ads | Hoa hồng | Lãi | Cập nhật lúc
-// Upsert theo Ngày, sort DESC sau mỗi batch.
+// Cột: Ngày | Account | Tiền ads | Hoa hồng | Lãi | Cập nhật lúc
+// Upsert composite key (Ngày, Account). Sort (Ngày DESC, Account ASC).
+// Account sentinel: "Tất cả" = tổng cross-account, "FB chung" = FB ad
+// attribute cho ≥2 Shopee owner cùng ngày, còn lại = tên account thật.
 // ============================================================
 
-const DAILY_STATS_HEADER = ['Ngày', 'Tiền ads', 'Hoa hồng', 'Lãi', 'Cập nhật lúc'];
+const DAILY_STATS_HEADER = ['Ngày', 'Account', 'Tiền ads', 'Hoa hồng', 'Lãi', 'Cập nhật lúc'];
 const DAILY_STATS_TAB_SUFFIX = '_stats';
+const DAILY_STATS_NUM_COLS = 6;
+const DAILY_STATS_ALL_LABEL = 'Tất cả';
 
 /**
  * Get-or-create tab daily stats cho user. Tên tab = localPart + suffix
  * `_stats`. Ownership guard qua developer metadata `owner_uid` (giống
  * pattern của video log) — cross-provider same-local-part bị reject sạch
  * thay vì ghi đè im lặng.
+ *
+ * Tự migrate tab cũ (5 cột không Account) → 6 cột bằng cách insert column
+ * B + fill "Tất cả" cho rows cũ.
  */
 function getOrCreateDailyStatsSheet_(user) {
   const ss = SpreadsheetApp.openById(VIDEO_LOG_SHEET_ID);
@@ -800,33 +839,58 @@ function getOrCreateDailyStatsSheet_(user) {
   let sheet = ss.getSheetByName(tabName);
   if (sheet) {
     const claimed = getSheetOwnerUid_(sheet);
-    if (!claimed) {
-      setSheetOwnerUid_(sheet, user.uid);
-      return sheet;
+    if (claimed && claimed !== user.uid) {
+      throw new Error(
+        'COLLISION: tab "' + tabName + '" đã thuộc user khác (uid=' + claimed + ').',
+      );
     }
-    if (claimed === user.uid) return sheet;
-    throw new Error(
-      'COLLISION: tab "' + tabName + '" đã thuộc user khác (uid=' + claimed + ').',
-    );
+    if (!claimed) setSheetOwnerUid_(sheet, user.uid);
+    migrateDailyStatsSheetIfNeeded_(sheet);
+    return sheet;
   }
 
   sheet = ss.insertSheet(tabName);
   setSheetOwnerUid_(sheet, user.uid);
+  writeDailyStatsHeader_(sheet);
+  return sheet;
+}
+
+function writeDailyStatsHeader_(sheet) {
   sheet
     .getRange(1, 1, 1, DAILY_STATS_HEADER.length)
     .setValues([DAILY_STATS_HEADER])
     .setFontWeight('bold');
   sheet.setFrozenRows(1);
   sheet.setColumnWidth(1, 110); // Ngày
-  sheet.setColumnWidth(2, 140); // Tiền ads
-  sheet.setColumnWidth(3, 140); // Hoa hồng
-  sheet.setColumnWidth(4, 140); // Lãi
-  sheet.setColumnWidth(5, 180); // Cập nhật lúc
-  // Number format cho cột B/C/D với hậu tố "đ" (VND). E giữ text (timestamp).
-  sheet.getRange('B:D').setNumberFormat('#,##0 "đ"');
-  sheet.getRange('A:A').setNumberFormat('@'); // ngày dạng YYYY-MM-DD plain text
-  sheet.getRange('E:E').setNumberFormat('@');
-  return sheet;
+  sheet.setColumnWidth(2, 140); // Account
+  sheet.setColumnWidth(3, 140); // Tiền ads
+  sheet.setColumnWidth(4, 140); // Hoa hồng
+  sheet.setColumnWidth(5, 140); // Lãi
+  sheet.setColumnWidth(6, 180); // Cập nhật lúc
+  // C/D/E (Tiền ads / Hoa hồng / Lãi) format VND. A/B/F giữ text.
+  sheet.getRange('C:E').setNumberFormat('#,##0 "đ"');
+  sheet.getRange('A:B').setNumberFormat('@');
+  sheet.getRange('F:F').setNumberFormat('@');
+}
+
+/**
+ * Migrate tab 5-col cũ → 6-col mới. Nhận biết qua header B: nếu khác
+ * 'Account' → insert column B + fill "Tất cả" cho mọi row data hiện có.
+ * Idempotent — chạy nhiều lần không hại.
+ */
+function migrateDailyStatsSheetIfNeeded_(sheet) {
+  const headerB = String(sheet.getRange(1, 2).getValue() || '');
+  if (headerB === 'Account') return;
+
+  sheet.insertColumnBefore(2);
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    const n = lastRow - 1;
+    const fill = [];
+    for (let i = 0; i < n; i++) fill.push([DAILY_STATS_ALL_LABEL]);
+    sheet.getRange(2, 2, n, 1).setValues(fill);
+  }
+  writeDailyStatsHeader_(sheet);
 }
 
 function nowVnTimestamp_() {
@@ -840,11 +904,12 @@ function nowVnTimestamp_() {
 
 /**
  * Batch upsert daily stats. Input `rows` là mảng
- * `[{date, spend, commission, profit}, ...]`. Số được round int (đ) phía
- * client trước khi gửi.
+ * `[{date, account, spend, commission, profit}, ...]`. Số được round int (đ)
+ * phía client trước khi gửi.
  *
- * Upsert theo cột A (Ngày): row tồn tại → setValues đè; chưa có → appendRow.
- * Sau khi xong, sort DESC theo cột A để view newest-first trong Sheet.
+ * Upsert composite key (date, account): row tồn tại → setValues đè; chưa có
+ * → appendRow. Sau khi xong, sort (Ngày DESC, Account ASC) để Sheet view
+ * newest-first và account grouping liền nhau trong cùng ngày.
  */
 function handleLogDailyStatsBatch(user, rows) {
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -854,14 +919,15 @@ function handleLogDailyStatsBatch(user, rows) {
   const sheet = getOrCreateDailyStatsSheet_(user);
   const updatedAt = nowVnTimestamp_();
 
-  // Build map date → 1-based row index từ data hiện tại.
+  // Build map "date|account" → 1-based row index từ data hiện tại.
   const lastRow = sheet.getLastRow();
   const existingMap = {};
   if (lastRow > 1) {
-    const dates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
-    for (let i = 0; i < dates.length; i++) {
-      const d = String(dates[i][0] || '');
-      if (d) existingMap[d] = i + 2;
+    const keys = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+    for (let i = 0; i < keys.length; i++) {
+      const d = String(keys[i][0] || '');
+      const a = String(keys[i][1] || '');
+      if (d && a) existingMap[d + '|' + a] = i + 2;
     }
   }
 
@@ -869,13 +935,15 @@ function handleLogDailyStatsBatch(user, rows) {
   let inserted = 0;
   rows.forEach(function (r) {
     const date = String(r.date || '');
-    if (!date) return;
+    const account = String(r.account || '');
+    if (!date || !account) return;
     const spend = Number(r.spend) || 0;
     const commission = Number(r.commission) || 0;
     const profit = Number(r.profit) || 0;
-    const values = [[date, spend, commission, profit, updatedAt]];
-    if (existingMap[date]) {
-      sheet.getRange(existingMap[date], 1, 1, 5).setValues(values);
+    const values = [[date, account, spend, commission, profit, updatedAt]];
+    const key = date + '|' + account;
+    if (existingMap[key]) {
+      sheet.getRange(existingMap[key], 1, 1, DAILY_STATS_NUM_COLS).setValues(values);
       upserted++;
     } else {
       sheet.appendRow(values[0]);
@@ -883,11 +951,15 @@ function handleLogDailyStatsBatch(user, rows) {
     }
   });
 
-  // Sort theo Ngày DESC để Sheet view newest-first. Rẻ vì < vài nghìn rows.
+  // Sort (Ngày DESC, Account ASC) để Sheet view newest-first và account
+  // grouping liền nhau trong cùng ngày. Rẻ vì < vài nghìn rows.
   if (sheet.getLastRow() > 2) {
     sheet
-      .getRange(2, 1, sheet.getLastRow() - 1, 5)
-      .sort({ column: 1, ascending: false });
+      .getRange(2, 1, sheet.getLastRow() - 1, DAILY_STATS_NUM_COLS)
+      .sort([
+        { column: 1, ascending: false },
+        { column: 2, ascending: true },
+      ]);
   }
 
   return jsonOk({ upserted: upserted, inserted: inserted });
