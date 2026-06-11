@@ -7,7 +7,8 @@ import {
   useRef,
   useState,
 } from "react";
-import { ShortcutButton, TabButton } from "./components/AppShellButtons";
+import { AppTabsNav } from "./components/AppTabsNav";
+import { AppFilterShortcuts } from "./components/AppFilterShortcuts";
 import { SplashScreen } from "./components/SplashScreen";
 import { DayBlock } from "./components/DayBlock";
 import { OverviewTab } from "./components/OverviewTab";
@@ -490,32 +491,7 @@ function AppInner() {
           </div>
         </div>
 
-        <nav className="flex gap-1 px-6">
-          <TabButton
-            active={activeTab === "stats"}
-            onClick={() => setActiveTab("stats")}
-            icon="analytics"
-            label="Thống kê"
-          />
-          <TabButton
-            active={activeTab === "overview"}
-            onClick={() => setActiveTab("overview")}
-            icon="insights"
-            label="Tổng quan"
-          />
-          <TabButton
-            active={activeTab === "download"}
-            onClick={() => setActiveTab("download")}
-            icon="download"
-            label="Download video"
-          />
-          <TabButton
-            active={activeTab === "upload"}
-            onClick={() => setActiveTab("upload")}
-            icon="upload"
-            label="Upload Page"
-          />
-        </nav>
+        <AppTabsNav activeTab={activeTab} onChange={setActiveTab} />
       </header>
 
       <input
@@ -616,66 +592,15 @@ function AppInner() {
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
-                <div className="flex shrink-0 flex-wrap items-center gap-1">
-                  <ShortcutButton
-                    active={
-                      filterMode.type === "recent" &&
-                      !filterMode.canExpand &&
-                      filterMode.count === 1
-                    }
-                    onClick={() => setRecentDays(1)}
-                  >
-                    Ngày gần nhất
-                  </ShortcutButton>
-                  <ShortcutButton
-                    active={
-                      filterMode.type === "recent" &&
-                      !filterMode.canExpand &&
-                      filterMode.count === 7
-                    }
-                    onClick={() => setRecentDays(7)}
-                  >
-                    7 ngày
-                  </ShortcutButton>
-                  <ShortcutButton
-                    active={
-                      filterMode.type === "recent" &&
-                      !filterMode.canExpand &&
-                      filterMode.count === 14
-                    }
-                    onClick={() => setRecentDays(14)}
-                  >
-                    14 ngày
-                  </ShortcutButton>
-                  <ShortcutButton
-                    active={
-                      filterMode.type === "recent" &&
-                      !filterMode.canExpand &&
-                      filterMode.count === 30
-                    }
-                    onClick={() => setRecentDays(30)}
-                  >
-                    30 ngày
-                  </ShortcutButton>
-                  <ShortcutButton
-                    active={isPrevMonthActive}
-                    onClick={setPrevMonth}
-                  >
-                    Tháng trước
-                  </ShortcutButton>
-                  <ShortcutButton
-                    active={isCurrentMonthActive}
-                    onClick={setCurrentMonth}
-                  >
-                    Tháng này
-                  </ShortcutButton>
-                  <ShortcutButton
-                    active={filterMode.type === "all"}
-                    onClick={setAllTime}
-                  >
-                    Từ trước đến nay
-                  </ShortcutButton>
-                </div>
+                <AppFilterShortcuts
+                  filterMode={filterMode}
+                  isPrevMonthActive={isPrevMonthActive}
+                  isCurrentMonthActive={isCurrentMonthActive}
+                  setRecentDays={setRecentDays}
+                  setPrevMonth={setPrevMonth}
+                  setCurrentMonth={setCurrentMonth}
+                  setAllTime={setAllTime}
+                />
 
                 <span className="hidden h-6 w-px bg-surface-8 md:inline-block" />
 
