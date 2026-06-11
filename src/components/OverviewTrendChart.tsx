@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -58,7 +58,9 @@ const GRANULARITY_LABEL: Record<TrendGranularity, string> = {
  * - Mode "finance": cột spend (đỏ cam) + cột netCommission (xanh dương) + đường profit (xanh lá / đỏ theo tone).
  * - Mode "roi": đường ROI % với reference line 0% (breakeven). Tô area xanh nếu >0, đỏ nếu <0 qua coloring stroke.
  */
-export function OverviewTrendChart({ data, cumulative, showAds }: Props) {
+export const OverviewTrendChart = memo(OverviewTrendChartInner);
+
+function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
   const [mode, setMode] = useState<ChartMode>("finance");
 
   // Granularity: data nhiều ngày (>31) → auto gom tuần/tháng. User vẫn có

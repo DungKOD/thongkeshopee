@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -14,8 +16,24 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { RulesDialog } from "./components/RulesDialog";
 import { PendingChangesBar } from "./components/PendingChangesBar";
 import { ImportPreviewDialog } from "./components/ImportPreviewDialog";
-import { DownloadVideoPage } from "./components/DownloadVideoPage";
-import { UploadVideoPage } from "./components/UploadVideoPage";
+
+// Lazy-load các tab/dialog nặng (video API, calculator, html-to-image) — chỉ
+// fetch chunk khi user thực sự mở, giảm initial bundle.
+const DownloadVideoPage = lazy(() =>
+  import("./components/DownloadVideoPage").then((m) => ({
+    default: m.DownloadVideoPage,
+  })),
+);
+const UploadVideoPage = lazy(() =>
+  import("./components/UploadVideoPage").then((m) => ({
+    default: m.UploadVideoPage,
+  })),
+);
+const SmartCalculator = lazy(() =>
+  import("./components/SmartCalculator").then((m) => ({
+    default: m.SmartCalculator,
+  })),
+);
 import { useDbStats, todayIso, type DaysFilter } from "./hooks/useDbStats";
 import {
   LOAD_MORE_STEP,
@@ -48,8 +66,18 @@ import { PremiumLockedScreen } from "./components/PremiumLockedScreen";
 import { isPremiumActive } from "./lib/userProfile";
 import { UserMenu } from "./components/UserMenu";
 import { DevCredit } from "./components/DevCredit";
-import { SmartCalculator } from "./components/SmartCalculator";
 import "./App.css";
+
+function LazyTabFallback() {
+  return (
+    <div className="mx-auto flex max-w-xl flex-col items-center gap-3 py-16 text-center text-white/60">
+      <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">
+        sync
+      </span>
+      <span className="text-sm">Đang tải...</span>
+    </div>
+  );
+}
 
 function AppInner() {
   const { signOut: authSignOut } = useAuth();
@@ -500,9 +528,13 @@ function AppInner() {
 
       <div className="p-6">
         {activeTab === "download" ? (
-          <DownloadVideoPage />
+          <Suspense fallback={<LazyTabFallback />}>
+            <DownloadVideoPage />
+          </Suspense>
         ) : activeTab === "upload" ? (
-          <UploadVideoPage />
+          <Suspense fallback={<LazyTabFallback />}>
+            <UploadVideoPage />
+          </Suspense>
         ) : loading ? (
           <div className="mx-auto flex max-w-xl flex-col items-center gap-3 py-16 text-center text-white/60">
             <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">
@@ -922,10 +954,11 @@ function AppInner() {
         onCancel={clearPending}
       />
 
-      <SmartCalculator
-        isOpen={calcOpen}
-        onClose={() => setCalcOpen(false)}
-      />
+      {calcOpen && (
+        <Suspense fallback={null}>
+          <SmartCalculator isOpen={calcOpen} onClose={() => setCalcOpen(false)} />
+        </Suspense>
+      )}
       <DevCredit variant="floating" />
     </main>
   );

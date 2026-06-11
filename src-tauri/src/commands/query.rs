@@ -37,7 +37,7 @@ pub fn db_ping(state: State<'_, DbState>) -> CmdResult<i64> {
 #[tauri::command]
 pub fn list_days(state: State<'_, DbState>) -> CmdResult<Vec<String>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let mut stmt = conn.prepare("SELECT date FROM days ORDER BY date DESC")?;
+    let mut stmt = conn.prepare_cached("SELECT date FROM days ORDER BY date DESC")?;
     let rows: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
@@ -169,7 +169,7 @@ fn list_days_with_rows_impl(
         params_vec.push(Box::new(v.max(0)));
     }
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let params_refs: Vec<&dyn rusqlite::ToSql> =
         params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
     let days: Vec<(String, Option<String>)> = stmt
@@ -199,7 +199,7 @@ fn list_days_with_rows_impl(
     let match_mode = read_sub_id_match_mode(conn);
     let default_id = default_account_id_lookup(conn);
     let account_names: HashMap<i64, String> = {
-        let mut stmt = conn.prepare("SELECT id, name FROM shopee_accounts")?;
+        let mut stmt = conn.prepare_cached("SELECT id, name FROM shopee_accounts")?;
         let iter = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         iter.collect::<rusqlite::Result<HashMap<_, _>>>()?
     };
@@ -1030,7 +1030,7 @@ fn batch_fetch_fb_ads(
          WHERE (CASE level WHEN 'ad_group' THEN 0 ELSE 1 END) = preferred_rank
          GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5",
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let iter = stmt.query_map(date_params, |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1068,7 +1068,7 @@ fn batch_fetch_fb_hier(
          FROM raw_fb_ads_hierarchy
          WHERE day_date IN ({placeholders})",
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let iter = stmt.query_map(date_params, |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1119,7 +1119,7 @@ fn batch_fetch_shopee_clicks(
         extra_params.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
     all_params.extend(extra_refs.iter().copied());
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let iter = stmt.query_map(all_params.as_slice(), |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1174,7 +1174,7 @@ fn batch_fetch_shopee_orders(
         extra_params.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
     all_params.extend(extra_refs.iter().copied());
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let iter = stmt.query_map(all_params.as_slice(), |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1223,7 +1223,7 @@ fn batch_fetch_manuals(
         extra_params.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
     all_params.extend(extra_refs.iter().copied());
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let iter = stmt.query_map(all_params.as_slice(), |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1267,7 +1267,7 @@ fn batch_fetch_all_account_owner_pairs(
     // date_params must be doubled for both IN clauses.
     let doubled: Vec<&dyn rusqlite::ToSql> =
         date_params.iter().copied().chain(date_params.iter().copied()).collect();
-    let mut stmt = conn.prepare(&hard_sql)?;
+    let mut stmt = conn.prepare_cached(&hard_sql)?;
     let iter = stmt.query_map(doubled.as_slice(), |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1286,7 +1286,7 @@ fn batch_fetch_all_account_owner_pairs(
                 COALESCE(shopee_account_id, 0)
          FROM raw_shopee_clicks WHERE day_date IN ({placeholders})",
     );
-    let mut stmt2 = conn.prepare(&click_sql)?;
+    let mut stmt2 = conn.prepare_cached(&click_sql)?;
     let iter2 = stmt2.query_map(date_params, |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1304,7 +1304,7 @@ fn batch_fetch_all_account_owner_pairs(
         "SELECT DISTINCT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
          FROM raw_shopee_order_items WHERE day_date IN ({placeholders})",
     );
-    let mut stmt3 = conn.prepare(&anchor_sql)?;
+    let mut stmt3 = conn.prepare_cached(&anchor_sql)?;
     let iter3 = stmt3.query_map(date_params, |r| {
         let day_date: String = r.get(0)?;
         let tuple: [String; 5] = [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
@@ -1433,23 +1433,24 @@ pub fn list_imported_files(state: State<'_, DbState>) -> CmdResult<Vec<ImportedF
     // v10: JOIN shopee_accounts để trả account_name + thêm reverted_at cho
     // FE phân biệt active vs đã hoàn tác. active_rows = SUM mapping (cần để
     // user biết bao nhiêu row thực tế còn active sau khi file khác revert).
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.filename, f.kind, f.imported_at, f.row_count, f.day_date,
+    // v10.3: gộp 4 correlated subquery COUNT(*) thành 1 UNION ALL + GROUP BY.
+    // Subquery cũ chạy 4×N lookup khi mở dialog import history; phiên bản này
+    // scan từng mapping table 1 lần rồi LEFT JOIN trên file_id.
+    let mut stmt = conn.prepare_cached(
+        "WITH mapping_counts AS (
+             SELECT file_id, COUNT(*) AS cnt FROM (
+                 SELECT file_id FROM clicks_to_file
+                 UNION ALL SELECT file_id FROM orders_to_file
+                 UNION ALL SELECT file_id FROM fb_ads_to_file
+                 UNION ALL SELECT file_id FROM fb_ads_hier_to_file
+             ) GROUP BY file_id
+         )
+         SELECT f.id, f.filename, f.kind, f.imported_at, f.row_count, f.day_date,
                 f.reverted_at, sa.name AS account_name,
-                COALESCE(
-                    (SELECT COUNT(*) FROM clicks_to_file WHERE file_id = f.id), 0
-                ) +
-                COALESCE(
-                    (SELECT COUNT(*) FROM orders_to_file WHERE file_id = f.id), 0
-                ) +
-                COALESCE(
-                    (SELECT COUNT(*) FROM fb_ads_to_file WHERE file_id = f.id), 0
-                ) +
-                COALESCE(
-                    (SELECT COUNT(*) FROM fb_ads_hier_to_file WHERE file_id = f.id), 0
-                ) AS active_rows
+                COALESCE(mc.cnt, 0) AS active_rows
          FROM imported_files f
          LEFT JOIN shopee_accounts sa ON sa.id = f.shopee_account_id
+         LEFT JOIN mapping_counts mc ON mc.file_id = f.id
          ORDER BY f.imported_at DESC",
     )?;
     let rows: Vec<ImportedFileInfo> = stmt
@@ -1527,7 +1528,7 @@ fn load_overview_impl(conn: &Connection) -> CmdResult<OverviewPayload> {
     // 1. manual_entries — nguồn chính của tên sản phẩm do user đặt.
     // a) Explicit display_name (user-set label).
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT display_name FROM manual_entries
              WHERE display_name IS NOT NULL AND display_name != ''",
         )?;
@@ -1538,7 +1539,7 @@ fn load_overview_impl(conn: &Connection) -> CmdResult<OverviewPayload> {
     // b) Sub_id derived names (khi không có display_name — standard case).
     // Build canonical bằng cách join các sub_id không rỗng, giống default_name().
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
              FROM manual_entries",
         )?;
@@ -1567,7 +1568,7 @@ fn load_overview_impl(conn: &Connection) -> CmdResult<OverviewPayload> {
     // sub_id columns trực tiếp để cover trường hợp sub_id nằm ở ad_name (không
     // phải campaign_name). Campaign_name vẫn thêm vào để user tìm được theo tên chiến dịch.
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
              FROM raw_fb_ads_hierarchy",
         )?;
@@ -1586,7 +1587,7 @@ fn load_overview_impl(conn: &Connection) -> CmdResult<OverviewPayload> {
                 overview_insert_name(&mut set, &parts.join("-"));
             }
         }
-        let mut stmt2 = conn.prepare(
+        let mut stmt2 = conn.prepare_cached(
             "SELECT DISTINCT campaign_name FROM raw_fb_ads_hierarchy
              WHERE campaign_name != ''",
         )?;
@@ -1598,7 +1599,7 @@ fn load_overview_impl(conn: &Connection) -> CmdResult<OverviewPayload> {
     // Batch query ưu tiên ad_group over campaign cho cùng tuple, nên sub_id của
     // ad_group phải có trong dropdown. Query cả 2 levels qua sub_id columns.
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
              FROM raw_fb_ads",
         )?;
@@ -1617,7 +1618,7 @@ fn load_overview_impl(conn: &Connection) -> CmdResult<OverviewPayload> {
                 overview_insert_name(&mut set, &parts.join("-"));
             }
         }
-        let mut stmt2 = conn.prepare(
+        let mut stmt2 = conn.prepare_cached(
             "SELECT DISTINCT name FROM raw_fb_ads WHERE name != ''",
         )?;
         for name in stmt2.query_map([], |r| r.get::<_, String>(0))? {
@@ -1679,7 +1680,7 @@ fn overview_insert_name(set: &mut HashSet<String>, name: &str) {
 #[tauri::command]
 pub fn list_click_referrers(state: State<'_, DbState>) -> CmdResult<Vec<String>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT COALESCE(referrer, '(khác)') FROM raw_shopee_clicks
          ORDER BY 1",
     )?;
@@ -1742,17 +1743,17 @@ pub fn get_order_items_for_row(
          FROM raw_shopee_order_items
          WHERE day_date = ?",
     );
-    if account_id_filter.is_some() {
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(day_date.clone())];
+    if let Some(id) = account_id_filter {
         sql.push_str(" AND shopee_account_id = ?");
+        params_vec.push(Box::new(id));
     }
+    // Pre-filter sub_id ở SQL để tận dụng idx_orders_day_subid; Rust vẫn check
+    // post-filter cho bi-directional prefix / Substring chính xác.
+    let target_subs = canonical_to_array(&target_canonical);
+    append_subid_prefilter(&mut sql, &mut params_vec, &target_subs, match_mode);
     sql.push_str(" ORDER BY order_time DESC");
-    let mut stmt = conn.prepare(&sql)?;
-
-    let params_vec: Vec<Box<dyn rusqlite::ToSql>> = if let Some(id) = account_id_filter {
-        vec![Box::new(day_date.clone()), Box::new(id)]
-    } else {
-        vec![Box::new(day_date.clone())]
-    };
+    let mut stmt = conn.prepare_cached(&sql)?;
     let params_refs: Vec<&dyn rusqlite::ToSql> =
         params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
 
@@ -1808,6 +1809,35 @@ fn sub_ids_match(
     is_compatible(&row_canon, &target_canon, mode)
 }
 
+/// Đẩy pre-filter sub_id xuống SQL để tận dụng `idx_orders_day_subid`. Logic
+/// pre-filter là điều kiện CẦN của `is_compatible` — Rust vẫn check post-filter
+/// cho chính xác.
+///
+/// - Exact + target rỗng: SQL đủ chính xác (5 cột = ''), Rust check vẫn pass.
+/// - Exact + target non-empty: SQL filter `sub_id1 = target[0]` (cả 2 chiều
+///   prefix đều bắt buộc slot 0 match).
+/// - Substring: không pre-filter (substring không đảm bảo slot 0 match).
+fn append_subid_prefilter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    target: &[String; 5],
+    mode: SubIdMatchMode,
+) {
+    if mode == SubIdMatchMode::Substring {
+        return;
+    }
+    let canon = to_canonical(target.clone());
+    if canon.is_empty() {
+        sql.push_str(
+            " AND sub_id1 = '' AND sub_id2 = '' AND sub_id3 = '' \
+             AND sub_id4 = '' AND sub_id5 = ''",
+        );
+    } else {
+        sql.push_str(" AND sub_id1 = ?");
+        params.push(Box::new(canon[0].clone()));
+    }
+}
+
 /// Phân bố đơn theo giờ trong ngày (0-23) — aggregate toàn bộ orders trong
 /// khoảng filter. Giúp user biết giờ nào buy nhiều → tối ưu đăng bài, run ads.
 ///
@@ -1859,7 +1889,7 @@ pub fn load_hourly_orders(
         }
         sql.push_str(" GROUP BY hour ORDER BY hour ASC");
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
             .iter()
             .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -1902,8 +1932,9 @@ pub fn load_hourly_orders(
         sql.push_str(" AND shopee_account_id = ?");
         params_vec.push(Box::new(*id));
     }
+    append_subid_prefilter(&mut sql, &mut params_vec, &target, match_mode);
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -2012,7 +2043,7 @@ pub fn load_hourly_clicks(
         }
         sql.push_str(" GROUP BY hour ORDER BY hour ASC");
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
             .iter()
             .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -2059,7 +2090,7 @@ pub fn load_hourly_clicks(
         sql.push_str(" AND shopee_account_id = ?");
         params_vec.push(Box::new(*id));
     }
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -2175,7 +2206,7 @@ pub fn load_referrer_efficiency(
          {where_clicks}
          GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, referrer"
     );
-    let mut stmt = conn.prepare(&clicks_sql)?;
+    let mut stmt = conn.prepare_cached(&clicks_sql)?;
     let refs_clicks: Vec<&dyn rusqlite::ToSql> = params_vec
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -2219,7 +2250,7 @@ pub fn load_referrer_efficiency(
          {where_orders}
          GROUP BY click_day, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5"
     );
-    let mut stmt = conn.prepare(&orders_sql)?;
+    let mut stmt = conn.prepare_cached(&orders_sql)?;
     let refs_orders: Vec<&dyn rusqlite::ToSql> = params_orders
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -2466,14 +2497,16 @@ pub fn load_click_order_delays(
         sql.push_str(" AND shopee_account_id = ?");
         params_vec.push(Box::new(*id));
     }
+    let target = f.sub_ids.clone();
+    if let Some(t) = target.as_ref() {
+        append_subid_prefilter(&mut sql, &mut params_vec, t, match_mode);
+    }
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let refs: Vec<&dyn rusqlite::ToSql> = params_vec
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
         .collect();
-
-    let target = f.sub_ids.clone();
     // Distinct orders (1 order nhiều items) — dedupe qua HashMap<order_id, delay>.
     let mut by_order: std::collections::HashMap<String, Option<f64>> =
         std::collections::HashMap::new();
@@ -2612,7 +2645,7 @@ pub fn load_cancellation_by_subid(
          GROUP BY sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, day_date",
     );
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let refs: Vec<&dyn rusqlite::ToSql> = params_vec
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -3411,6 +3444,226 @@ mod tests {
         assert_eq!(row_a.shopee_clicks_total, 0);
 
         assert_eq!(day.totals.shopee_clicks_total, 1);
+    }
+
+    // =====================================================================
+    // Regression tests cho perf optimizations (v0.10.3):
+    // - append_subid_prefilter: pre-filter SQL pushdown cho sub_id matching
+    // - list_imported_files CTE: gộp 4 subquery thành 1 UNION ALL + GROUP BY
+    // =====================================================================
+
+    #[test]
+    fn subid_prefilter_exact_non_empty_pushes_slot0() {
+        let mut sql = String::from("SELECT 1 WHERE 1=1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        append_subid_prefilter(
+            &mut sql,
+            &mut params,
+            &["camp".into(), "x".into(), "".into(), "".into(), "".into()],
+            SubIdMatchMode::Exact,
+        );
+        assert!(sql.ends_with(" AND sub_id1 = ?"));
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn subid_prefilter_exact_empty_locks_all_slots() {
+        let mut sql = String::from("SELECT 1 WHERE 1=1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        append_subid_prefilter(
+            &mut sql,
+            &mut params,
+            &["".into(), "".into(), "".into(), "".into(), "".into()],
+            SubIdMatchMode::Exact,
+        );
+        // Empty target match chỉ empty row → SQL lock 5 cột = ''.
+        assert!(sql.contains("sub_id1 = ''"));
+        assert!(sql.contains("sub_id5 = ''"));
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn subid_prefilter_substring_skips_pushdown() {
+        let mut sql_before = String::from("SELECT 1 WHERE 1=1");
+        let sql_clone = sql_before.clone();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        append_subid_prefilter(
+            &mut sql_before,
+            &mut params,
+            &["dungcamp1".into(), "".into(), "".into(), "".into(), "".into()],
+            SubIdMatchMode::Substring,
+        );
+        // Substring không pushdown → SQL không đổi.
+        assert_eq!(sql_before, sql_clone);
+        assert!(params.is_empty());
+    }
+
+    /// Verify pre-filter là điều kiện CẦN của is_compatible: KHÔNG skip row nào
+    /// thực sự compatible. Seed nhiều order với sub_id khác nhau, target=[a,b];
+    /// chạy SQL với prefilter rồi compare với full-scan + Rust filter.
+    #[test]
+    fn subid_prefilter_exact_does_not_skip_compatible_rows() {
+        let conn = seed_conn();
+        let acc = seed_account(&conn, "TK");
+        let date = "2026-04-20";
+        seed_day(&conn, date);
+        // Rows compatible với target=[a,b] (prefix bi-directional):
+        seed_shopee_order(&conn, date, acc, ["a", "b", "", "", ""], 1, 10.0, 100.0); // = target
+        seed_shopee_order(&conn, date, acc, ["a", "b", "c", "", ""], 2, 10.0, 100.0); // target prefix of row
+        seed_shopee_order(&conn, date, acc, ["a", "", "", "", ""], 3, 10.0, 100.0); // row prefix of target
+        // Rows KHÔNG compatible:
+        seed_shopee_order(&conn, date, acc, ["a", "x", "", "", ""], 4, 10.0, 100.0); // slot 1 khác
+        seed_shopee_order(&conn, date, acc, ["z", "b", "", "", ""], 5, 10.0, 100.0); // slot 0 khác
+        seed_shopee_order(&conn, date, acc, ["", "", "", "", ""], 6, 10.0, 100.0); // empty
+
+        // Pre-filter SQL: count rows passing slot0=a.
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM raw_shopee_order_items WHERE day_date = ?",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(date.to_string())];
+        let target = ["a".to_string(), "b".to_string(), "".into(), "".into(), "".into()];
+        append_subid_prefilter(&mut sql, &mut params, &target, SubIdMatchMode::Exact);
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|b| b.as_ref()).collect();
+        let prefiltered: i64 = conn
+            .query_row(&sql, refs.as_slice(), |r| r.get(0))
+            .unwrap();
+        // Pre-filter giữ 4 row có sub_id1='a' (3 compatible + 1 không compatible "a,x").
+        assert_eq!(prefiltered, 4);
+
+        // Sanity: post-filter Rust giữ đúng 3 compatible.
+        let target_canon = to_canonical(target.clone());
+        let mut stmt = conn
+            .prepare(
+                "SELECT sub_id1, sub_id2, sub_id3, sub_id4, sub_id5
+                 FROM raw_shopee_order_items WHERE day_date = ?",
+            )
+            .unwrap();
+        let rows: Vec<[String; 5]> = stmt
+            .query_map(params![date], |r| {
+                Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?])
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let kept: Vec<_> = rows
+            .into_iter()
+            .filter(|r| {
+                is_compatible(
+                    &to_canonical(r.clone()),
+                    &target_canon,
+                    SubIdMatchMode::Exact,
+                )
+            })
+            .collect();
+        assert_eq!(kept.len(), 3, "expected 3 compatible rows post-filter");
+    }
+
+    #[test]
+    fn subid_prefilter_substring_full_scan_keeps_all_candidates() {
+        let conn = seed_conn();
+        let acc = seed_account(&conn, "TK");
+        let date = "2026-04-20";
+        seed_day(&conn, date);
+        // Substring case: row [dungcamp1] match target [camp1] (slot0 khác!).
+        seed_shopee_order(&conn, date, acc, ["dungcamp1", "", "", "", ""], 1, 10.0, 100.0);
+        seed_shopee_order(&conn, date, acc, ["xyz", "", "", "", ""], 2, 10.0, 100.0);
+
+        // Pre-filter Substring không pushdown → SQL chỉ filter day_date.
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM raw_shopee_order_items WHERE day_date = ?",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(date.to_string())];
+        let target = ["camp1".to_string(), "".into(), "".into(), "".into(), "".into()];
+        append_subid_prefilter(&mut sql, &mut params, &target, SubIdMatchMode::Substring);
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|b| b.as_ref()).collect();
+        let count: i64 = conn
+            .query_row(&sql, refs.as_slice(), |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "Substring mode phải giữ cả 2 row cho Rust check");
+    }
+
+    /// Verify CTE refactor: active_rows = SUM(mapping count). Compare giá trị
+    /// trả về với compute manual từng table riêng.
+    #[test]
+    fn list_imported_files_active_rows_matches_legacy_count() {
+        let conn = seed_conn();
+        let date = "2026-04-20";
+        seed_day(&conn, date);
+
+        // File 1: orders mapping (2 row).
+        let file_orders = seed_imported_file(&conn, "shopee_commission", date);
+        conn.execute(
+            "INSERT INTO orders_to_file(order_item_id, file_id) VALUES(1, ?)",
+            params![file_orders],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO orders_to_file(order_item_id, file_id) VALUES(2, ?)",
+            params![file_orders],
+        )
+        .unwrap();
+
+        // File 2: clicks mapping (3 row).
+        let file_clicks = seed_imported_file(&conn, "shopee_clicks", date);
+        for cid in ["c1", "c2", "c3"] {
+            conn.execute(
+                "INSERT INTO clicks_to_file(click_id, file_id) VALUES(?, ?)",
+                params![cid, file_clicks],
+            )
+            .unwrap();
+        }
+
+        // File 3: fb_ads mapping (1 row) + fb_hier (2 row) → tổng 3.
+        let file_fb = seed_imported_file(&conn, "fb_ad_group", date);
+        conn.execute(
+            "INSERT INTO fb_ads_to_file(fb_ad_id, file_id) VALUES(10, ?)",
+            params![file_fb],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fb_ads_hier_to_file(fb_ad_id, file_id) VALUES(20, ?)",
+            params![file_fb],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fb_ads_hier_to_file(fb_ad_id, file_id) VALUES(21, ?)",
+            params![file_fb],
+        )
+        .unwrap();
+
+        // File 4: không có mapping → active_rows = 0.
+        let file_empty = seed_imported_file(&conn, "shopee_clicks", date);
+
+        // Test trực tiếp CTE SQL (Tauri State API không thuận để construct
+        // trong unit test → query DB-level y hệt SQL trong list_imported_files).
+        let mut stmt = conn
+            .prepare(
+                "WITH mapping_counts AS (
+                     SELECT file_id, COUNT(*) AS cnt FROM (
+                         SELECT file_id FROM clicks_to_file
+                         UNION ALL SELECT file_id FROM orders_to_file
+                         UNION ALL SELECT file_id FROM fb_ads_to_file
+                         UNION ALL SELECT file_id FROM fb_ads_hier_to_file
+                     ) GROUP BY file_id
+                 )
+                 SELECT f.id, COALESCE(mc.cnt, 0) AS active_rows
+                 FROM imported_files f
+                 LEFT JOIN mapping_counts mc ON mc.file_id = f.id
+                 ORDER BY f.id",
+            )
+            .unwrap();
+        let actual: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        let map: std::collections::HashMap<i64, i64> = actual.into_iter().collect();
+        assert_eq!(map[&file_orders], 2);
+        assert_eq!(map[&file_clicks], 3);
+        assert_eq!(map[&file_fb], 3); // 1 fb_ads + 2 fb_hier
+        assert_eq!(map[&file_empty], 0);
     }
 
     // ========================================================================

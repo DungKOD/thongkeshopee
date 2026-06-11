@@ -1,3 +1,4 @@
+import { memo } from "react";
 import {
   Bar,
   BarChart,
@@ -32,7 +33,9 @@ interface ReferrerEfficiencyTableProps {
 /// Bảng referrer leaderboard sắp theo CR (quality signal cho ads).
 /// Khác "top referrers" chỉ count clicks — cái này show orders + commission
 /// + CR để xác định referrer nào bring revenue thực sự.
-export function ReferrerEfficiencyTable({
+export const ReferrerEfficiencyTable = memo(ReferrerEfficiencyTableInner);
+
+function ReferrerEfficiencyTableInner({
   rows,
   fees,
 }: ReferrerEfficiencyTableProps) {
@@ -165,7 +168,9 @@ const BUCKET_COLOR: Record<string, string> = {
 
 /// Histogram thời gian từ click → đặt hàng. Biểu đồ phân bố để hiểu user
 /// behavior: impulse (<1h) vs consider (>24h) → tune retargeting window.
-export function ClickDelayChart({ data }: { data: DelayBucket[] }) {
+export const ClickDelayChart = memo(ClickDelayChartInner);
+
+function ClickDelayChartInner({ data }: { data: DelayBucket[] }) {
   const total = data.reduce((s, b) => s + b.orders, 0);
   if (total === 0) {
     return (

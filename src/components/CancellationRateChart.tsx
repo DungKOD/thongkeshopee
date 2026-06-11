@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -61,7 +61,9 @@ const COLOR_CANCELLED = "#ef4444";
 const COLOR_DANGER_HIGH = "#dc2626";
 const COLOR_WARNING = "#f59e0b";
 
-export function CancellationRateChart({
+export const CancellationRateChart = memo(CancellationRateChartInner);
+
+function CancellationRateChartInner({
   data,
   minOrdersDefault = 5,
   topNDefault = 15,

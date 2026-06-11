@@ -243,71 +243,79 @@ export function OverviewTab({
 
     setClickInsightsLoading(true);
 
-    // Khi user pick mode "Ngày gần nhất" (limit=N) thay vì range, currentFilter
-    // chỉ có `limit` — BE queries hourly/referrer/delay/cancellation KHÔNG hiểu
-    // `limit` (chỉ list_days_with_rows hiểu) → query trả all-time. Derive
-    // date range từ `days[]` (đã được FE filter đúng) để pass xuống BE.
-    let beFromDate = currentFilter.fromDate;
-    let beToDate = currentFilter.toDate;
-    if (!beFromDate || !beToDate) {
-      const sortedDates = days.map((d) => d.date).sort();
-      beFromDate = beFromDate ?? sortedDates[0];
-      beToDate = beToDate ?? sortedDates[sortedDates.length - 1];
-    }
+    // Debounce 400ms: user đổi filter liên tục (gõ ngày, chuyển account) sẽ
+    // dồn về 1 lần query thay vì spam 5 BE command mỗi keystroke.
+    const timer = setTimeout(() => {
+      if (cancelled) return;
 
-    const beFilter: DaysFilter = {
-      fromDate: beFromDate,
-      toDate: beToDate,
-      accountFilter,
-    };
-    Promise.all([
-      invoke<HourlyOrderBucketDto[]>("load_hourly_orders", { filter: beFilter }),
-      invoke<HourlyClickBucketDto[]>("load_hourly_clicks", { filter: beFilter }),
-      invoke<ReferrerEfficiency[]>("load_referrer_efficiency", { filter: beFilter }),
-      invoke<DelayBucket[]>("load_click_order_delays", { filter: beFilter }),
-      invoke<CancellationByDayBucket[]>("load_cancellation_by_subid", {
-        filter: beFilter,
-      }),
-    ])
-      .then(([orders, clicks, referrers, delays, cancellations]) => {
-        if (cancelled) return;
-        setHourlyOrders(
-          orders.map((b) => ({
-            hour: b.hour,
-            orders: b.orders,
-            orderValue: b.orderValue,
-            commission: b.commission,
-            clicks: 0,
-          })),
-        );
-        setHourlyClicks(
-          clicks.map((b) => ({
-            hour: b.hour,
-            orders: 0,
-            orderValue: 0,
-            commission: 0,
-            clicks: b.clicks,
-          })),
-        );
-        setReferrerEff(referrers);
-        setClickDelays(delays);
-        setCancellationByDay(cancellations);
-      })
-      .catch((e) => {
-        console.error("[overview click insights] load failed:", e);
-        if (!cancelled) {
-          setHourlyOrders([]);
-          setHourlyClicks([]);
-          setReferrerEff([]);
-          setClickDelays([]);
-          setCancellationByDay([]);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setClickInsightsLoading(false);
-      });
+      // Khi user pick mode "Ngày gần nhất" (limit=N) thay vì range, currentFilter
+      // chỉ có `limit` — BE queries hourly/referrer/delay/cancellation KHÔNG hiểu
+      // `limit` (chỉ list_days_with_rows hiểu) → query trả all-time. Derive
+      // date range từ `days[]` (đã được FE filter đúng) để pass xuống BE.
+      let beFromDate = currentFilter.fromDate;
+      let beToDate = currentFilter.toDate;
+      if (!beFromDate || !beToDate) {
+        const sortedDates = days.map((d) => d.date).sort();
+        beFromDate = beFromDate ?? sortedDates[0];
+        beToDate = beToDate ?? sortedDates[sortedDates.length - 1];
+      }
+
+      const beFilter: DaysFilter = {
+        fromDate: beFromDate,
+        toDate: beToDate,
+        accountFilter,
+      };
+      Promise.all([
+        invoke<HourlyOrderBucketDto[]>("load_hourly_orders", { filter: beFilter }),
+        invoke<HourlyClickBucketDto[]>("load_hourly_clicks", { filter: beFilter }),
+        invoke<ReferrerEfficiency[]>("load_referrer_efficiency", { filter: beFilter }),
+        invoke<DelayBucket[]>("load_click_order_delays", { filter: beFilter }),
+        invoke<CancellationByDayBucket[]>("load_cancellation_by_subid", {
+          filter: beFilter,
+        }),
+      ])
+        .then(([orders, clicks, referrers, delays, cancellations]) => {
+          if (cancelled) return;
+          setHourlyOrders(
+            orders.map((b) => ({
+              hour: b.hour,
+              orders: b.orders,
+              orderValue: b.orderValue,
+              commission: b.commission,
+              clicks: 0,
+            })),
+          );
+          setHourlyClicks(
+            clicks.map((b) => ({
+              hour: b.hour,
+              orders: 0,
+              orderValue: 0,
+              commission: 0,
+              clicks: b.clicks,
+            })),
+          );
+          setReferrerEff(referrers);
+          setClickDelays(delays);
+          setCancellationByDay(cancellations);
+        })
+        .catch((e) => {
+          console.error("[overview click insights] load failed:", e);
+          if (!cancelled) {
+            setHourlyOrders([]);
+            setHourlyClicks([]);
+            setReferrerEff([]);
+            setClickDelays([]);
+            setCancellationByDay([]);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setClickInsightsLoading(false);
+        });
+    }, 400);
+
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [
     currentFilter.fromDate,

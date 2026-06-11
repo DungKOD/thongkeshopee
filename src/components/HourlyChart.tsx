@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import {
   Bar,
   BarChart,
@@ -41,7 +41,9 @@ interface Props {
  * Highlight peak hours (top 3 bucket) bằng màu shopee; còn lại màu xám.
  * Giúp user nhanh thấy khung giờ user mua nhiều nhất → tối ưu đăng bài.
  */
-export function HourlyChart({
+export const HourlyChart = memo(HourlyChartInner);
+
+function HourlyChartInner({
   data,
   title = "Giờ mua hàng",
   metric = "orders",
