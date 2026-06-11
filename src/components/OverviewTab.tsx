@@ -68,6 +68,9 @@ const SOURCE_OPTIONS: Array<{ id: SourceFilter; label: string; icon: string; des
   { id: "shopee_only", label: "Chỉ Shopee", icon: "shopping_cart", desc: "Chỉ rows có Shopee data" },
 ];
 
+/** Debounce ms cho 5-BE-query effect khi user đổi filter. */
+const INSIGHTS_DEBOUNCE_MS = 400;
+
 
 export function OverviewTab({
   days,
@@ -172,8 +175,8 @@ export function OverviewTab({
 
     setClickInsightsLoading(true);
 
-    // Debounce 400ms: user đổi filter liên tục (gõ ngày, chuyển account) sẽ
-    // dồn về 1 lần query thay vì spam 5 BE command mỗi keystroke.
+    // Debounce: user đổi filter liên tục (gõ ngày, chuyển account) sẽ dồn
+    // về 1 lần query thay vì spam 5 BE command mỗi keystroke.
     const timer = setTimeout(() => {
       if (cancelled) return;
 
@@ -240,7 +243,7 @@ export function OverviewTab({
         .finally(() => {
           if (!cancelled) setClickInsightsLoading(false);
         });
-    }, 400);
+    }, INSIGHTS_DEBOUNCE_MS);
 
     return () => {
       cancelled = true;

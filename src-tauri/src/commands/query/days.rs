@@ -24,6 +24,11 @@ use super::aggregate::{
     canonical_to_array, default_name, params_to_refs, read_sub_id_match_mode, representative,
     to_canonical, Canonical, SubIdMatchMode,
 };
+
+/// SQLite default variable limit = 999. Batch path đẩy N day_date qua
+/// `IN (?, ?, ...)` cần ≤ 900 để chừa slot cho params khác (account_id, etc.).
+/// Vượt limit → fallback per-day query loop.
+const BATCH_DAY_LIMIT: usize = 900;
 use super::{default_account_id_lookup, AccountFilterMode, DaysFilter};
 
 #[tauri::command]
@@ -112,10 +117,9 @@ pub(super) fn list_days_with_rows_impl(
         iter.collect::<rusqlite::Result<HashMap<_, _>>>()?
     };
 
-    // SQLite variable limit = 999 by default. For safety, fall back to the
-    // per-day loop when the date list is very large (>900 slots). In practice
-    // this app rarely queries more than ~100 days at a time.
-    if days.len() > 900 {
+    // SQLite variable limit = 999. Fallback per-day loop khi vượt threshold.
+    // In practice this app rarely queries more than ~100 days at a time.
+    if days.len() > BATCH_DAY_LIMIT {
         let mut out = Vec::with_capacity(days.len());
         for (date, notes) in days {
             let (mut rows, totals) =
@@ -785,7 +789,7 @@ fn process_day_data(
 /// Returns `HashMap<String, Vec<T>>` keyed by day_date.
 /// `account_id_eq`: None = All accounts (no filter on Shopee/manual tables).
 ///
-/// SQLite variable limit: caller must ensure dates.len() <= 900.
+/// SQLite variable limit: caller must ensure dates.len() <= BATCH_DAY_LIMIT.
 fn batch_fetch_fb_ads(
     conn: &Connection,
     placeholders: &str,
@@ -1120,7 +1124,7 @@ fn batch_fetch_all_account_owner_pairs(
     Ok(result)
 }
 
-/// Fallback single-day query path (used when dates > 900 or for direct calls).
+/// Fallback single-day query path (used when dates > BATCH_DAY_LIMIT or for direct calls).
 /// Fetches 5 data sources for a single day_date, builds owner pairs, then
 /// delegates to `process_day_data` for Phase 2 + Phase 3 logic.
 fn aggregate_rows_for_day(

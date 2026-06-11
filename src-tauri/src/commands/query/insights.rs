@@ -16,6 +16,9 @@ use super::aggregate::{
     append_date_account_filters, append_subid_prefilter, is_prefix, params_to_refs,
     read_sub_id_match_mode, sub_ids_match, to_canonical, Canonical,
 };
+
+const SECS_PER_HOUR: f64 = 3600.0;
+const SECS_PER_DAY: f64 = 86_400.0;
 use super::{AccountFilterMode, DaysFilter};
 
 /// Unique referrer values (cột "Người giới thiệu" trong WebsiteClickReport).
@@ -674,10 +677,10 @@ pub fn load_click_order_delays(
     for delay in by_order.into_values() {
         let key = match delay {
             None => "no_click",
-            Some(s) if s < 3600.0 => "<1h",
-            Some(s) if s < 6.0 * 3600.0 => "1-6h",
-            Some(s) if s < 24.0 * 3600.0 => "6-24h",
-            Some(s) if s < 3.0 * 86400.0 => "1-3d",
+            Some(s) if s < SECS_PER_HOUR => "<1h",
+            Some(s) if s < 6.0 * SECS_PER_HOUR => "1-6h",
+            Some(s) if s < SECS_PER_DAY => "6-24h",
+            Some(s) if s < 3.0 * SECS_PER_DAY => "1-3d",
             Some(_) => ">3d",
         };
         *buckets.entry(key).or_insert(0) += 1;
