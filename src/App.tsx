@@ -6,8 +6,9 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
+import { ShortcutButton, TabButton } from "./components/AppShellButtons";
+import { SplashScreen } from "./components/SplashScreen";
 import { DayBlock } from "./components/DayBlock";
 import { OverviewTab } from "./components/OverviewTab";
 import { SubIdTimelineBlock } from "./components/SubIdTimelineBlock";
@@ -964,50 +965,6 @@ function AppInner() {
   );
 }
 
-interface ShortcutButtonProps {
-  active?: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}
-
-function ShortcutButton({ active, onClick, children }: ShortcutButtonProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`btn-ripple rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
-        active
-          ? "border border-shopee-500 bg-shopee-500/20 text-shopee-200"
-          : "border border-surface-8 bg-surface-1 text-white/80 hover:border-shopee-500/50 hover:bg-shopee-900/20 hover:text-shopee-200"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
-interface TabButtonProps {
-  active: boolean;
-  onClick: () => void;
-  icon: string;
-  label: string;
-}
-
-function TabButton({ active, onClick, icon, label }: TabButtonProps) {
-  return (
-    <button
-      onClick={onClick}
-      className={`btn-ripple flex items-center gap-1.5 rounded-t-lg px-4 py-2 text-sm font-medium transition-colors ${
-        active
-          ? "bg-surface-0 text-shopee-300"
-          : "text-white/70 hover:bg-white/10 hover:text-white"
-      }`}
-    >
-      <span className="material-symbols-rounded text-base">{icon}</span>
-      {label}
-    </button>
-  );
-}
 
 function AuthGate() {
   const {
@@ -1078,47 +1035,6 @@ function AuthGate() {
   );
 }
 
-interface SplashScreenProps {
-  title: string;
-  subtitle?: string;
-  error?: boolean;
-  onRetry?: () => void;
-}
-
-function SplashScreen({ title, subtitle, error, onRetry }: SplashScreenProps) {
-  return (
-    <main className="min-h-screen bg-surface-0 px-6 text-white">
-      <div className="flex flex-col items-center pt-[32vh]">
-        <span
-          className={`material-symbols-rounded text-7xl ${
-            error ? "text-red-400" : "animate-spin text-shopee-400"
-          }`}
-        >
-          {error ? "error" : "cloud_sync"}
-        </span>
-        <div className="mt-6 flex flex-col items-center gap-3">
-          <h1 className="text-center text-2xl font-semibold text-white/95">
-            {title}
-          </h1>
-          {subtitle && (
-            <p className="max-w-md break-words text-center text-base text-white/70">
-              {subtitle}
-            </p>
-          )}
-          {onRetry && (
-            <button
-              onClick={onRetry}
-              className="btn-ripple mt-2 flex items-center gap-2 rounded-lg border border-white/40 bg-white/10 px-4 py-2 text-sm font-medium text-white hover:bg-white/20"
-            >
-              <span className="material-symbols-rounded text-base">refresh</span>
-              Tải lại
-            </button>
-          )}
-        </div>
-      </div>
-    </main>
-  );
-}
 
 function App() {
   return (
