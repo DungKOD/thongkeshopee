@@ -1,5 +1,6 @@
 import {
   lazy,
+  startTransition,
   Suspense,
   useCallback,
   useEffect,
@@ -81,11 +82,55 @@ function LazyTabFallback() {
   );
 }
 
+type AppTab = "stats" | "overview" | "download" | "upload";
+
 function AppInner() {
   const { signOut: authSignOut } = useAuth();
-  const [activeTab, setActiveTab] = useState<
-    "stats" | "overview" | "download" | "upload"
-  >("stats");
+  const [activeTab, setActiveTabRaw] = useState<AppTab>("stats");
+
+  // startTransition: switching tab là non-urgent UI update — React batch
+  // re-render, không block input/click. Tránh đơ khi user spam click tab.
+  const setActiveTab = useCallback((tab: AppTab) => {
+    startTransition(() => setActiveTabRaw(tab));
+  }, []);
+
+  // Track lazy tabs đã từng mount (Download/Upload chunks). Giữ mounted khi
+  // user switch sang tab khác → không phải refetch chunk + không re-trigger
+  // useEffect khi quay lại.
+  const [mountedLazyTabs, setMountedLazyTabs] = useState<Set<AppTab>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    if (activeTab === "download" || activeTab === "upload") {
+      setMountedLazyTabs((prev) => {
+        if (prev.has(activeTab)) return prev;
+        const next = new Set(prev);
+        next.add(activeTab);
+        return next;
+      });
+    }
+  }, [activeTab]);
+
+  // Prefetch lazy chunks trong idle time sau mount → click tab lần đầu vẫn
+  // instant (chunk đã trong cache khi React.lazy resolve).
+  useEffect(() => {
+    const schedule =
+      typeof requestIdleCallback === "function"
+        ? requestIdleCallback
+        : (cb: () => void) => setTimeout(cb, 1500);
+    const handle = schedule(() => {
+      void import("./components/DownloadVideoPage");
+      void import("./components/UploadVideoPage");
+      void import("./components/SmartCalculator");
+    });
+    return () => {
+      if (typeof cancelIdleCallback === "function" && typeof handle === "number") {
+        cancelIdleCallback(handle);
+      } else if (typeof handle === "number") {
+        clearTimeout(handle);
+      }
+    };
+  }, []);
 
   const statsFilter = useFilterMode("stats");
   const overviewFilter = useFilterMode("overview");
@@ -504,14 +549,26 @@ function AppInner() {
       />
 
       <div className="p-6">
-        {activeTab === "download" ? (
-          <Suspense fallback={<LazyTabFallback />}>
-            <DownloadVideoPage />
-          </Suspense>
-        ) : activeTab === "upload" ? (
-          <Suspense fallback={<LazyTabFallback />}>
-            <UploadVideoPage />
-          </Suspense>
+        {/* Lazy tabs: mount-once, hide bằng CSS khi inactive. Tránh
+            re-fetch chunk + reset state mỗi lần user switch tab. */}
+        {mountedLazyTabs.has("download") && (
+          <div className={activeTab === "download" ? "" : "hidden"}>
+            <Suspense fallback={<LazyTabFallback />}>
+              <DownloadVideoPage />
+            </Suspense>
+          </div>
+        )}
+        {mountedLazyTabs.has("upload") && (
+          <div className={activeTab === "upload" ? "" : "hidden"}>
+            <Suspense fallback={<LazyTabFallback />}>
+              <UploadVideoPage />
+            </Suspense>
+          </div>
+        )}
+        {activeTab === "download" || activeTab === "upload" ? (
+          // Lazy chunk đang tải lần đầu → fallback nằm trong Suspense ở trên.
+          // Block stats/overview rendering hoàn toàn trong khi xem lazy tabs.
+          null
         ) : loading ? (
           <div className="mx-auto flex max-w-xl flex-col items-center gap-3 py-16 text-center text-white/60">
             <span className="material-symbols-rounded animate-spin text-4xl text-shopee-400">

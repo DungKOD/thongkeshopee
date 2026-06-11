@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 
 interface ShortcutButtonProps {
   active?: boolean;
@@ -6,7 +6,9 @@ interface ShortcutButtonProps {
   children: ReactNode;
 }
 
-export function ShortcutButton({ active, onClick, children }: ShortcutButtonProps) {
+export const ShortcutButton = memo(ShortcutButtonInner);
+
+function ShortcutButtonInner({ active, onClick, children }: ShortcutButtonProps) {
   return (
     <button
       type="button"
@@ -29,7 +31,9 @@ interface TabButtonProps {
   label: string;
 }
 
-export function TabButton({ active, onClick, icon, label }: TabButtonProps) {
+export const TabButton = memo(TabButtonInner);
+
+function TabButtonInner({ active, onClick, icon, label }: TabButtonProps) {
   return (
     <button
       onClick={onClick}

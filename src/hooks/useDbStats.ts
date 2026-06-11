@@ -103,7 +103,16 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
     ],
   );
 
+  // Cache list_days_with_rows theo filterKey: user switch stats↔overview tab
+  // (2 filter khác nhau) lặp lại sẽ hit cache → instant, không re-fetch.
+  // Invalidate trong refetch() sau mutation. LRU cap 8 entries để không leak.
+  const daysCacheRef = useRef<Map<string, UiDay[]>>(new Map());
   const refetchDays = useCallback(async () => {
+    const cached = daysCacheRef.current.get(filterKey);
+    if (cached) {
+      setDays(cached);
+      return;
+    }
     const payload: DaysFilter = {
       fromDate: filter.fromDate,
       toDate: filter.toDate,
@@ -114,6 +123,12 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
     const data = await invoke<UiDay[]>("list_days_with_rows", {
       filter: payload,
     });
+    const cache = daysCacheRef.current;
+    if (cache.size >= 8) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey !== undefined) cache.delete(oldestKey);
+    }
+    cache.set(filterKey, data);
     setDays(data);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filterKey]);
@@ -128,6 +143,8 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
   }, []);
 
   const refetch = useCallback(async () => {
+    // Mutation/manual refresh → invalidate cache để fetch lại từ DB.
+    daysCacheRef.current.clear();
     setLoading(true);
     setError(null);
     try {
