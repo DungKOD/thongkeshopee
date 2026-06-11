@@ -38,7 +38,7 @@ pub fn run() {
             commands::accounts::reassign_shopee_account_data,
             commands::query::db_ping,
             commands::query::list_days,
-            commands::query::list_days_with_rows,
+            commands::query::days::list_days_with_rows,
             commands::query::overview::load_overview,
             commands::query::files::list_imported_files,
             commands::query::insights::load_hourly_orders,
