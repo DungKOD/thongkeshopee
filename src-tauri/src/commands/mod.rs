@@ -9,10 +9,11 @@
 pub mod accounts;
 pub mod app_settings;
 pub mod app_util;
-pub mod apps_script;
 pub mod batch;
 pub mod db_transfer;
 pub mod device;
+pub mod fb_ads;
+pub mod fb_reels;
 pub mod imports;
 pub mod manual;
 pub mod preview;

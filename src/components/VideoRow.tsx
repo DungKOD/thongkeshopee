@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { memo, useState } from "react";
 import type { UiRow } from "../types";
 import { computeUiRow, fmtInt, fmtPct, fmtVnd, uiRowKey } from "../formulas";
 import { sumFiltered, useSettings } from "../hooks/useSettings";
@@ -8,14 +8,19 @@ interface CampaignRowProps {
   row: UiRow;
   index: number;
   pending: boolean;
-  onEdit: () => void;
-  onToggleDelete: () => void;
-  onViewDetail: () => void;
-  onViewHistory?: () => void;
+  // Callbacks nhận `row` → ổn định ref cấp DayBlock (không inline closure
+  // per-row map). Combined với memo → row chỉ re-render khi pending/index/
+  // hiddenCols/showAccount/deleteBlocked đổi.
+  onEdit: (row: UiRow) => void;
+  onToggleDelete: (row: UiRow) => void;
+  onViewDetail: (row: UiRow) => void;
+  onViewHistory?: (row: UiRow) => void;
   readOnly?: boolean;
   showAccount?: boolean;
   deleteBlocked?: boolean;
   hiddenCols?: Set<string>;
+  /** Cột rỗng auto-hide: skip render <td> hoàn toàn (≠ hiddenCols chỉ mask). */
+  autoHiddenCols?: ReadonlySet<string>;
 }
 
 const cellCls = "px-3 py-2.5 text-center whitespace-nowrap";
@@ -30,7 +35,7 @@ function fmtOrNa(
   return { text: fmt(value), cls: "" };
 }
 
-export function VideoRow({
+function VideoRowImpl({
   row,
   index,
   pending,
@@ -42,11 +47,13 @@ export function VideoRow({
   showAccount = false,
   deleteBlocked = false,
   hiddenCols,
+  autoHiddenCols,
 }: CampaignRowProps) {
   const h = (col: string) => hiddenCols?.has(col) ?? false;
+  const auto = (col: string) => autoHiddenCols?.has(col) ?? false;
   const [copied, setCopied] = useState(false);
   const { settings } = useSettings();
-  const { isBookmarked, toggle: toggleBookmark } = useBookmark(
+  const { isBookmarked, toggle: toggleBookmark, set: setBookmark } = useBookmark(
     uiRowKey(row.dayDate, row.subIds, row.accountId),
   );
   const shopeeClicks = sumFiltered(
@@ -75,7 +82,8 @@ export function VideoRow({
     if (pending) return;
     const selection = window.getSelection();
     if (selection && selection.toString().length > 0) return;
-    onViewDetail();
+    setBookmark(true);
+    onViewDetail(row);
   };
 
   return (
@@ -98,7 +106,7 @@ export function VideoRow({
           : index}
       </td>
       <td
-        className={`max-w-[280px] px-4 py-2.5 text-left text-sm font-semibold text-white sticky left-12 z-[9] shadow-[2px_0_8px_rgba(0,0,0,0.5)] ${isBookmarked ? "bg-[#2b2212]" : "bg-[#222222]"} ${dataCellPending}`}
+        className={`w-[120px] px-4 py-2.5 text-left text-sm font-semibold text-white sticky left-12 z-[9] shadow-[2px_0_8px_rgba(0,0,0,0.5)] ${isBookmarked ? "bg-[#2b2212]" : "bg-[#222222]"} ${dataCellPending}`}
         title={h("Sản phẩm") ? undefined : row.displayName}
       >
         {h("Sản phẩm") ? MASK : (
@@ -130,6 +138,21 @@ export function VideoRow({
                 </span>
               </button>
             )}
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); toggleBookmark(); }}
+              title={isBookmarked ? "Bỏ đánh dấu" : "Đánh dấu đang check SP này"}
+              aria-label="Đánh dấu"
+              className={`btn-ripple flex-none flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
+                isBookmarked
+                  ? "text-amber-400 hover:bg-amber-500/20"
+                  : "text-white/30 hover:bg-amber-500/10 hover:text-amber-300"
+              }`}
+            >
+              <span className="material-symbols-rounded text-lg">
+                {isBookmarked ? "bookmark" : "bookmark_border"}
+              </span>
+            </button>
           </div>
         )}
       </td>
@@ -152,70 +175,90 @@ export function VideoRow({
           )}
         </td>
       )}
-      <td className={`${cellCls} tabular-nums ${clicksCell.cls} ${dataCellPending}`}>
-        {h("Click ADS") ? MASK : clicksCell.text}
-      </td>
-      <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
-        {h("Click Shopee") ? MASK : fmtInt(shopeeClicks)}
-      </td>
-      <td className={`${cellCls} tabular-nums text-gray-400 ${cpcCell.cls} ${dataCellPending}`}>
-        {h("Đơn giá click") ? MASK : cpcCell.text}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums ${
-          spendCell.cls === "" ? "text-blue-400" : spendCell.cls
-        } ${dataCellPending}`}
-      >
-        {h("Tổng tiền chạy") ? MASK : spendCell.text}
-      </td>
-      <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
-        {h("Số lượng đơn") ? MASK : fmtInt(row.ordersCount)}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums text-gray-400 ${
-          shopeeClicks === 0 ? naCls : ""
-        } ${dataCellPending}`}
-        title={
-          shopeeClicks === 0
-            ? "Không có Click Shopee → không tính được CR"
-            : `CR = Số đơn / Click Shopee × 100% (${row.ordersCount}/${shopeeClicks})`
-        }
-      >
-        {h("Tỷ lệ chuyển đổi") ? MASK : shopeeClicks > 0 ? fmtPct(c.conversionRate) : "—"}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums text-gray-400 ${
-          row.ordersCount === 0 ? naCls : ""
-        } ${dataCellPending}`}
-      >
-        {h("Giá trị đơn hàng") ? MASK : row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
-      </td>
-      <td className={`${cellCls} tabular-nums text-shopee-400 ${dataCellPending}`}>
-        {h("Hoa hồng") ? MASK : fmtVnd(row.commissionTotal)}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums font-medium ${profitCls} ${dataCellPending}`}
-      >
-        {h("Lợi nhuận") ? MASK : fmtVnd(c.profit)}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums ${
-          row.totalSpend && row.totalSpend > 0 ? profitCls : naCls
-        } ${dataCellPending}`}
-        title={
-          !row.totalSpend || row.totalSpend === 0
-            ? "Không có chi phí ads → không tính được ROI (lãi tự nhiên không qua spend)"
-            : `ROI = (Hoa hồng sau phí − Tiền ads) / Tiền ads\n${
-                c.profitMargin > 0
-                  ? "Có lãi"
-                  : c.profitMargin < 0
-                  ? "Đang lỗ"
-                  : "Hòa vốn"
-              }`
-        }
-      >
-        {h("ROI") ? MASK : row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
-      </td>
+      {!auto("Click ADS") && (
+        <td className={`${cellCls} tabular-nums ${clicksCell.cls} ${dataCellPending}`}>
+          {h("Click ADS") ? MASK : clicksCell.text}
+        </td>
+      )}
+      {!auto("Click Shopee") && (
+        <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
+          {h("Click Shopee") ? MASK : fmtInt(shopeeClicks)}
+        </td>
+      )}
+      {!auto("Đơn giá click") && (
+        <td className={`${cellCls} tabular-nums text-gray-400 ${cpcCell.cls} ${dataCellPending}`}>
+          {h("Đơn giá click") ? MASK : cpcCell.text}
+        </td>
+      )}
+      {!auto("Tổng tiền chạy") && (
+        <td
+          className={`${cellCls} tabular-nums ${
+            spendCell.cls === "" ? "text-blue-400" : spendCell.cls
+          } ${dataCellPending}`}
+        >
+          {h("Tổng tiền chạy") ? MASK : spendCell.text}
+        </td>
+      )}
+      {!auto("Số lượng đơn") && (
+        <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
+          {h("Số lượng đơn") ? MASK : fmtInt(row.ordersCount)}
+        </td>
+      )}
+      {!auto("CR") && (
+        <td
+          className={`${cellCls} tabular-nums text-gray-400 ${
+            shopeeClicks === 0 ? naCls : ""
+          } ${dataCellPending}`}
+          title={
+            shopeeClicks === 0
+              ? "Không có Click Shopee → không tính được CR"
+              : `CR = Số đơn / Click Shopee × 100% (${row.ordersCount}/${shopeeClicks})`
+          }
+        >
+          {h("CR") ? MASK : shopeeClicks > 0 ? fmtPct(c.conversionRate) : "—"}
+        </td>
+      )}
+      {!auto("Giá trị đơn hàng") && (
+        <td
+          className={`${cellCls} tabular-nums text-gray-400 ${
+            row.ordersCount === 0 ? naCls : ""
+          } ${dataCellPending}`}
+        >
+          {h("Giá trị đơn hàng") ? MASK : row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
+        </td>
+      )}
+      {!auto("Hoa hồng") && (
+        <td className={`${cellCls} tabular-nums text-shopee-400 ${dataCellPending}`}>
+          {h("Hoa hồng") ? MASK : fmtVnd(row.commissionTotal)}
+        </td>
+      )}
+      {!auto("Lợi nhuận") && (
+        <td
+          className={`${cellCls} tabular-nums font-medium ${profitCls} ${dataCellPending}`}
+        >
+          {h("Lợi nhuận") ? MASK : fmtVnd(c.profit)}
+        </td>
+      )}
+      {!auto("ROI") && (
+        <td
+          className={`${cellCls} tabular-nums ${
+            row.totalSpend && row.totalSpend > 0 ? profitCls : naCls
+          } ${dataCellPending}`}
+          title={
+            !row.totalSpend || row.totalSpend === 0
+              ? "Không có chi phí ads → không tính được ROI (lãi tự nhiên không qua spend)"
+              : `ROI = (Hoa hồng sau phí − Tiền ads) / Tiền ads\n${
+                  c.profitMargin > 0
+                    ? "Có lãi"
+                    : c.profitMargin < 0
+                    ? "Đang lỗ"
+                    : "Hòa vốn"
+                }`
+          }
+        >
+          {h("ROI") ? MASK : row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
+        </td>
+      )}
       <td className={`${cellCls} col-actions sticky right-0 z-10 bg-[#222222] shadow-[-2px_0_8px_rgba(0,0,0,0.5)]`}>
         <div className="flex justify-center gap-0.5">
           <button
@@ -236,7 +279,8 @@ export function VideoRow({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                onViewHistory();
+                setBookmark(true);
+                onViewHistory(row);
               }}
               className="btn-ripple flex h-8 w-8 items-center justify-center rounded-full text-white/40 hover:bg-shopee-500/10 hover:text-shopee-300"
               title="Xem lịch sử theo ngày"
@@ -250,7 +294,7 @@ export function VideoRow({
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (!pending) onEdit();
+                  if (!pending) onEdit(row);
                 }}
                 disabled={pending}
                 className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
@@ -267,7 +311,7 @@ export function VideoRow({
                 onClick={(e) => {
                   e.stopPropagation();
                   if (deleteBlocked && !pending) return;
-                  onToggleDelete();
+                  onToggleDelete(row);
                 }}
                 disabled={deleteBlocked && !pending}
                 className={`btn-ripple flex h-8 w-8 items-center justify-center rounded-full ${
@@ -297,3 +341,11 @@ export function VideoRow({
     </tr>
   );
 }
+
+// memo: cache hit (cùng day reference từ daysCache) → row reference giữ
+// nguyên + tất cả callbacks stable (refactor để nhận row) → skip toàn bộ
+// re-render. Tiết kiệm ~N×M useState/useBookmark/computeUiRow mỗi lần parent
+// (DayBlock, App) re-render vì state khác (vd: scroll, dialog open).
+export const VideoRow = memo(VideoRowImpl);
+
+

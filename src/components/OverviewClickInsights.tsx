@@ -166,6 +166,7 @@ const BUCKET_COLOR: Record<string, string> = {
   no_click: "#64748b",
 };
 
+
 /// Histogram thời gian từ click → đặt hàng. Biểu đồ phân bố để hiểu user
 /// behavior: impulse (<1h) vs consider (>24h) → tune retargeting window.
 export const ClickDelayChart = memo(ClickDelayChartInner);
@@ -213,7 +214,7 @@ function ClickDelayChartInner({ data }: { data: DelayBucket[] }) {
           {fmtInt(total)} đơn
         </span>
       </header>
-      <div className="h-[220px] w-full">
+      <div className="animate-chart-fade-in h-[220px] w-full">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart
             data={chartData}
@@ -239,7 +240,12 @@ function ClickDelayChartInner({ data }: { data: DelayBucket[] }) {
               )}
               cursor={{ fill: "#ffffff08" }}
             />
-            <Bar dataKey="orders" radius={[4, 4, 0, 0]} maxBarSize={60}>
+            <Bar
+              dataKey="orders"
+              radius={[4, 4, 0, 0]}
+              maxBarSize={60}
+              isAnimationActive={false}
+            >
               {chartData.map((d, i) => (
                 <Cell key={`cell-${i}`} fill={BUCKET_COLOR[d.key] ?? "#64748b"} />
               ))}

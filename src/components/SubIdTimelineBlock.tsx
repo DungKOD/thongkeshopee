@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+﻿import { useMemo, useState } from "react";
 import type { UiDay, UiRow } from "../types";
 import {
   computeNetCommission,
@@ -47,8 +47,8 @@ const HEADERS: Array<{ label: string; tooltip?: string }> = [
   { label: "Tổng tiền chạy", tooltip: "Spend FB" },
   { label: "Số lượng đơn", tooltip: "Số đơn hàng (COUNT DISTINCT order_id)" },
   {
-    label: "Tỷ lệ chuyển đổi",
-    tooltip: "CR = Số đơn / Click Shopee × 100%",
+    label: "CR",
+    tooltip: "Tỷ lệ chuyển đổi (CR) = Số đơn / Click Shopee × 100%",
   },
   {
     label: "Giá trị đơn hàng",
@@ -70,6 +70,9 @@ const HEADERS: Array<{ label: string; tooltip?: string }> = [
 const cellCls = "px-3 py-2.5 text-center";
 const naCls = "text-white/30";
 
+/** Set rỗng dùng làm sentinel ổn định ref khi user toggle reveal empty cols. */
+const EMPTY_STR_SET: ReadonlySet<string> = new Set<string>();
+
 export function SubIdTimelineBlock({
   subId,
   days,
@@ -89,11 +92,55 @@ export function SubIdTimelineBlock({
 
   // Cột TK Shopee chỉ render khi filter=All (giống DayBlock).
   const showAccount = !accountFilter || accountFilter.kind === "all";
-  const headers = useMemo(
-    () =>
-      showAccount ? HEADERS : HEADERS.filter((h) => h.label !== "TK Shopee"),
-    [showAccount],
-  );
+
+  // Auto-hide cột rỗng (cùng logic DayBlock): 1-pass qua flatRows.
+  const [revealEmpty, setRevealEmpty] = useState(false);
+  const autoEmptyCols = useMemo(() => {
+    const empty = new Set<string>();
+    if (flatRows.length === 0) return empty;
+    let anyClicks = false, anyShopee = false, anyCpc = false;
+    let anySpend = false, anyOrders = false, anyCommission = false;
+    let anyProfit = false;
+    for (const r of flatRows) {
+      const shopee = sumFiltered(
+        r.shopeeClicksByReferrer,
+        settings.clickSources,
+      );
+      const c = computeUiRow(r, settings.profitFees, shopee);
+      if (r.adsClicks && r.adsClicks > 0) anyClicks = true;
+      if (shopee > 0) anyShopee = true;
+      if (c.cpc > 0) anyCpc = true;
+      if (r.totalSpend && r.totalSpend > 0) anySpend = true;
+      if (r.ordersCount > 0) anyOrders = true;
+      if (r.commissionTotal !== 0) anyCommission = true;
+      if (c.profit !== 0) anyProfit = true;
+    }
+    if (!anyClicks) empty.add("Click ADS");
+    if (!anyShopee) empty.add("Click Shopee");
+    if (!anyCpc) empty.add("Đơn giá click");
+    if (!anySpend) {
+      empty.add("Tổng tiền chạy");
+      empty.add("ROI");
+    }
+    if (!anyOrders) {
+      empty.add("Số lượng đơn");
+      empty.add("Giá trị đơn hàng");
+    }
+    if (!anyOrders || !anyShopee) empty.add("CR");
+    if (!anyCommission) empty.add("Hoa hồng");
+    if (!anyProfit) empty.add("Lợi nhuận");
+    return empty;
+  }, [flatRows, settings.clickSources, settings.profitFees]);
+  const effectiveAutoHidden = revealEmpty ? EMPTY_STR_SET : autoEmptyCols;
+
+  const headers = useMemo(() => {
+    let h = HEADERS;
+    if (!showAccount) h = h.filter((col) => col.label !== "TK Shopee");
+    if (effectiveAutoHidden.size > 0) {
+      h = h.filter((col) => !effectiveAutoHidden.has(col.label));
+    }
+    return h;
+  }, [showAccount, effectiveAutoHidden]);
 
   // Đếm distinct dayDate cho label "X ngày có data" (rows.length over-count
   // khi multi-acc same day).
@@ -164,17 +211,40 @@ export function SubIdTimelineBlock({
             {distinctDays} ngày có data
           </div>
         </div>
+        {autoEmptyCols.size > 0 && (
+          <button
+            onClick={() => setRevealEmpty((v) => !v)}
+            title={
+              revealEmpty
+                ? `Ẩn lại ${autoEmptyCols.size} cột rỗng`
+                : `${autoEmptyCols.size} cột rỗng đã ẩn: ${Array.from(
+                    autoEmptyCols,
+                  ).join(", ")}. Bấm để hiện.`
+            }
+            className={`btn-ripple inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+              revealEmpty
+                ? "border-shopee-500/40 bg-shopee-500/15 text-shopee-300 hover:bg-shopee-500/20"
+                : "border-white/10 bg-white/5 text-white/55 hover:bg-white/10 hover:text-white/80"
+            }`}
+            aria-pressed={revealEmpty}
+          >
+            <span className="material-symbols-rounded text-sm">
+              {revealEmpty ? "visibility" : "visibility_off"}
+            </span>
+            {autoEmptyCols.size} cột rỗng
+          </button>
+        )}
       </header>
 
       <div className="overflow-x-auto">
-        <table className="w-full border-collapse text-sm">
+        <table className="w-full border-collapse text-sm table-fixed">
           <thead>
             <tr className="border-b-2 border-shopee-500/50 bg-gradient-to-b from-shopee-900/35 to-shopee-900/15 text-shopee-100">
               {headers.map((h, i) => (
                 <th
                   key={i}
                   title={h.tooltip}
-                  className={`px-3 py-3.5 text-center text-xs font-bold uppercase tracking-wider whitespace-nowrap ${
+                  className={`w-[120px] px-3 py-3.5 text-center text-xs font-bold uppercase tracking-wider whitespace-nowrap ${
                     h.tooltip ? "cursor-help" : ""
                   }`}
                 >
@@ -196,6 +266,7 @@ export function SubIdTimelineBlock({
                 key={uiRowKey(r.dayDate, r.subIds, r.accountId)}
                 row={r}
                 showAccount={showAccount}
+                autoHiddenCols={effectiveAutoHidden}
                 pending={pendingRowDeletes.has(
                   uiRowKey(r.dayDate, r.subIds, r.accountId),
                 )}
@@ -213,48 +284,64 @@ export function SubIdTimelineBlock({
                 Tổng
               </td>
               {showAccount && <td />}
-              <td className="px-3 py-4 text-center tabular-nums">
-                {fmtInt(totals.clicks)}
-              </td>
-              <td className="px-3 py-4 text-center tabular-nums">
-                {fmtInt(totals.shopeeClicks)}
-              </td>
-              <td />
-              <td className="px-3 py-4 text-center tabular-nums text-blue-400">
-                {fmtVnd(totals.totalSpend)}
-              </td>
-              <td className="px-3 py-4 text-center tabular-nums">
-                {fmtInt(totals.orders)}
-              </td>
-              <td
-                className="px-3 py-4 text-center tabular-nums"
-                title={
-                  totals.shopeeClicks === 0
-                    ? "Không có Click Shopee → không tính được CR"
-                    : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
-                }
-              >
-                {totals.shopeeClicks > 0
-                  ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
-                  : "—"}
-              </td>
-              <td
-                className="px-3 py-4 text-center tabular-nums"
-                title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
-              >
-                {totals.orders > 0
-                  ? fmtVnd(totals.orderValueTotal / totals.orders)
-                  : "—"}
-              </td>
-              <td className="px-3 py-4 text-center tabular-nums text-shopee-400">
-                {fmtVnd(totals.commission)}
-              </td>
-              <td
-                className={`px-3 py-4 text-center tabular-nums ${profitCls}`}
-              >
-                {fmtVnd(totals.profit)}
-              </td>
-              <td />
+              {!effectiveAutoHidden.has("Click ADS") && (
+                <td className={`px-3 py-4 text-center tabular-nums`}>
+                  {fmtInt(totals.clicks)}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("Click Shopee") && (
+                <td className={`px-3 py-4 text-center tabular-nums`}>
+                  {fmtInt(totals.shopeeClicks)}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("Đơn giá click") && <td />}
+              {!effectiveAutoHidden.has("Tổng tiền chạy") && (
+                <td className={`px-3 py-4 text-center tabular-nums text-blue-400`}>
+                  {fmtVnd(totals.totalSpend)}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("Số lượng đơn") && (
+                <td className={`px-3 py-4 text-center tabular-nums`}>
+                  {fmtInt(totals.orders)}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("CR") && (
+                <td
+                  className={`px-3 py-4 text-center tabular-nums`}
+                  title={
+                    totals.shopeeClicks === 0
+                      ? "Không có Click Shopee → không tính được CR"
+                      : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
+                  }
+                >
+                  {totals.shopeeClicks > 0
+                    ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
+                    : "—"}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("Giá trị đơn hàng") && (
+                <td
+                  className={`px-3 py-4 text-center tabular-nums`}
+                  title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
+                >
+                  {totals.orders > 0
+                    ? fmtVnd(totals.orderValueTotal / totals.orders)
+                    : "—"}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("Hoa hồng") && (
+                <td className={`px-3 py-4 text-center tabular-nums text-shopee-400`}>
+                  {fmtVnd(totals.commission)}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("Lợi nhuận") && (
+                <td
+                  className={`px-3 py-4 text-center tabular-nums ${profitCls}`}
+                >
+                  {fmtVnd(totals.profit)}
+                </td>
+              )}
+              {!effectiveAutoHidden.has("ROI") && <td />}
               <td />
             </tr>
           </tfoot>
@@ -287,6 +374,7 @@ interface TimelineRowProps {
   onViewHistory?: () => void;
   readOnly?: boolean;
   showAccount?: boolean;
+  autoHiddenCols?: ReadonlySet<string>;
 }
 
 function TimelineRow({
@@ -298,7 +386,9 @@ function TimelineRow({
   onViewHistory,
   readOnly = false,
   showAccount = false,
+  autoHiddenCols,
 }: TimelineRowProps) {
+  const auto = (col: string) => autoHiddenCols?.has(col) ?? false;
   const { settings } = useSettings();
   const shopeeClicks = sumFiltered(
     row.shopeeClicksByReferrer,
@@ -358,60 +448,80 @@ function TimelineRow({
           )}
         </td>
       )}
-      <td
-        className={`${cellCls} tabular-nums ${dataCellPending} ${
-          clicksCell?.cls ?? ""
-        }`}
-      >
-        {clicksCell ? clicksCell.text : fmtInt(row.adsClicks ?? 0)}
-      </td>
-      <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
-        {fmtInt(shopeeClicks)}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums text-gray-400 ${dataCellPending} ${cpcCell.cls}`}
-      >
-        {cpcCell.text}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums ${dataCellPending} ${
-          spendCell?.cls ?? "text-blue-400"
-        }`}
-      >
-        {spendCell ? spendCell.text : fmtVnd(row.totalSpend ?? 0)}
-      </td>
-      <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
-        {fmtInt(row.ordersCount)}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums text-gray-400 ${dataCellPending} ${
-          shopeeClicks === 0 ? naCls : ""
-        }`}
-      >
-        {shopeeClicks > 0 ? fmtPct(c.conversionRate) : "—"}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums text-gray-400 ${dataCellPending} ${
-          row.ordersCount === 0 ? naCls : ""
-        }`}
-      >
-        {row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
-      </td>
-      <td className={`${cellCls} tabular-nums text-shopee-400 ${dataCellPending}`}>
-        {fmtVnd(row.commissionTotal)}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums font-medium ${profitCls} ${dataCellPending}`}
-      >
-        {fmtVnd(c.profit)}
-      </td>
-      <td
-        className={`${cellCls} tabular-nums ${
-          row.totalSpend && row.totalSpend > 0 ? profitCls : naCls
-        } ${dataCellPending}`}
-      >
-        {row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
-      </td>
+      {!auto("Click ADS") && (
+        <td
+          className={`${cellCls} tabular-nums ${dataCellPending} ${
+            clicksCell?.cls ?? ""
+          }`}
+        >
+          {clicksCell ? clicksCell.text : fmtInt(row.adsClicks ?? 0)}
+        </td>
+      )}
+      {!auto("Click Shopee") && (
+        <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
+          {fmtInt(shopeeClicks)}
+        </td>
+      )}
+      {!auto("Đơn giá click") && (
+        <td
+          className={`${cellCls} tabular-nums text-gray-400 ${dataCellPending} ${cpcCell.cls}`}
+        >
+          {cpcCell.text}
+        </td>
+      )}
+      {!auto("Tổng tiền chạy") && (
+        <td
+          className={`${cellCls} tabular-nums ${dataCellPending} ${
+            spendCell?.cls ?? "text-blue-400"
+          }`}
+        >
+          {spendCell ? spendCell.text : fmtVnd(row.totalSpend ?? 0)}
+        </td>
+      )}
+      {!auto("Số lượng đơn") && (
+        <td className={`${cellCls} tabular-nums ${dataCellPending}`}>
+          {fmtInt(row.ordersCount)}
+        </td>
+      )}
+      {!auto("CR") && (
+        <td
+          className={`${cellCls} tabular-nums text-gray-400 ${dataCellPending} ${
+            shopeeClicks === 0 ? naCls : ""
+          }`}
+        >
+          {shopeeClicks > 0 ? fmtPct(c.conversionRate) : "—"}
+        </td>
+      )}
+      {!auto("Giá trị đơn hàng") && (
+        <td
+          className={`${cellCls} tabular-nums text-gray-400 ${dataCellPending} ${
+            row.ordersCount === 0 ? naCls : ""
+          }`}
+        >
+          {row.ordersCount > 0 ? fmtVnd(c.orderValue) : "—"}
+        </td>
+      )}
+      {!auto("Hoa hồng") && (
+        <td className={`${cellCls} tabular-nums text-shopee-400 ${dataCellPending}`}>
+          {fmtVnd(row.commissionTotal)}
+        </td>
+      )}
+      {!auto("Lợi nhuận") && (
+        <td
+          className={`${cellCls} tabular-nums font-medium ${profitCls} ${dataCellPending}`}
+        >
+          {fmtVnd(c.profit)}
+        </td>
+      )}
+      {!auto("ROI") && (
+        <td
+          className={`${cellCls} tabular-nums ${
+            row.totalSpend && row.totalSpend > 0 ? profitCls : naCls
+          } ${dataCellPending}`}
+        >
+          {row.totalSpend && row.totalSpend > 0 ? fmtPct(c.profitMargin) : "—"}
+        </td>
+      )}
       <td className={cellCls}>
         <div className="flex justify-center gap-0.5">
           {onViewHistory && (

@@ -1,4 +1,4 @@
-import { Fragment } from "react";
+﻿import { Fragment, memo } from "react";
 import type { FbBreakdown, FbAdSetGroup, FbAdLeaf } from "../types";
 import { fmtInt, fmtVnd } from "../formulas";
 
@@ -6,6 +6,8 @@ interface FbHierarchyTreeProps {
   breakdown: FbBreakdown;
   showAccount: boolean;
   hiddenCols?: Set<string>;
+  /** Cột rỗng auto-hide ở cấp DayBlock: skip render <td> để align với main row. */
+  autoHiddenCols?: ReadonlySet<string>;
 }
 
 const NA = "—";
@@ -61,6 +63,7 @@ function FbDataCols({
   cpcCls,
   spendCls,
   hiddenCols,
+  autoHiddenCols,
 }: {
   clicks: number | null | undefined;
   cpc: number | null | undefined;
@@ -68,38 +71,30 @@ function FbDataCols({
   cpcCls: string;
   spendCls: string;
   hiddenCols?: Set<string>;
+  autoHiddenCols?: ReadonlySet<string>;
 }) {
-  const hClicks = hiddenCols?.has("Click ADS") ?? false;
-  const hCpc = hiddenCols?.has("Đơn giá click") ?? false;
-  const hSpend = hiddenCols?.has("Tổng tiền chạy") ?? false;
-  if (hClicks || hCpc || hSpend) {
-    return (
-      <>
-        {hClicks ? <td className={cell}>{MASK}</td> : <IntCell v={clicks} />}  {/* Click ADS   */}
-        <NaCell />                               {/* Click Shopee   */}
-        {hCpc ? <td className={cell}>{MASK}</td> : <VndCell v={cpc} cls={cpcCls} />}   {/* CPC       */}
-        {hSpend ? <td className={cell}>{MASK}</td> : <VndCell v={spend} cls={spendCls} />} {/* Spend  */}
-        <NaCell />                               {/* Số đơn        */}
-        <NaCell />                               {/* CR             */}
-        <NaCell />                               {/* GMV            */}
-        <NaCell />                               {/* Hoa hồng      */}
-        <NaCell />                               {/* Lợi nhuận     */}
-        <NaCell />                               {/* ROI            */}
-      </>
-    );
-  }
+  const h = (col: string) => hiddenCols?.has(col) ?? false;
+  const auto = (col: string) => autoHiddenCols?.has(col) ?? false;
+  // Mỗi cell render conditional theo autoHiddenCols để align với main row +
+  // header (DayBlock skip <th> tương ứng). hiddenCols vẫn giữ behavior MASK cũ.
   return (
     <>
-      <IntCell v={clicks} />                    {/* Click ADS      */}
-      <NaCell />                                 {/* Click Shopee   */}
-      <VndCell v={cpc} cls={cpcCls} />          {/* CPC            */}
-      <VndCell v={spend} cls={spendCls} />      {/* Spend          */}
-      <NaCell />                                 {/* Số đơn        */}
-      <NaCell />                                 {/* CR             */}
-      <NaCell />                                 {/* GMV            */}
-      <NaCell />                                 {/* Hoa hồng      */}
-      <NaCell />                                 {/* Lợi nhuận     */}
-      <NaCell />                                 {/* ROI            */}
+      {!auto("Click ADS") && (
+        h("Click ADS") ? <td className={cell}>{MASK}</td> : <IntCell v={clicks} />
+      )}
+      {!auto("Click Shopee") && <NaCell />}
+      {!auto("Đơn giá click") && (
+        h("Đơn giá click") ? <td className={cell}>{MASK}</td> : <VndCell v={cpc} cls={cpcCls} />
+      )}
+      {!auto("Tổng tiền chạy") && (
+        h("Tổng tiền chạy") ? <td className={cell}>{MASK}</td> : <VndCell v={spend} cls={spendCls} />
+      )}
+      {!auto("Số lượng đơn") && <NaCell />}
+      {!auto("CR") && <NaCell />}
+      {!auto("Giá trị đơn hàng") && <NaCell />}
+      {!auto("Hoa hồng") && <NaCell />}
+      {!auto("Lợi nhuận") && <NaCell />}
+      {!auto("ROI") && <NaCell />}
     </>
   );
 }
@@ -109,11 +104,13 @@ function AdRow({
   showAccount,
   indentCls,
   hiddenCols,
+  autoHiddenCols,
 }: {
   ad: FbAdLeaf;
   showAccount: boolean;
   indentCls: string;
   hiddenCols?: Set<string>;
+  autoHiddenCols?: ReadonlySet<string>;
 }) {
   return (
     <tr className="border-b border-surface-8/20">
@@ -144,6 +141,7 @@ function AdRow({
         cpcCls="text-gray-400"
         spendCls="text-blue-200"
         hiddenCols={hiddenCols}
+        autoHiddenCols={autoHiddenCols}
       />
       <td className="col-actions" />
     </tr>
@@ -156,12 +154,14 @@ function AdSetRow({
   showAd,
   indentCls,
   hiddenCols,
+  autoHiddenCols,
 }: {
   adset: FbAdSetGroup;
   showAccount: boolean;
   showAd: boolean;
   indentCls: string;
   hiddenCols?: Set<string>;
+  autoHiddenCols?: ReadonlySet<string>;
 }) {
   return (
     <tr className="border-b border-surface-8/40 bg-surface-1/25">
@@ -190,13 +190,14 @@ function AdSetRow({
         cpcCls="text-gray-400"
         spendCls="text-blue-300"
         hiddenCols={hiddenCols}
+        autoHiddenCols={autoHiddenCols}
       />
       <td className="col-actions" />
     </tr>
   );
 }
 
-export function FbHierarchyTree({ breakdown, showAccount, hiddenCols }: FbHierarchyTreeProps) {
+function FbHierarchyTreeImpl({ breakdown, showAccount, hiddenCols, autoHiddenCols }: FbHierarchyTreeProps) {
   if (!breakdown.campaigns.length) return null;
 
   const { showCampaign, showAdSet, showAd } = computeLevels(breakdown);
@@ -242,6 +243,7 @@ export function FbHierarchyTree({ breakdown, showAccount, hiddenCols }: FbHierar
                   cpcCls="text-gray-400"
                   spendCls="font-semibold text-blue-400"
                   hiddenCols={hiddenCols}
+                  autoHiddenCols={autoHiddenCols}
                 />
                 <td className="col-actions" />
               </tr>
@@ -257,6 +259,7 @@ export function FbHierarchyTree({ breakdown, showAccount, hiddenCols }: FbHierar
                     showAd={showAd}
                     indentCls={adsetIndent}
                     hiddenCols={hiddenCols}
+                    autoHiddenCols={autoHiddenCols}
                   />
                   {showAd &&
                     adset.ads.map((ad) => (
@@ -266,6 +269,7 @@ export function FbHierarchyTree({ breakdown, showAccount, hiddenCols }: FbHierar
                         showAccount={showAccount}
                         indentCls={adUnderAdsetIndent}
                         hiddenCols={hiddenCols}
+                        autoHiddenCols={autoHiddenCols}
                       />
                     ))}
                 </Fragment>
@@ -279,6 +283,7 @@ export function FbHierarchyTree({ breakdown, showAccount, hiddenCols }: FbHierar
                 showAccount={showAccount}
                 indentCls={adFlatIndent}
                 hiddenCols={hiddenCols}
+                autoHiddenCols={autoHiddenCols}
               />
             ))}
           </Fragment>
@@ -287,3 +292,8 @@ export function FbHierarchyTree({ breakdown, showAccount, hiddenCols }: FbHierar
     </>
   );
 }
+
+// memo: breakdown ref ổn định khi day cache hit; showAccount/hiddenCols
+// chỉ đổi khi user action (filter / toggle column). Tránh re-build tree
+// vài chục dòng × N day mỗi commit.
+export const FbHierarchyTree = memo(FbHierarchyTreeImpl);

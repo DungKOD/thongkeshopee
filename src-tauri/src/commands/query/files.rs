@@ -10,7 +10,7 @@ use crate::db::DbState;
 use super::super::{CmdError, CmdResult};
 
 #[tauri::command]
-pub fn list_imported_files(state: State<'_, DbState>) -> CmdResult<Vec<ImportedFileInfo>> {
+pub async fn list_imported_files(state: State<'_, DbState>) -> CmdResult<Vec<ImportedFileInfo>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     // v10: JOIN shopee_accounts để trả account_name + thêm reverted_at cho
     // FE phân biệt active vs đã hoàn tác. active_rows = SUM mapping (cần để

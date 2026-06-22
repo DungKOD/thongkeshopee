@@ -10,9 +10,9 @@ use rusqlite::Connection;
 use serde::Serialize;
 use tauri::State;
 
-use crate::db::DbState;
+use crate::db::ReadPool;
 
-use super::super::{CmdError, CmdResult};
+use super::super::CmdResult;
 
 /// Snapshot toàn DB dùng cho FE autocomplete + summary. Gọi 1 lần khi app start
 /// và sau mỗi mutation — KHÔNG gọi mỗi filter-change. FE dùng để:
@@ -35,8 +35,8 @@ pub struct OverviewPayload {
 }
 
 #[tauri::command]
-pub fn load_overview(state: State<'_, DbState>) -> CmdResult<OverviewPayload> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+pub async fn load_overview(pool: State<'_, ReadPool>) -> CmdResult<OverviewPayload> {
+    let conn = pool.acquire();
     load_overview_impl(&conn)
 }
 

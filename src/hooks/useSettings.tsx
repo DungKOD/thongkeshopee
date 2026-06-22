@@ -3,19 +3,22 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
 } from "react";
 import { invoke } from "../lib/tauri";
 import { useAuth } from "../contexts/AuthContext";
+import {
+  sumFiltered as sumFilteredPure,
+  type ProfitFees as ProfitFeesPure,
+} from "../lib/profitFees";
 
-export interface ProfitFees {
-  /** % thuế + phí sàn khấu trừ từ hoa hồng (vd 10.98). */
-  taxAndPlatformRate: number;
-  /** % dự phòng hoàn/hủy đơn (vd 9). */
-  returnReserveRate: number;
-}
+// Re-export để consumers cũ (formulas.ts, components, worker) không phải sửa
+// import path. Source of truth nằm ở `lib/profitFees.ts` — pure module worker-safe.
+export type ProfitFees = ProfitFeesPure;
+export const sumFiltered = sumFilteredPure;
 
 /// Mode khớp tuple sub_id giữa FB ad và Shopee anchor.
 /// - `exact`: slot-by-slot equality (default). Chỉ merge khi tuple FB là
@@ -160,23 +163,31 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       if (!hydratedRef.current) return;
       setSettings((prev) => {
         const cs = { ...prev.clickSources };
-        const newKeys: string[] = [];
+        const newEntries: SettingEntry[] = [];
         for (const s of sources) {
           if (s && !(s in cs)) {
             cs[s] = true;
-            newKeys.push(s);
+            newEntries.push({
+              key: CLICK_SOURCE_PREFIX + s,
+              value: JSON.stringify(true),
+            });
           }
         }
-        if (newKeys.length === 0) return prev;
+        if (newEntries.length === 0) return prev;
+        // BULK transaction thay vì N invoke set_app_setting riêng lẻ. Khi user
+        // import CSV với nhiều nguồn click mới (vd 50-100 referrers), N round-
+        // trip BE x N lần acquire DbState mutex → có thể "treo" UI ở progress
+        // "Đang tải nguồn click...". Bulk dùng 1 prepared stmt trong 1 tx.
         setTimeout(() => {
-          for (const k of newKeys) {
-            void persistKey(CLICK_SOURCE_PREFIX + k, true);
-          }
+          void invoke<void>("set_app_settings_bulk", { entries: newEntries })
+            .catch((err) =>
+              console.warn("[useSettings] bulk register sources failed:", err),
+            );
         }, 0);
         return { ...prev, clickSources: cs };
       });
     },
-    [persistKey],
+    [],
   );
 
   const getEnabledSet = useCallback((): Set<string> => {
@@ -211,19 +222,35 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [persistKey],
   );
 
+  // useMemo: KHÔNG tạo object literal mới mỗi render. Nếu thiếu, mọi
+  // consumer useSettings() (hàng trăm VideoRow + DayBlock) sẽ re-render
+  // bất cứ khi nào SettingsProvider re-render — kể cả khi data thực không
+  // đổi. Đây là silent killer của memoization.
+  const value = useMemo<SettingsContextValue>(
+    () => ({
+      settings,
+      setClickSource,
+      registerSources,
+      getEnabledSet,
+      setProfitFee,
+      setSubIdMatchMode,
+      reload,
+      hydrated,
+    }),
+    [
+      settings,
+      setClickSource,
+      registerSources,
+      getEnabledSet,
+      setProfitFee,
+      setSubIdMatchMode,
+      reload,
+      hydrated,
+    ],
+  );
+
   return (
-    <SettingsContext.Provider
-      value={{
-        settings,
-        setClickSource,
-        registerSources,
-        getEnabledSet,
-        setProfitFee,
-        setSubIdMatchMode,
-        reload,
-        hydrated,
-      }}
-    >
+    <SettingsContext.Provider value={value}>
       {children}
     </SettingsContext.Provider>
   );
@@ -235,17 +262,3 @@ export function useSettings(): SettingsContextValue {
   return ctx;
 }
 
-/**
- * Tính shopeeClicks hiển thị từ breakdown theo settings.
- * Referrer không có trong settings (ví dụ "Nhập tay" khi chưa đăng ký) mặc định = enabled.
- */
-export function sumFiltered(
-  breakdown: Record<string, number>,
-  clickSources: Record<string, boolean>,
-): number {
-  let total = 0;
-  for (const [ref, n] of Object.entries(breakdown)) {
-    if (clickSources[ref] !== false) total += n;
-  }
-  return total;
-}

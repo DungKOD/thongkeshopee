@@ -245,7 +245,6 @@ export function AggregateProductDialog({
     setCapturing(true);
     try {
       const blob = await captureElementToBlob(dialogRef.current, {
-        pixelRatio: 2,
         backgroundColor: "#121212",
       });
       setScreenshotBlob(blob);
@@ -446,9 +445,9 @@ export function AggregateProductDialog({
                 tooltip="Hoa hồng / Số đơn"
               />
               <MetricRow
-                label="Tỷ lệ chuyển đổi"
+                label="CR"
                 value={cr !== null ? fmtPct(cr) : "—"}
-                tooltip="CR = Số đơn / Click Shopee × 100%"
+                tooltip="Tỷ lệ chuyển đổi (CR) = Số đơn / Click Shopee × 100%"
               />
               <MetricRow
                 label="Hoa hồng gross"
@@ -1001,14 +1000,15 @@ function OrderStatusBreakdownChart({ data }: { data: BreakdownPoint[] }) {
                 }}
               />
             )}
-            <Bar dataKey="attributed" stackId="a" name="Có HH" fill={COLOR_ATTRIBUTED} />
-            <Bar dataKey="zeroHH" stackId="a" name="HH = 0đ" fill={COLOR_ZERO_HH} />
+            <Bar dataKey="attributed" stackId="a" name="Có HH" fill={COLOR_ATTRIBUTED} isAnimationActive={false} />
+            <Bar dataKey="zeroHH" stackId="a" name="HH = 0đ" fill={COLOR_ZERO_HH} isAnimationActive={false} />
             <Bar
               dataKey="cancelled"
               stackId="a"
               name="Hủy"
               fill={COLOR_CANCELLED}
               radius={[4, 4, 0, 0]}
+              isAnimationActive={false}
             >
               <LabelList
                 dataKey="badPct"

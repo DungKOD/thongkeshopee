@@ -1,8 +1,5 @@
 import type { DayTotals, UiDay, UiRow, VideoComputed } from "./types";
-import {
-  sumFiltered,
-  type ProfitFees,
-} from "./hooks/useSettings";
+import { sumFiltered, type ProfitFees } from "./lib/profitFees";
 
 const safeDiv = (a: number, b: number) => (b === 0 ? 0 : a / b);
 
@@ -703,6 +700,41 @@ export type ExtremumDay = {
   orders: number;
 };
 
+export type CommissionExtremumDay = {
+  date: string;
+  netCommission: number;
+  orders: number;
+};
+
+/// Best/worst day theo netCommission — dùng cho mode "Chỉ Shopee" (không có
+/// spend → không so sánh profit/ROI được). Trả null nếu trend chỉ có ≤ 1 ngày
+/// hoặc nếu best.date === worst.date (so sánh với chính nó không có nghĩa).
+export function computeCommissionExtremumDays(
+  trend: readonly DailyTrendPoint[],
+): {
+  best: CommissionExtremumDay | null;
+  worst: CommissionExtremumDay | null;
+} {
+  if (trend.length <= 1) return { best: null, worst: null };
+  const withCommission = trend.filter((p) => p.netCommission > 0);
+  if (withCommission.length === 0) return { best: null, worst: null };
+
+  const best = withCommission.reduce((a, b) =>
+    a.netCommission >= b.netCommission ? a : b,
+  );
+  const worst = withCommission.reduce((a, b) =>
+    a.netCommission <= b.netCommission ? a : b,
+  );
+  if (best.date === worst.date) return { best: null, worst: null };
+
+  const toExt = (p: DailyTrendPoint): CommissionExtremumDay => ({
+    date: p.date,
+    netCommission: p.netCommission,
+    orders: p.orders,
+  });
+  return { best: toExt(best), worst: toExt(worst) };
+}
+
 export function computeExtremumDays(
   trend: readonly DailyTrendPoint[],
 ): { best: ExtremumDay | null; worst: ExtremumDay | null } {
@@ -762,6 +794,23 @@ export const fmtDate = (iso: string) => {
   if (!y || !m || !d) return iso;
   return `${d}/${m}/${y}`;
 };
+
+/**
+ * Compact tiếng Việt cho KPI lớn — "3,94 tỷ" / "355,9 triệu" / "12 nghìn".
+ * Trả `null` khi dưới ngưỡng (< 1 triệu) → caller bỏ qua, chỉ hiển thị số đầy đủ.
+ */
+export function fmtVndCompactVi(n: number): string | null {
+  if (!Number.isFinite(n) || n === 0) return null;
+  const abs = Math.abs(n);
+  const sign = n < 0 ? "-" : "";
+  if (abs >= 1_000_000_000) {
+    return `${sign}${(abs / 1_000_000_000).toFixed(2).replace(".", ",")} tỷ`;
+  }
+  if (abs >= 1_000_000) {
+    return `${sign}${(abs / 1_000_000).toFixed(1).replace(".", ",")} triệu`;
+  }
+  return null;
+}
 
 /** Rút gọn số thành K/M/B cho trục Y chart (giữ dấu âm). */
 export function fmtMoneyShort(n: number): string {

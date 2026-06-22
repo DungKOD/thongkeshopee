@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 use tauri::State;
 
 use crate::db::types::{FbAdLeaf, FbAdSetGroup, FbBreakdown, FbCampaignGroup, UiDay, UiRow};
-use crate::db::DbState;
+use crate::db::ReadPool;
 
 use super::super::{CmdError, CmdResult};
 use super::aggregate::{
@@ -31,18 +31,42 @@ use super::aggregate::{
 const BATCH_DAY_LIMIT: usize = 900;
 use super::{default_account_id_lookup, AccountFilterMode, DaysFilter};
 
+/// Async để Tauri chạy command trên worker thread thay vì main thread →
+/// JS event loop không block khi SQL aggregation chạy. SQL bên trong vẫn
+/// sync (rusqlite blocking) nhưng chỉ giữ MutexGuard trong phạm vi body
+/// không cross `.await` → future Send-safe.
+///
+/// Production: truyền `Some(pool)` xuống impl để 5-6 batch fetch chạy song
+/// song trên N connection riêng (SQLite WAL multi-reader). Test path: gọi
+/// `list_days_with_rows_impl(&conn, filter)` → None pool → serial fallback.
 #[tauri::command]
-pub fn list_days_with_rows(
-    state: State<'_, DbState>,
+pub async fn list_days_with_rows(
+    pool: State<'_, ReadPool>,
     filter: Option<DaysFilter>,
 ) -> CmdResult<Vec<UiDay>> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
-    list_days_with_rows_impl(&conn, filter.unwrap_or_default())
+    let pool_ref: &ReadPool = &pool;
+    let conn = pool_ref.acquire();
+    list_days_with_rows_impl_with_pool(&conn, Some(pool_ref), filter.unwrap_or_default())
 }
 
 /// Tách impl khỏi command để test truy cập trực tiếp với `Connection`.
+/// Tests dùng wrapper này (single-conn, serial batch fetch).
 pub(super) fn list_days_with_rows_impl(
     conn: &Connection,
+    filter: DaysFilter,
+) -> CmdResult<Vec<UiDay>> {
+    list_days_with_rows_impl_with_pool(conn, None, filter)
+}
+
+/// Impl chính. `pool_for_parallel`:
+/// - `Some(pool)`: 5-6 batch query chạy song song qua `std::thread::scope`,
+///   mỗi thread acquire connection riêng từ pool (WAL multi-reader). Wall
+///   clock ≈ max(query_times) thay vì sum(query_times) → 3-5x nhanh hơn
+///   khi data lớn.
+/// - `None`: serial fetch trên `conn` (test path, hoặc env không có pool).
+pub(super) fn list_days_with_rows_impl_with_pool(
+    conn: &Connection,
+    pool_for_parallel: Option<&ReadPool>,
     filter: DaysFilter,
 ) -> CmdResult<Vec<UiDay>> {
     // Build query động theo filter. Tất cả đều parameterized — không string-concat user input.
@@ -150,36 +174,44 @@ pub(super) fn list_days_with_rows_impl(
     // =========================================================================
     let dates: Vec<&str> = days.iter().map(|(d, _)| d.as_str()).collect();
     let placeholders = dates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let date_params: Vec<&dyn rusqlite::ToSql> =
-        dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
 
     let account_id_eq: Option<i64> = match &account_filter {
         AccountFilterMode::Account { id } => Some(*id),
         _ => None,
     };
 
-    // Fetch all 5 sources in 5 queries (+ up to 3 extra when account filter active).
-    let mut batch_fb_ads =
-        batch_fetch_fb_ads(conn, &placeholders, date_params.as_slice())?;
-    let mut batch_fb_hier =
-        batch_fetch_fb_hier(conn, &placeholders, date_params.as_slice())?;
-    let mut batch_clicks =
-        batch_fetch_shopee_clicks(conn, &placeholders, date_params.as_slice(), account_id_eq)?;
-    let mut batch_orders =
-        batch_fetch_shopee_orders(conn, &placeholders, date_params.as_slice(), account_id_eq)?;
-    let mut batch_manuals =
-        batch_fetch_manuals(conn, &placeholders, date_params.as_slice(), account_id_eq)?;
-
-    // All-account owner pairs: only needed when account filter is active.
-    // When All: derived per-day from already-fetched (unfiltered) data.
-    let mut batch_owner_pairs: Option<HashMap<String, RawOwnerPairs>> = if account_id_eq.is_some() {
-        Some(batch_fetch_all_account_owner_pairs(
-            conn,
-            &placeholders,
-            date_params.as_slice(),
-        )?)
-    } else {
-        None
+    // Fetch all 5-6 sources. Parallel khi có pool (5-6 thread, mỗi thread
+    // acquire connection riêng — SQLite WAL cho phép multi-reader concurrent
+    // nên wall-clock ≈ max(query_times)). Serial khi None (test path).
+    let (
+        mut batch_fb_ads,
+        mut batch_fb_hier,
+        mut batch_clicks,
+        mut batch_orders,
+        mut batch_manuals,
+        mut batch_owner_pairs,
+    ) = match pool_for_parallel {
+        Some(p) => fetch_batches_parallel(p, &placeholders, dates.as_slice(), account_id_eq)?,
+        None => {
+            let date_params: Vec<&dyn rusqlite::ToSql> =
+                dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+            (
+                batch_fetch_fb_ads(conn, &placeholders, date_params.as_slice())?,
+                batch_fetch_fb_hier(conn, &placeholders, date_params.as_slice())?,
+                batch_fetch_shopee_clicks(conn, &placeholders, date_params.as_slice(), account_id_eq)?,
+                batch_fetch_shopee_orders(conn, &placeholders, date_params.as_slice(), account_id_eq)?,
+                batch_fetch_manuals(conn, &placeholders, date_params.as_slice(), account_id_eq)?,
+                if account_id_eq.is_some() {
+                    Some(batch_fetch_all_account_owner_pairs(
+                        conn,
+                        &placeholders,
+                        date_params.as_slice(),
+                    )?)
+                } else {
+                    None
+                },
+            )
+        }
     };
 
     let mut out = Vec::with_capacity(days.len());
@@ -1122,6 +1154,91 @@ fn batch_fetch_all_account_owner_pairs(
         );
     }
     Ok(result)
+}
+
+/// Tuple chứa kết quả 5-6 batch fetch — type alias dùng chung serial vs parallel.
+type BatchResults = (
+    HashMap<String, Vec<RawFbAds>>,
+    HashMap<String, Vec<RawFbHier>>,
+    HashMap<String, Vec<RawShopeeClick>>,
+    HashMap<String, Vec<RawShopeeOrder>>,
+    HashMap<String, Vec<RawManual>>,
+    Option<HashMap<String, RawOwnerPairs>>,
+);
+
+/// Chạy 5-6 batch query song song qua `std::thread::scope`. Mỗi thread acquire
+/// 1 ReadPool connection riêng → SQLite WAL multi-reader cho phép concurrent.
+/// Tổng wall-clock ≈ max(query_times) thay vì sum(query_times) — 3-5x faster
+/// khi data lớn (5 query × 50ms serial → ~60ms parallel).
+///
+/// `Vec<&dyn ToSql>` được build lại trong từng closure (không cross thread
+/// boundary). Các capture (`&ReadPool`, `&[&str]`, `&str`, `Option<i64>`) đều
+/// `Send + Sync`. MutexGuard từ `pool.acquire()` là `!Send` nhưng chỉ tồn tại
+/// trong thân closure (không crossing yield/spawn boundary) → an toàn.
+fn fetch_batches_parallel(
+    pool: &ReadPool,
+    placeholders: &str,
+    dates: &[&str],
+    account_id_eq: Option<i64>,
+) -> CmdResult<BatchResults> {
+    std::thread::scope(|s| -> CmdResult<BatchResults> {
+        let h_fb_ads = s.spawn(|| -> CmdResult<HashMap<String, Vec<RawFbAds>>> {
+            let conn = pool.acquire();
+            let p: Vec<&dyn rusqlite::ToSql> =
+                dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+            batch_fetch_fb_ads(&conn, placeholders, p.as_slice())
+        });
+        let h_fb_hier = s.spawn(|| -> CmdResult<HashMap<String, Vec<RawFbHier>>> {
+            let conn = pool.acquire();
+            let p: Vec<&dyn rusqlite::ToSql> =
+                dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+            batch_fetch_fb_hier(&conn, placeholders, p.as_slice())
+        });
+        let h_clicks = s.spawn(|| -> CmdResult<HashMap<String, Vec<RawShopeeClick>>> {
+            let conn = pool.acquire();
+            let p: Vec<&dyn rusqlite::ToSql> =
+                dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+            batch_fetch_shopee_clicks(&conn, placeholders, p.as_slice(), account_id_eq)
+        });
+        let h_orders = s.spawn(|| -> CmdResult<HashMap<String, Vec<RawShopeeOrder>>> {
+            let conn = pool.acquire();
+            let p: Vec<&dyn rusqlite::ToSql> =
+                dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+            batch_fetch_shopee_orders(&conn, placeholders, p.as_slice(), account_id_eq)
+        });
+        let h_manuals = s.spawn(|| -> CmdResult<HashMap<String, Vec<RawManual>>> {
+            let conn = pool.acquire();
+            let p: Vec<&dyn rusqlite::ToSql> =
+                dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+            batch_fetch_manuals(&conn, placeholders, p.as_slice(), account_id_eq)
+        });
+        let h_owner_pairs = if account_id_eq.is_some() {
+            Some(s.spawn(|| -> CmdResult<HashMap<String, RawOwnerPairs>> {
+                let conn = pool.acquire();
+                let p: Vec<&dyn rusqlite::ToSql> =
+                    dates.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+                batch_fetch_all_account_owner_pairs(&conn, placeholders, p.as_slice())
+            }))
+        } else {
+            None
+        };
+
+        let map_panic = |name: &str, e: Box<dyn std::any::Any + Send>| -> CmdError {
+            CmdError::msg(format!("batch fetch '{name}' panicked: {e:?}"))
+        };
+
+        let fb_ads = h_fb_ads.join().map_err(|e| map_panic("fb_ads", e))??;
+        let fb_hier = h_fb_hier.join().map_err(|e| map_panic("fb_hier", e))??;
+        let clicks = h_clicks.join().map_err(|e| map_panic("clicks", e))??;
+        let orders = h_orders.join().map_err(|e| map_panic("orders", e))??;
+        let manuals = h_manuals.join().map_err(|e| map_panic("manuals", e))??;
+        let owner_pairs = match h_owner_pairs {
+            Some(h) => Some(h.join().map_err(|e| map_panic("owner_pairs", e))??),
+            None => None,
+        };
+
+        Ok((fb_ads, fb_hier, clicks, orders, manuals, owner_pairs))
+    })
 }
 
 /// Fallback single-day query path (used when dates > BATCH_DAY_LIMIT or for direct calls).

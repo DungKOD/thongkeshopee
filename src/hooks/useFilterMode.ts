@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 
 /**
@@ -17,6 +17,10 @@ export type FilterMode =
 export type FilterScope = "stats" | "overview";
 
 export const LOAD_MORE_STEP = 7;
+/** First-paint page size cho "range" / "all" mode: BE chỉ trả N ngày gần nhất
+ *  → load gần như tức thì kể cả khi DB có hàng năm data. User scroll xuống
+ *  cuối → `extendPage()` tăng pageLimit thêm `LOAD_MORE_STEP` → refetch. */
+export const INITIAL_PAGE_LIMIT = 30;
 /** Mặc định BOTH scopes (stats + overview) = 1 ngày gần nhất — khớp với
  *  shortcut "Ngày gần nhất" (canExpand=false, count=1) để UI highlight
  *  đúng. User click shortcut khác (7/14/30 ngày / range) để mở rộng. */
@@ -104,10 +108,30 @@ export interface UseFilterModeResult {
   setDateFrom: (v: string) => void;
   /** Date picker "Đến ngày" → chuyển sang range mode. */
   setDateTo: (v: string) => void;
+  /** Explicit range (cả from + to set cùng lúc). */
+  setRange: (from: string, to: string) => void;
+  /** Page size hiện tại cho "range"/"all" mode. `undefined` nếu scope không
+   *  paginate (overview). "recent" mode không dùng pageLimit (đã có count). */
+  pageLimit: number | undefined;
+  /** Tăng pageLimit thêm `step` ngày — gọi từ infinite scroll observer. No-op
+   *  nếu scope không paginate. */
+  extendPage: (step?: number) => void;
 }
 
-export function useFilterMode(_scope: FilterScope): UseFilterModeResult {
+export function useFilterMode(scope: FilterScope): UseFilterModeResult {
   const [mode, setMode] = useState<FilterMode>(DEFAULT_MODE);
+  // Stats tab paginate để first paint "gần như tức thì" kể cả khi user chọn
+  // "Từ trước đến nay" trên DB nhiều năm. Overview tab cần full data để KPI
+  // chính xác → không paginate (pageLimit undefined → BE không cap).
+  const usePagination = scope === "stats";
+  const [pageLimit, setPageLimit] = useState<number | undefined>(
+    usePagination ? INITIAL_PAGE_LIMIT : undefined,
+  );
+  // Mode đổi → reset pageLimit về 30. Tránh user click "Tháng này" rồi
+  // "Từ trước đến nay" mà vẫn giữ pageLimit cũ (vd 90) → load chậm trở lại.
+  useEffect(() => {
+    if (usePagination) setPageLimit(INITIAL_PAGE_LIMIT);
+  }, [mode, usePagination]);
 
   const setRecent = useCallback(
     (n: number) => setMode({ type: "recent", count: n, canExpand: false }),
@@ -137,6 +161,16 @@ export function useFilterMode(_scope: FilterScope): UseFilterModeResult {
       to: v,
     }));
   }, []);
+  const setRange = useCallback((from: string, to: string) => {
+    setMode({ type: "range", from, to });
+  }, []);
+  const extendPage = useCallback(
+    (step: number = LOAD_MORE_STEP) => {
+      if (!usePagination) return;
+      setPageLimit((n) => (n ?? INITIAL_PAGE_LIMIT) + step);
+    },
+    [usePagination],
+  );
 
   return {
     mode,
@@ -148,5 +182,8 @@ export function useFilterMode(_scope: FilterScope): UseFilterModeResult {
     clear,
     setDateFrom,
     setDateTo,
+    setRange,
+    pageLimit,
+    extendPage,
   };
 }

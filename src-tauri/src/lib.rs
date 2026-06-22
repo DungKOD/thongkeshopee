@@ -88,6 +88,23 @@ pub fn run() {
             commands::fb_reels::fb_upload_reel,
             commands::fb_reels::fb_list_posts,
             commands::fb_reels::fb_delete_post,
+            commands::fb_ads::fb_ads_validate_token,
+            commands::fb_ads::fb_ads_save_accounts,
+            commands::fb_ads::fb_ads_list_accounts,
+            commands::fb_ads::fb_ads_delete_account,
+            commands::fb_ads::fb_ads_list_fb_campaigns,
+            commands::fb_ads::fb_ads_save_template,
+            commands::fb_ads::fb_ads_list_templates,
+            commands::fb_ads::fb_ads_get_template_detail,
+            commands::fb_ads::fb_ads_delete_template,
+            commands::fb_ads::fb_ads_save_draft,
+            commands::fb_ads::fb_ads_list_drafts,
+            commands::fb_ads::fb_ads_get_draft,
+            commands::fb_ads::fb_ads_delete_draft,
+            commands::fb_ads::fb_ads_create_batch,
+            commands::fb_ads::fb_ads_retry_job,
+            commands::fb_ads::fb_ads_list_batches,
+            commands::fb_ads::fb_ads_list_jobs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

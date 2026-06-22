@@ -113,6 +113,122 @@ html:not(.fonts-loaded) .material-symbols-rounded {
   will-change: transform;
 }
 
+/* Chart animations — Recharts default SVG animation (interpolate attribute
+ * `height` từng frame qua React state) gây giật trên một số máy. Thay
+ * bằng CSS transform trên từng <path> của bar/line: scaleY (compositor-only)
+ * → GPU layer riêng, mượt 60fps không chiếm CPU. Tắt isAnimationActive ở
+ * Recharts elements trước khi dùng class này (nếu không sẽ animate 2 lần).
+ *
+ * - `.animate-chart-fade-in`: vertical bars grow up from bottom (default).
+ * - `.animate-chart-fade-in-h`: horizontal bars grow right from left
+ *   (dùng cho BarChart layout="vertical").
+ *
+ * Re-trigger animation = parent thay `key` (mode/metric switch). Filter
+ * data đổi → bars update in-place không re-animate. */
+
+@keyframes chart-bar-grow-up {
+  from { transform: scaleY(0); opacity: 0; }
+  to   { transform: scaleY(1); opacity: 1; }
+}
+@keyframes chart-bar-grow-right {
+  from { transform: scaleX(0); opacity: 0; }
+  to   { transform: scaleX(1); opacity: 1; }
+}
+@keyframes chart-line-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Vertical bars: scale từ đáy lên. Apply trực tiếp lên <g class="recharts-bar-rectangle">
+ * thay vì child path để selector ngắn + tránh edge case khi Recharts đổi
+ * structure. `transform-box: fill-box` để transform-origin tính theo BBox
+ * của g (= BBox của bar bên trong), không phải SVG root. */
+.animate-chart-fade-in .recharts-bar-rectangle {
+  animation: chart-bar-grow-up 700ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  transform-origin: bottom;
+  transform-box: fill-box;
+  will-change: transform, opacity;
+}
+
+/* Stagger 25ms mỗi bar → wave effect "mọc lên lần lượt" trái sang phải.
+ * Cover 30 bars (đủ cho 24 giờ hourly, ~30 ngày trend, top-N cancellation).
+ * Bar > 30 share delay cuối qua nth-child(n+31). */
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(1)  { animation-delay: 0ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(2)  { animation-delay: 25ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(3)  { animation-delay: 50ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(4)  { animation-delay: 75ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(5)  { animation-delay: 100ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(6)  { animation-delay: 125ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(7)  { animation-delay: 150ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(8)  { animation-delay: 175ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(9)  { animation-delay: 200ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(10) { animation-delay: 225ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(11) { animation-delay: 250ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(12) { animation-delay: 275ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(13) { animation-delay: 300ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(14) { animation-delay: 325ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(15) { animation-delay: 350ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(16) { animation-delay: 375ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(17) { animation-delay: 400ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(18) { animation-delay: 425ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(19) { animation-delay: 450ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(20) { animation-delay: 475ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(21) { animation-delay: 500ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(22) { animation-delay: 525ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(23) { animation-delay: 550ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(24) { animation-delay: 575ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(25) { animation-delay: 600ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(26) { animation-delay: 625ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(27) { animation-delay: 650ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(28) { animation-delay: 675ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(29) { animation-delay: 700ms; }
+.animate-chart-fade-in .recharts-bar-rectangle:nth-child(n+30) { animation-delay: 725ms; }
+
+/* Horizontal bars: scale từ trái sang phải, stagger top-to-bottom. */
+.animate-chart-fade-in-h .recharts-bar-rectangle {
+  animation: chart-bar-grow-right 700ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  transform-origin: left;
+  transform-box: fill-box;
+  will-change: transform, opacity;
+}
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(1)  { animation-delay: 0ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(2)  { animation-delay: 30ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(3)  { animation-delay: 60ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(4)  { animation-delay: 90ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(5)  { animation-delay: 120ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(6)  { animation-delay: 150ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(7)  { animation-delay: 180ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(8)  { animation-delay: 210ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(9)  { animation-delay: 240ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(10) { animation-delay: 270ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(11) { animation-delay: 300ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(12) { animation-delay: 330ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(13) { animation-delay: 360ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(14) { animation-delay: 390ms; }
+.animate-chart-fade-in-h .recharts-bar-rectangle:nth-child(n+15) { animation-delay: 420ms; }
+
+/* Lines + areas: reveal trái-sang-phải bằng clip-path inset (Chromium
+ * composite được trên GPU). Cảm giác line/area đang "vẽ" dần theo thời
+ * gian, khớp với trục X (time). Cubic-bezier ease-out cho tốc độ đầu
+ * nhanh, cuối chậm dần — tự nhiên như tay vẽ. */
+@keyframes chart-line-reveal-ltr {
+  from { clip-path: inset(0 100% 0 0); }
+  to   { clip-path: inset(0 0 0 0); }
+}
+
+.animate-chart-fade-in .recharts-line-curve,
+.animate-chart-fade-in .recharts-area-area,
+.animate-chart-fade-in .recharts-area-curve {
+  animation: chart-line-reveal-ltr 900ms cubic-bezier(0.4, 0, 0.2, 1) 150ms backwards;
+  will-change: clip-path;
+}
+
+/* Dots: fade sau khi line vẽ gần xong. Active-dot (hover) loại trừ để
+ * không bị animate khi tooltip xuất hiện. */
+.animate-chart-fade-in .recharts-line-dots {
+  animation: chart-line-fade-in 400ms ease-out 800ms backwards;
+}
+
 /* Indeterminate progress bar — thanh chạy qua-lại khi không biết % */
 @keyframes progress-indeterminate {
   0% { transform: translateX(-100%); }

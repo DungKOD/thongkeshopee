@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { TabButton } from "./AppShellButtons";
 
-export type AppTab = "stats" | "overview" | "download" | "upload";
+export type AppTab = "stats" | "overview" | "download" | "upload" | "bulkcamp";
 
 interface AppTabsNavProps {
   activeTab: AppTab;
@@ -15,6 +15,7 @@ export function AppTabsNav({ activeTab, onChange }: AppTabsNavProps) {
   const onOverview = useCallback(() => onChange("overview"), [onChange]);
   const onDownload = useCallback(() => onChange("download"), [onChange]);
   const onUpload = useCallback(() => onChange("upload"), [onChange]);
+  const onBulkCamp = useCallback(() => onChange("bulkcamp"), [onChange]);
   return (
     <nav className="flex gap-1 px-6">
       <TabButton
@@ -40,6 +41,12 @@ export function AppTabsNav({ activeTab, onChange }: AppTabsNavProps) {
         onClick={onUpload}
         icon="upload"
         label="Upload Page"
+      />
+      <TabButton
+        active={activeTab === "bulkcamp"}
+        onClick={onBulkCamp}
+        icon="campaign"
+        label="Bulk Camp"
       />
     </nav>
   );

@@ -14,6 +14,7 @@ import {
   YAxis,
 } from "recharts";
 import type {
+  CommissionExtremumDay,
   CumulativePoint,
   DailyTrendPoint,
   TrendGranularity,
@@ -21,9 +22,11 @@ import type {
 import {
   aggregateTrend,
   availableGranularities,
+  computeCommissionExtremumDays,
   computeCumulativeTrend,
   defaultTrendGranularity,
   fmtDate,
+  fmtInt,
   fmtMoneyShort,
   fmtPct,
   fmtVnd,
@@ -97,6 +100,15 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
   // Shopee-only: không hiển thị mode ROI (không có spend → không có ROI nghĩa).
   const effectiveMode: ChartMode = showAds ? mode : "finance";
 
+  // Ngày hoa hồng cao/thấp nhất — chỉ hiển thị ở mode "Chỉ Shopee" và khi
+  // khoảng lọc có ≥ 2 ngày có hoa hồng khác nhau (so sánh 1 ngày với chính
+  // nó vô nghĩa nên helper trả null). Dùng raw `data` (day-level) để label
+  // luôn là "ngày" bất kể granularity tuần/tháng.
+  const commissionExtremum = useMemo(
+    () => (showAds ? null : computeCommissionExtremumDays(data)),
+    [data, showAds],
+  );
+
   const empty = aggregated.length === 0;
 
   return (
@@ -156,12 +168,30 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
         </div>
       </header>
 
+      {commissionExtremum?.best && commissionExtremum?.worst && (
+        <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <CommissionExtremumPill
+            day={commissionExtremum.best}
+            kind="best"
+          />
+          <CommissionExtremumPill
+            day={commissionExtremum.worst}
+            kind="worst"
+          />
+        </div>
+      )}
+
       {empty ? (
         <div className="flex h-[280px] items-center justify-center text-sm text-white/40">
           Không có dữ liệu để vẽ biểu đồ
         </div>
       ) : (
-        <div className="h-[280px] w-full">
+        // `key` re-mount khi đổi mode/granularity → CSS fade-in chạy lại.
+        // Filter data đổi (data prop) → key giữ nguyên → chart snap thẳng, không animate.
+        <div
+          key={`${effectiveMode}-${granularity}`}
+          className="animate-chart-fade-in h-[280px] w-full"
+        >
           <ResponsiveContainer width="100%" height="100%">
             {effectiveMode === "cumulative" ? (
               <AreaChart
@@ -216,6 +246,7 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
                   stroke={SPEND_COLOR}
                   fill="url(#grad-cum-spend)"
                   strokeWidth={2}
+                  isAnimationActive={false}
                 />
                 <Area
                   type="monotone"
@@ -224,6 +255,7 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
                   stroke={PROFIT_COLOR}
                   fill="url(#grad-cum-profit)"
                   strokeWidth={2.5}
+                  isAnimationActive={false}
                 />
               </AreaChart>
             ) : effectiveMode === "finance" ? (
@@ -265,6 +297,7 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
                     fill={SPEND_COLOR}
                     radius={[4, 4, 0, 0]}
                     barSize={14}
+                    isAnimationActive={false}
                   />
                 )}
                 <Bar
@@ -273,6 +306,7 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
                   fill={COMMISSION_COLOR}
                   radius={[4, 4, 0, 0]}
                   barSize={14}
+                  isAnimationActive={false}
                 />
                 <Line
                   type="monotone"
@@ -282,6 +316,7 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
                   strokeWidth={2.5}
                   dot={{ r: 3, fill: PROFIT_COLOR }}
                   activeDot={{ r: 5 }}
+                  isAnimationActive={false}
                 />
                 <ReferenceLine
                   y={0}
@@ -334,6 +369,7 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
                   name="ROI %"
                   stroke={PROFIT_COLOR}
                   strokeWidth={2.5}
+                  isAnimationActive={false}
                   dot={(props: {
                     cx?: number;
                     cy?: number;
@@ -370,6 +406,50 @@ function OverviewTrendChartInner({ data, cumulative, showAds }: Props) {
         </div>
       )}
     </section>
+  );
+}
+
+function CommissionExtremumPill({
+  day,
+  kind,
+}: {
+  day: CommissionExtremumDay;
+  kind: "best" | "worst";
+}) {
+  const isBest = kind === "best";
+  const accent = isBest ? "text-green-300" : "text-amber-300";
+  const border = isBest ? "border-green-500/30" : "border-amber-500/30";
+  const bg = isBest ? "bg-green-500/5" : "bg-amber-500/5";
+  const iconColor = isBest ? "text-green-300" : "text-amber-300";
+  return (
+    <div
+      className={`flex items-center gap-3 rounded-lg border ${border} ${bg} px-3 py-2`}
+      title="Hoa hồng ròng = sau thuế & hoàn hủy"
+    >
+      <span className={`material-symbols-rounded text-base ${iconColor}`}>
+        {isBest ? "trending_up" : "trending_down"}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-white/55">
+          {isBest
+            ? "Ngày hoa hồng ròng cao nhất"
+            : "Ngày hoa hồng ròng thấp nhất"}
+          <span className="ml-1 normal-case tracking-normal text-white/40">
+            (sau thuế &amp; hoàn hủy)
+          </span>
+        </p>
+        <p className="mt-0.5 truncate text-sm text-white/85">
+          <span className="font-medium text-white/90">{fmtDate(day.date)}</span>
+          <span className="mx-1.5 text-white/30">·</span>
+          <span className={`font-bold tabular-nums ${accent}`}>
+            {fmtVnd(day.netCommission)}
+          </span>
+          <span className="ml-1.5 text-[11px] text-white/55">
+            ({fmtInt(day.orders)} đơn)
+          </span>
+        </p>
+      </div>
+    </div>
   );
 }
 

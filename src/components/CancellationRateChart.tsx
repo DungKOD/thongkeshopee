@@ -212,7 +212,10 @@ function CancellationRateChartInner({
           Không có sản phẩm nào có ≥ {minOrders} đơn trong khoảng đã chọn.
         </div>
       ) : (
-        <div style={{ height: chartHeight }} className="w-full">
+        <div
+          style={{ height: chartHeight }}
+          className="animate-chart-fade-in-h w-full"
+        >
           <ResponsiveContainer width="100%" height="100%">
             <BarChart
               data={ranked}
@@ -241,6 +244,7 @@ function CancellationRateChartInner({
               <Bar
                 dataKey="cancelRate"
                 radius={[0, 4, 4, 0]}
+                isAnimationActive={false}
                 onClick={(d) => {
                   if (!onSelectSubId) return;
                   const subIds = (d as unknown as { payload: SubIdSummary })

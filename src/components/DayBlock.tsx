@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { UiDay, UiRow } from "../types";
 import {
@@ -43,6 +43,10 @@ const ROI_TOOLTIP =
   "• < 0% = đang lỗ\n" +
   "VD: -50% nghĩa là lỗ một nửa số tiền đã chi.";
 
+/** Set rỗng dùng làm sentinel khi user toggle hiện cột rỗng — giữ ref stable
+ *  để props pass-through không invalidate memo của VideoRow/TotalsRow. */
+const EMPTY_STR_SET: ReadonlySet<string> = new Set<string>();
+
 const HEADERS: Array<{ label: string; tooltip?: string }> = [
   { label: "#" },
   { label: "Sản phẩm" },
@@ -67,8 +71,8 @@ const HEADERS: Array<{ label: string; tooltip?: string }> = [
   { label: "Tổng tiền chạy", tooltip: "Spend FB (đã trừ ngân sách chưa tiêu)" },
   { label: "Số lượng đơn", tooltip: "Số đơn hàng (COUNT DISTINCT order_id)" },
   {
-    label: "Tỷ lệ chuyển đổi",
-    tooltip: "CR = Số đơn / Click Shopee × 100% (dùng click Shopee vì user vào Shopee mới có khả năng mua)",
+    label: "CR",
+    tooltip: "Tỷ lệ chuyển đổi (CR) = Số đơn / Click Shopee × 100% (dùng click Shopee vì user vào Shopee mới có khả năng mua)",
   },
   {
     label: "Giá trị đơn hàng",
@@ -83,7 +87,7 @@ const HEADERS: Array<{ label: string; tooltip?: string }> = [
   { label: "" },
 ];
 
-export function DayBlock({
+function DayBlockImpl({
   day,
   pendingDayDeletes,
   pendingRowDeletes,
@@ -118,10 +122,59 @@ export function DayBlock({
   // Cột "TK Shopee" chỉ render khi user đang xem tất cả account (filter All).
   // Khi filter 1 acc cụ thể, mọi row đều cùng acc → cột trùng lặp, bỏ.
   const showAccount = !accountFilter || accountFilter.kind === "all";
-  const headers = useMemo(
-    () => (showAccount ? HEADERS : HEADERS.filter((h) => h.label !== "TK Shopee")),
-    [showAccount],
-  );
+
+  // Auto-hide cột rỗng: cột nào toàn bộ rows trong ngày không có data thì
+  // ẩn để bảng co lại, đỡ scroll ngang. User bấm chip "N cột rỗng" để hiện
+  // lại nếu muốn verify. Compute 1-pass qua day.rows (nhẹ — đã loop tương
+  // tự trong sortedRows useMemo phía dưới).
+  const [revealEmpty, setRevealEmpty] = useState(false);
+  const autoEmptyCols = useMemo(() => {
+    const empty = new Set<string>();
+    if (day.rows.length === 0) return empty;
+    let anyClicks = false, anyShopee = false, anyCpc = false;
+    let anySpend = false, anyOrders = false, anyCommission = false;
+    let anyProfit = false;
+    for (const r of day.rows) {
+      const shopee = sumFiltered(
+        r.shopeeClicksByReferrer,
+        settings.clickSources,
+      );
+      const c = computeUiRow(r, settings.profitFees, shopee);
+      if (r.adsClicks && r.adsClicks > 0) anyClicks = true;
+      if (shopee > 0) anyShopee = true;
+      if (c.cpc > 0) anyCpc = true;
+      if (r.totalSpend && r.totalSpend > 0) anySpend = true;
+      if (r.ordersCount > 0) anyOrders = true;
+      if (r.commissionTotal !== 0) anyCommission = true;
+      if (c.profit !== 0) anyProfit = true;
+    }
+    if (!anyClicks) empty.add("Click ADS");
+    if (!anyShopee) empty.add("Click Shopee");
+    if (!anyCpc) empty.add("Đơn giá click");
+    if (!anySpend) {
+      empty.add("Tổng tiền chạy");
+      empty.add("ROI"); // ROI cần spend
+    }
+    if (!anyOrders) {
+      empty.add("Số lượng đơn");
+      empty.add("Giá trị đơn hàng"); // GMV TB cần orders
+    }
+    if (!anyOrders || !anyShopee) empty.add("CR"); // CR cần cả 2
+    if (!anyCommission) empty.add("Hoa hồng");
+    if (!anyProfit) empty.add("Lợi nhuận");
+    return empty;
+  }, [day.rows, settings.clickSources, settings.profitFees]);
+  // revealEmpty=true → trả EMPTY set → không filter cột → user thấy đầy đủ.
+  const effectiveAutoHidden = revealEmpty ? EMPTY_STR_SET : autoEmptyCols;
+
+  const headers = useMemo(() => {
+    let h = HEADERS;
+    if (!showAccount) h = h.filter((col) => col.label !== "TK Shopee");
+    if (effectiveAutoHidden.size > 0) {
+      h = h.filter((col) => !effectiveAutoHidden.has(col.label));
+    }
+    return h;
+  }, [showAccount, effectiveAutoHidden]);
 
   // Tuple đa-account: same canonical sub_ids xuất hiện trong ≥2 row khác
   // accountId. Khi user xóa 1 row trong số này, BE batch_commit_deletes wipe
@@ -235,7 +288,6 @@ export function DayBlock({
     setCapturing(true);
     try {
       const blob = await captureElementToBlob(sectionRef.current, {
-        pixelRatio: 2,
         backgroundColor: "#121212",
       });
       setScreenshotBlob(blob);
@@ -253,10 +305,13 @@ export function DayBlock({
     setScreenshotBlob(null);
   };
 
-  const totals = computeUiDayTotals(
-    day,
-    settings.clickSources,
-    settings.profitFees,
+  // useMemo: totals chạy iterate qua day.rows (computeOverviewTotals).
+  // Trước khi memo, chạy lại mỗi DayBlock render (vd: hover state, scroll
+  // floating nav toggle) → N × M rows × ops mỗi commit. Deps stable khi
+  // cache hit → totals ref ổn định + TotalsRow memoize tốt hơn.
+  const totals = useMemo(
+    () => computeUiDayTotals(day, settings.clickSources, settings.profitFees),
+    [day, settings.clickSources, settings.profitFees],
   );
 
   const accountCounts = useMemo(() => {
@@ -298,6 +353,11 @@ export function DayBlock({
     <span className="select-none tracking-widest text-white/20">••••</span>
   );
 
+  // Stable row-action callbacks → memo VideoRow bail out toàn bộ rows khi
+  // parent re-render (vd: scroll, hover khác). useCallback ref đổi chỉ khi
+  // deps đổi (user action: toggle pending) — không phải mỗi commit.
+  const handleViewDetail = useCallback((r: UiRow) => setDetailRow(r), []);
+  const handleViewHistory = useCallback((r: UiRow) => setHistoryRow(r), []);
   const dayPending = pendingDayDeletes.has(day.date);
   // "All rows pending" = user đã chọn xóa từng dòng cho đến hết → visual
   // giống như xóa cả ngày (gạch toàn bộ text + mờ data, giữ nút Undo rõ).
@@ -309,12 +369,46 @@ export function DayBlock({
     );
   const effectiveDayPending = dayPending || allRowsPending;
 
+  // Stable: chỉ recreate khi day data hoặc cờ pending đổi (user action).
+  // Trong load path các deps stable → callback ref ổn định → memo VideoRow
+  // bail out khi pendingRowDeletes thay đổi không liên quan row khác.
+  const handleRowToggleDelete = useCallback(
+    (r: UiRow) => {
+      const rKey = uiRowKey(r.dayDate, r.subIds, r.accountId);
+      if (dayPending) {
+        // User click 1 row khi cả ngày đang pending → bỏ pending ngày, set
+        // pending cho mọi row khác → trạng thái "tất cả trừ row này"
+        onToggleDayDelete(day.date);
+        for (const other of day.rows) {
+          if (uiRowKey(other.dayDate, other.subIds, other.accountId) !== rKey) {
+            onToggleRowDelete(other);
+          }
+        }
+      } else {
+        onToggleRowDelete(r);
+      }
+    },
+    [dayPending, day.date, day.rows, onToggleDayDelete, onToggleRowDelete],
+  );
+
   return (
     <section
       ref={sectionRef}
       className={`mb-6 [overflow:clip] rounded-xl shadow-elev-2 transition-shadow hover:shadow-elev-4 ${
         effectiveDayPending ? "bg-surface-2/60" : "bg-surface-2"
       } ${capturing ? "capture-mode" : ""}`}
+      // content-visibility: auto = browser skip layout/paint khi off-screen
+      // (đặc biệt quan trọng cho list 30+ ngày × table to). contain-intrinsic-
+      // size cho placeholder height để tránh scroll jumping. capture-mode
+      // (screenshot) tắt content-visibility vì html-to-image cần layout đầy đủ.
+      style={
+        capturing
+          ? undefined
+          : {
+              contentVisibility: "auto",
+              containIntrinsicSize: "auto 700px",
+            }
+      }
     >
       <header ref={headerRef} className="flex items-center justify-between border-b border-surface-8 px-5 py-3">
         <div className="flex items-center gap-3">
@@ -350,6 +444,29 @@ export function DayBlock({
           )}
         </div>
         <div className="capture-hide flex items-center gap-2">
+          {autoEmptyCols.size > 0 && (
+            <button
+              onClick={() => setRevealEmpty((v) => !v)}
+              title={
+                revealEmpty
+                  ? `Ẩn lại ${autoEmptyCols.size} cột rỗng (không có data)`
+                  : `${autoEmptyCols.size} cột rỗng đã ẩn: ${Array.from(
+                      autoEmptyCols,
+                    ).join(", ")}. Bấm để hiện.`
+              }
+              className={`btn-ripple inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+                revealEmpty
+                  ? "border-shopee-500/40 bg-shopee-500/15 text-shopee-300 hover:bg-shopee-500/20"
+                  : "border-white/10 bg-white/5 text-white/55 hover:bg-white/10 hover:text-white/80"
+              }`}
+              aria-pressed={revealEmpty}
+            >
+              <span className="material-symbols-rounded text-sm">
+                {revealEmpty ? "visibility" : "visibility_off"}
+              </span>
+              {autoEmptyCols.size} cột rỗng
+            </button>
+          )}
           {!effectiveDayPending && day.rows.length > 0 && (totalGain > 0 || totalLoss < 0) && (() => {
             const net = totalGain + totalLoss;
             const netPositive = net > 0;
@@ -481,7 +598,7 @@ export function DayBlock({
         </div>
       )}
       <div ref={tableScrollRef} className="overflow-x-scroll overflow-y-clip">
-        <table className="min-w-full border-collapse text-sm">
+        <table className="min-w-full border-collapse text-sm table-fixed">
           <thead className="sticky top-0 z-20 shadow-[0_2px_8px_rgba(0,0,0,0.45)]">
             <tr className="border-b border-shopee-500/40 bg-[#1a0c10] text-shopee-100">
               {headers.map((h, i) => {
@@ -490,13 +607,16 @@ export function DayBlock({
                 const isAction = i === headers.length - 1;
                 const canToggle = !isIndex && !isAction && !!h.label;
                 const colHidden = canToggle && hiddenCols.has(h.label);
+                // Equal width: tất cả cột (kể cả Sản phẩm + TK Shopee + action)
+                // đều w-[120px] kết hợp `table-fixed`. Index sticky-left 48px,
+                // Sản phẩm sticky-left với cùng width — tên dài sẽ truncate.
                 const alignCls = isIndex
                   ? "w-12 px-2 text-center sticky left-0 z-30 bg-[#1a0c10]"
                   : isProduct
-                  ? "min-w-[220px] px-4 text-left sticky left-12 z-[29] bg-[#1a0c10] shadow-[2px_0_8px_rgba(0,0,0,0.5)]"
+                  ? "w-[120px] px-4 text-left sticky left-12 z-[29] bg-[#1a0c10] shadow-[2px_0_8px_rgba(0,0,0,0.5)]"
                   : isAction
-                  ? "min-w-[112px] px-3 text-center"
-                  : "min-w-[96px] px-3 text-center";
+                  ? "w-[120px] px-3 text-center"
+                  : "w-[120px] px-3 text-center";
                 return (
                   <th
                     key={i}
@@ -560,6 +680,7 @@ export function DayBlock({
                 orderValueTotal={day.totals.orderValueTotal}
                 showAccount={showAccount}
                 hiddenCols={hiddenCols}
+                autoHiddenCols={effectiveAutoHidden}
                 MASK={MASK}
                 compact
               />
@@ -592,23 +713,11 @@ export function DayBlock({
                       pending={effectiveDayPending || pendingRowDeletes.has(key)}
                       deleteBlocked={deleteBlocked}
                       hiddenCols={hiddenCols}
-                      onEdit={() => onEditRow(r)}
-                      onToggleDelete={() => {
-                        if (dayPending) {
-                          onToggleDayDelete(day.date);
-                          for (const other of day.rows) {
-                            if (
-                              uiRowKey(other.dayDate, other.subIds, other.accountId) !== key
-                            ) {
-                              onToggleRowDelete(other);
-                            }
-                          }
-                        } else {
-                          onToggleRowDelete(r);
-                        }
-                      }}
-                      onViewDetail={() => setDetailRow(r)}
-                      onViewHistory={() => setHistoryRow(r)}
+                      autoHiddenCols={effectiveAutoHidden}
+                            onEdit={onEditRow}
+                      onToggleDelete={handleRowToggleDelete}
+                      onViewDetail={handleViewDetail}
+                      onViewHistory={handleViewHistory}
                       readOnly={readOnly}
                     />
                     {hasFbBreakdown && (
@@ -616,7 +725,8 @@ export function DayBlock({
                         breakdown={r.fbBreakdown!}
                         showAccount={showAccount}
                         hiddenCols={hiddenCols}
-                      />
+                        autoHiddenCols={effectiveAutoHidden}
+                              />
                     )}
                   </Fragment>
                 );
@@ -631,6 +741,7 @@ export function DayBlock({
                 orderValueTotal={day.totals.orderValueTotal}
                 showAccount={showAccount}
                 hiddenCols={hiddenCols}
+                autoHiddenCols={effectiveAutoHidden}
                 MASK={MASK}
               />
             </tfoot>
@@ -726,6 +837,11 @@ export function DayBlock({
   );
 }
 
+// memo: cache hit (cùng filterKey) → `day` giữ nguyên reference, props
+// callbacks đều stable (useCallback ở App) → skip toàn bộ re-render.
+// Tiết kiệm hàng chục ms x N day khi user switch tab/filter.
+export const DayBlock = memo(DayBlockImpl);
+
 // =========================================================
 // TotalsRow — dùng chung cho tfoot (bottom) và top summary
 // =========================================================
@@ -736,6 +852,8 @@ type TotalsRowProps = {
   orderValueTotal: number;
   showAccount: boolean;
   hiddenCols: Set<string>;
+  /** Cột rỗng auto-hide: skip render <td> hoàn toàn (≠ hiddenCols chỉ mask). */
+  autoHiddenCols?: ReadonlySet<string>;
   MASK: React.ReactNode;
   /** true = hàng tóm tắt trên đầu tbody (padding nhỏ hơn, bg khác). */
   compact?: boolean;
@@ -747,6 +865,7 @@ function TotalsRow({
   orderValueTotal,
   showAccount,
   hiddenCols,
+  autoHiddenCols,
   MASK,
   compact = false,
 }: TotalsRowProps) {
@@ -756,6 +875,7 @@ function TotalsRow({
     : "border-t-2 border-shopee-500 bg-shopee-900/25 text-base font-bold text-white";
 
   const stickyBg = compact ? "bg-[#140810]" : "bg-[#1a0e0e]";
+  const auto = (col: string) => autoHiddenCols?.has(col) ?? false;
   return (
     <tr className={rowCls}>
       <td className={`w-12 sticky left-0 z-10 ${stickyBg}`} />
@@ -763,78 +883,98 @@ function TotalsRow({
         {compact ? "↑ Tổng" : "Tổng"}
       </td>
       {showAccount && <td />}
-      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
-        {hiddenCols.has("Click ADS") ? MASK : fmtInt(totals.clicks)}
-      </td>
-      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
-        {hiddenCols.has("Click Shopee") ? MASK : fmtInt(totals.shopeeClicks)}
-      </td>
-      <td
-        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-gray-400`}
-        title={
-          totals.clicks > 0
-            ? `CPC TB = Tổng tiền chạy / Tổng click ADS\n= ${fmtVnd(totals.totalSpend)} / ${fmtInt(totals.clicks)}`
-            : "Không có click ADS"
-        }
-      >
-        {hiddenCols.has("Đơn giá click")
-          ? MASK
-          : totals.clicks > 0
-          ? fmtVnd(totals.totalSpend / totals.clicks)
-          : "—"}
-      </td>
-      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-blue-400`}>
-        {hiddenCols.has("Tổng tiền chạy") ? MASK : fmtVnd(totals.totalSpend)}
-      </td>
-      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
-        {hiddenCols.has("Số lượng đơn") ? MASK : fmtInt(totals.orders)}
-      </td>
-      <td
-        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}
-        title={
-          totals.shopeeClicks === 0
-            ? "Không có Click Shopee → không tính được CR"
-            : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
-        }
-      >
-        {hiddenCols.has("Tỷ lệ chuyển đổi")
-          ? MASK
-          : totals.shopeeClicks > 0
-          ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
-          : "—"}
-      </td>
-      <td
-        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}
-        title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
-      >
-        {hiddenCols.has("Giá trị đơn hàng")
-          ? MASK
-          : totals.orders > 0
-          ? fmtVnd(orderValueTotal / totals.orders)
-          : "—"}
-      </td>
-      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-shopee-400`}>
-        {hiddenCols.has("Hoa hồng") ? MASK : fmtVnd(totals.commission)}
-      </td>
-      <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap ${totalsProfitCls}`}>
-        {hiddenCols.has("Lợi nhuận") ? MASK : fmtVnd(totals.profit)}
-      </td>
-      <td
-        className={`px-3 ${py} text-center tabular-nums whitespace-nowrap ${
-          totals.totalSpend > 0 ? totalsProfitCls : "text-white/30"
-        }`}
-        title={
-          totals.totalSpend > 0
-            ? `ROI TB = (Hoa hồng ròng − Tiền ads) / Tiền ads\n= ${fmtVnd(totals.profit)} / ${fmtVnd(totals.totalSpend)}`
-            : "Không có tiền ads"
-        }
-      >
-        {hiddenCols.has("ROI")
-          ? MASK
-          : totals.totalSpend > 0
-          ? fmtPct((totals.profit / totals.totalSpend) * 100)
-          : "—"}
-      </td>
+      {!auto("Click ADS") && (
+        <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
+          {hiddenCols.has("Click ADS") ? MASK : fmtInt(totals.clicks)}
+        </td>
+      )}
+      {!auto("Click Shopee") && (
+        <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
+          {hiddenCols.has("Click Shopee") ? MASK : fmtInt(totals.shopeeClicks)}
+        </td>
+      )}
+      {!auto("Đơn giá click") && (
+        <td
+          className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-gray-400`}
+          title={
+            totals.clicks > 0
+              ? `CPC TB = Tổng tiền chạy / Tổng click ADS\n= ${fmtVnd(totals.totalSpend)} / ${fmtInt(totals.clicks)}`
+              : "Không có click ADS"
+          }
+        >
+          {hiddenCols.has("Đơn giá click")
+            ? MASK
+            : totals.clicks > 0
+            ? fmtVnd(totals.totalSpend / totals.clicks)
+            : "—"}
+        </td>
+      )}
+      {!auto("Tổng tiền chạy") && (
+        <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-blue-400`}>
+          {hiddenCols.has("Tổng tiền chạy") ? MASK : fmtVnd(totals.totalSpend)}
+        </td>
+      )}
+      {!auto("Số lượng đơn") && (
+        <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}>
+          {hiddenCols.has("Số lượng đơn") ? MASK : fmtInt(totals.orders)}
+        </td>
+      )}
+      {!auto("CR") && (
+        <td
+          className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}
+          title={
+            totals.shopeeClicks === 0
+              ? "Không có Click Shopee → không tính được CR"
+              : `CR TB = Σ Số đơn / Σ Click Shopee × 100% (${totals.orders}/${totals.shopeeClicks})`
+          }
+        >
+          {hiddenCols.has("CR")
+            ? MASK
+            : totals.shopeeClicks > 0
+            ? fmtPct((totals.orders / totals.shopeeClicks) * 100)
+            : "—"}
+        </td>
+      )}
+      {!auto("Giá trị đơn hàng") && (
+        <td
+          className={`px-3 ${py} text-center tabular-nums whitespace-nowrap`}
+          title="GMV TB = Σ Giá trị đơn hàng / Σ Số đơn"
+        >
+          {hiddenCols.has("Giá trị đơn hàng")
+            ? MASK
+            : totals.orders > 0
+            ? fmtVnd(orderValueTotal / totals.orders)
+            : "—"}
+        </td>
+      )}
+      {!auto("Hoa hồng") && (
+        <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap text-shopee-400`}>
+          {hiddenCols.has("Hoa hồng") ? MASK : fmtVnd(totals.commission)}
+        </td>
+      )}
+      {!auto("Lợi nhuận") && (
+        <td className={`px-3 ${py} text-center tabular-nums whitespace-nowrap ${totalsProfitCls}`}>
+          {hiddenCols.has("Lợi nhuận") ? MASK : fmtVnd(totals.profit)}
+        </td>
+      )}
+      {!auto("ROI") && (
+        <td
+          className={`px-3 ${py} text-center tabular-nums whitespace-nowrap ${
+            totals.totalSpend > 0 ? totalsProfitCls : "text-white/30"
+          }`}
+          title={
+            totals.totalSpend > 0
+              ? `ROI TB = (Hoa hồng ròng − Tiền ads) / Tiền ads\n= ${fmtVnd(totals.profit)} / ${fmtVnd(totals.totalSpend)}`
+              : "Không có tiền ads"
+          }
+        >
+          {hiddenCols.has("ROI")
+            ? MASK
+            : totals.totalSpend > 0
+            ? fmtPct((totals.profit / totals.totalSpend) * 100)
+            : "—"}
+        </td>
+      )}
       <td className={`col-actions sticky right-0 z-10 ${stickyBg} shadow-[-2px_0_8px_rgba(0,0,0,0.5)]`} />
     </tr>
   );

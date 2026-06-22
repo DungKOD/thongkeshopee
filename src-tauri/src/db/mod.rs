@@ -17,9 +17,15 @@ use rusqlite::Connection;
 use tauri::{AppHandle, Manager};
 
 pub mod content_id;
+pub mod fb_ads_db;
+pub mod fb_reels_db;
+pub mod read_pool;
 pub mod types;
 pub mod video_db;
 
+pub use fb_ads_db::FbAdsDbState;
+pub use fb_reels_db::FbReelsDbState;
+pub use read_pool::{ReadConn, ReadPool};
 pub use video_db::VideoDbState;
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -125,7 +131,17 @@ pub fn setup(app: &AppHandle) -> Result<()> {
     let path = resolve_db_path(app)?;
     let conn = init_db_at(&path)?;
     app.manage(DbState(Mutex::new(conn)));
+
+    // Read pool — N reader song song nhờ WAL. Init SAU `init_db_at` để file
+    // tồn tại + WAL pragma đã set bởi write conn. Read commands lấy từ pool;
+    // write commands giữ `DbState` (1 writer trong WAL).
+    let pool = read_pool::ReadPool::new(&path, read_pool::DEFAULT_READ_POOL_SIZE)
+        .context("không tạo read pool")?;
+    app.manage(pool);
+
     video_db::setup(app)?;
+    fb_reels_db::setup(app)?;
+    fb_ads_db::setup(app)?;
     Ok(())
 }
 

@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -154,7 +155,11 @@ export function AccountProvider({ children }: AccountProviderProps) {
     }
   }, []);
 
-  const defaultAccountId = accounts?.find(isDefaultAccount)?.id ?? null;
+  // useMemo: tránh chạy `.find` mỗi render + ref ổn định cho context value.
+  const defaultAccountId = useMemo(
+    () => accounts?.find(isDefaultAccount)?.id ?? null,
+    [accounts],
+  );
 
   // User UID đổi: CLEAR state cũ → load filter từ localStorage uid mới →
   // refetch list từ DB. Sau khi cloud-sync stack bị bóc, app chỉ còn 1 DB
@@ -163,25 +168,53 @@ export function AccountProvider({ children }: AccountProviderProps) {
   // UI sẽ chuyển sang LoginScreen, không cần list).
   useEffect(() => {
     setAccounts(null);
-    setFilterState(loadAccountFilter(uid));
+    // Content-aware setFilterState: nếu filter content giống prev → giữ NGUYÊN
+    // ref. Tránh tạo object literal mới mỗi uid change làm useMemo downstream
+    // (effectiveFilter, useDbStats filterKey, OverviewTab useEffect deps) bị
+    // invalidate dù content không đổi → BE invoke fire dư, charts re-render
+    // "linh tinh" lúc mount.
+    setFilterState((prev) => {
+      const next = loadAccountFilter(uid);
+      if (
+        prev.kind === next.kind &&
+        (prev.kind === "all" || (next.kind === "account" && prev.id === next.id))
+      ) {
+        return prev;
+      }
+      return next;
+    });
     setActiveAccountId(null);
     if (uid) {
       void refresh();
     }
   }, [uid, refresh]);
 
+  // useMemo: tương tự SettingsContext. Khi accounts/filter/activeAccountId
+  // ổn định (đa số thời gian sau khi load xong), value ref giữ nguyên →
+  // consumer dùng `accountFilter` từ context KHÔNG bị invalidate, memo
+  // DayBlock/VideoRow hoạt động đúng.
+  const value = useMemo<AccountContextValue>(
+    () => ({
+      accounts,
+      defaultAccountId,
+      filter,
+      setFilter,
+      activeAccountId,
+      setActiveAccountId,
+      refresh,
+    }),
+    [
+      accounts,
+      defaultAccountId,
+      filter,
+      setFilter,
+      activeAccountId,
+      refresh,
+    ],
+  );
+
   return (
-    <AccountContext.Provider
-      value={{
-        accounts,
-        defaultAccountId,
-        filter,
-        setFilter,
-        activeAccountId,
-        setActiveAccountId,
-        refresh,
-      }}
-    >
+    <AccountContext.Provider value={value}>
       {children}
     </AccountContext.Provider>
   );

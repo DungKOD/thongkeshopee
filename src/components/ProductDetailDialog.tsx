@@ -50,7 +50,6 @@ export function ProductDetailDialog({
     setCapturing(true);
     try {
       const blob = await captureElementToBlob(dialogRef.current, {
-        pixelRatio: 2,
         backgroundColor: "#121212",
       });
       setScreenshotBlob(blob);
@@ -367,11 +366,11 @@ export function ProductDetailDialog({
                 }
               />
               <MetricRow
-                label="Tỷ lệ chuyển đổi"
+                label="CR"
                 value={
                   shopeeClicks > 0 ? fmtPct(computed.conversionRate) : "—"
                 }
-                tooltip="CR = Số đơn / Click Shopee × 100%"
+                tooltip="Tỷ lệ chuyển đổi (CR) = Số đơn / Click Shopee × 100%"
               />
               <MetricRow
                 label="Tổng tiền chạy"

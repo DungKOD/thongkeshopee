@@ -20,7 +20,7 @@ use super::{CmdError, CmdResult};
 /// Smoke test — verify DB connection mở được + bảng `days` hiện diện.
 /// Trả về `total_days_count`.
 #[tauri::command]
-pub fn db_ping(state: State<'_, DbState>) -> CmdResult<i64> {
+pub async fn db_ping(state: State<'_, DbState>) -> CmdResult<i64> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let count: i64 =
         conn.query_row("SELECT COUNT(*) FROM days", [], |r| r.get(0))?;
@@ -28,7 +28,7 @@ pub fn db_ping(state: State<'_, DbState>) -> CmdResult<i64> {
 }
 
 #[tauri::command]
-pub fn list_days(state: State<'_, DbState>) -> CmdResult<Vec<String>> {
+pub async fn list_days(state: State<'_, DbState>) -> CmdResult<Vec<String>> {
     let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let mut stmt = conn.prepare_cached("SELECT date FROM days ORDER BY date DESC")?;
     let rows: Vec<String> = stmt

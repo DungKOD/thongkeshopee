@@ -2,6 +2,11 @@
 //!
 //! - `export_db`: backup DB đang chạy ra file do user chọn (WAL-safe).
 //! - `import_db`: nhận file `.db` mới, validate schema, thay thế, restart app.
+//!
+//! **Scope:** chỉ export/import `thongkeshopee.db` (main DB). Các DB phụ
+//! (`video_logs.db`, `fb_reels.db`) là local-only, KHÔNG include vào backup
+//! vì chứa data nhạy cảm (FB Page Access Token) hoặc không cần share giữa
+//! máy. Không thay đổi scope mà không cân nhắc bảo mật.
 
 use std::path::{Path, PathBuf};
 

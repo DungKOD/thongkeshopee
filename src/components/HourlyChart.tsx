@@ -126,7 +126,11 @@ function HourlyChartInner({
           Chưa có dữ liệu đơn hàng để phân tích
         </div>
       ) : (
-        <div className="h-[220px] w-full">
+        // `key={metric}` re-mount khi đổi metric → CSS fade-in chạy lại.
+        <div
+          key={metric}
+          className="animate-chart-fade-in h-[220px] w-full"
+        >
           <ResponsiveContainer width="100%" height="100%">
             <BarChart
               data={chartData}
@@ -161,6 +165,7 @@ function HourlyChartInner({
                 dataKey={metric}
                 radius={[4, 4, 0, 0]}
                 maxBarSize={26}
+                isAnimationActive={false}
               >
                 {chartData.map((d, i) => (
                   <Cell

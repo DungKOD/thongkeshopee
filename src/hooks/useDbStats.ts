@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { invoke } from "../lib/tauri";
 import type {
   ManualEntryInput,
@@ -49,6 +55,23 @@ interface UseDbStatsOptions {
   filter: DaysFilter;
 }
 
+/** Tiến độ load data — 1 step / 1 invoke command. */
+export interface LoadProgress {
+  done: number;
+  total: number;
+  label: string;
+}
+
+const PROGRESS_LABEL_INIT = "Đang khởi tạo...";
+const PROGRESS_LABEL_DAYS = "Đang tải dữ liệu ngày...";
+const PROGRESS_LABEL_OVERVIEW = "Đang tải tổng quan...";
+const PROGRESS_LABEL_REFERRERS = "Đang tải nguồn click...";
+const PROGRESS_LABEL_DONE = "Hoàn tất";
+
+// LRU cap cho list_days_with_rows. User switch filter/account/sub_id qua lại
+// nhiều combo → cache đủ rộng để giữ kết quả gần đây.
+const DAYS_CACHE_MAX = 32;
+
 /**
  * State + mutations cho data đọc từ SQLite. DB là source of truth;
  * state chỉ là cache để render, invalidate sau mỗi mutation.
@@ -67,12 +90,48 @@ interface UseDbStatsOptions {
  * - Pending row lưu cả `{dayDate, subIds}` trong Map value → commit KHÔNG cần
  *   scan `days` cache. An toàn cả khi row pending ngoài slice hiện tại.
  */
+/** Compute filterKey từ DaysFilter — share giữa hook và consumer cần check
+ *  days đã thuộc về filter nào (vd Overview tab cần biết days đang load đúng
+ *  filter của mình hay đang là filter của Stats tab). Đồng bộ format với
+ *  filterKey nội bộ ở useDbStats để comparison chính xác. */
+export function makeFilterKey(filter: DaysFilter): string {
+  return JSON.stringify({
+    fromDate: filter.fromDate ?? null,
+    toDate: filter.toDate ?? null,
+    limit: filter.limit ?? null,
+    subIdFilter: filter.subIdFilter ?? null,
+    accountFilter: filter.accountFilter ?? null,
+  });
+}
+
 export function useDbStats({ filter }: UseDbStatsOptions) {
   const [days, setDays] = useState<UiDay[]>([]);
+  /** filterKey của data hiện đang trong `days` state. Khi !== expected key
+   *  của 1 tab cụ thể → tab đó biết days đang stale, nên giữ cache cũ. */
+  const [daysFilterKey, setDaysFilterKey] = useState<string>("");
   const [overview, setOverview] = useState<Overview>(EMPTY_OVERVIEW);
   const [referrers, setReferrers] = useState<string[]>([]);
+  // `loading` = chưa bao giờ có data → blank screen + progress lớn.
+  // `refreshing` = đã có data + đang fetch (SWR) → giữ content cũ + indicator nhỏ.
+  // Phân tách 2 state để filter switch / mutation KHÔNG flash blank UI.
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<LoadProgress>(() => ({
+    done: 0,
+    total: 0,
+    label: PROGRESS_LABEL_INIT,
+  }));
+
+  // Mỗi step xong → tăng done, đổi label theo step kế tiếp (label giữ là
+  // step VỪA xong để user thấy đã hoàn tất phần nào).
+  const advanceProgress = useCallback((label: string) => {
+    setProgress((p) => ({
+      done: Math.min(p.done + 1, p.total),
+      total: p.total,
+      label,
+    }));
+  }, []);
 
   // Pending state cho staged delete.
   // Row: Map<key, ManualRowKey> để commit reconstruct payload KHÔNG qua scan `days`.
@@ -84,16 +143,10 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
   );
 
   // Memoize filter object để args ổn định — tránh refetch loop khi caller
-  // tạo object mới mỗi render. Key serialize theo field tuần tự.
+  // tạo object mới mỗi render. Key serialize theo field tuần tự — dùng cùng
+  // helper `makeFilterKey` để consumer có thể compare đúng định dạng.
   const filterKey = useMemo(
-    () =>
-      JSON.stringify({
-        fromDate: filter.fromDate ?? null,
-        toDate: filter.toDate ?? null,
-        limit: filter.limit ?? null,
-        subIdFilter: filter.subIdFilter ?? null,
-        accountFilter: filter.accountFilter ?? null,
-      }),
+    () => makeFilterKey(filter),
     [
       filter.fromDate,
       filter.toDate,
@@ -107,10 +160,22 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
   // (2 filter khác nhau) lặp lại sẽ hit cache → instant, không re-fetch.
   // Invalidate trong refetch() sau mutation. LRU cap 8 entries để không leak.
   const daysCacheRef = useRef<Map<string, UiDay[]>>(new Map());
+  // Ref tracking filterKey hiện tại — guard chống race khi user đổi filter
+  // giữa lúc invoke đang pending. Stale response phải KHÔNG được setDays /
+  // advanceProgress vì sẽ overwrite kết quả mới hơn (worst case: invoke cũ
+  // resolve sau invoke mới → UI kẹt vĩnh viễn ở data filter cũ).
+  const latestFilterKeyRef = useRef(filterKey);
+  latestFilterKeyRef.current = filterKey;
   const refetchDays = useCallback(async () => {
     const cached = daysCacheRef.current.get(filterKey);
     if (cached) {
+      // Cache hit: sync setState (KHÔNG startTransition) → React batch với
+      // render hiện tại → user thấy data mới ngay frame kế. LazyDayBlock đã
+      // tách mount cost nên reconcile rẻ. startTransition đây làm delay 1-2
+      // frame → cảm giác "lag" khi switch tab/filter.
       setDays(cached);
+      setDaysFilterKey(filterKey);
+      advanceProgress(PROGRESS_LABEL_DAYS);
       return;
     }
     const payload: DaysFilter = {
@@ -123,38 +188,65 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
     const data = await invoke<UiDay[]>("list_days_with_rows", {
       filter: payload,
     });
+    // Cache populate luôn (key + data khớp với invoke vừa chạy) — kể cả khi
+    // stale: user click lại filter này sau đó sẽ hit cache instant.
     const cache = daysCacheRef.current;
-    if (cache.size >= 8) {
+    if (cache.size >= DAYS_CACHE_MAX) {
       const oldestKey = cache.keys().next().value;
       if (oldestKey !== undefined) cache.delete(oldestKey);
     }
     cache.set(filterKey, data);
+    // Guard stale: nếu user đã đổi filter trong lúc invoke chạy, KHÔNG apply
+    // state — để invoke mới hơn nắm quyền. Check qua ref vì closure capture
+    // filterKey lúc tạo refetchDays, còn ref luôn trỏ tới filterKey hiện tại.
+    if (latestFilterKeyRef.current !== filterKey) return;
+    advanceProgress(PROGRESS_LABEL_DAYS);
+    // Sync setState (KHÔNG startTransition): bọc transition khiến setDays
+    // queue low-priority, trong khi setRefreshing(false) sau Promise.all
+    // resolve là urgent → React commit refreshing=false + days CŨ, transition
+    // update "kẹt" cho đến khi user tương tác (vd switch tab) trigger commit.
+    // useDeferredValue ở consumer vẫn defer được render cost cho list dài.
     setDays(data);
+    setDaysFilterKey(filterKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterKey]);
+  }, [filterKey, advanceProgress]);
 
-  const refetchOverview = useCallback(async () => {
-    const [ov, refs] = await Promise.all([
-      invoke<Overview>("load_overview"),
-      invoke<string[]>("list_click_referrers"),
-    ]);
+  const refetchOverviewOnly = useCallback(async () => {
+    const ov = await invoke<Overview>("load_overview");
+    // Overview chứa allSubIds (có thể 10k+) → dropdown filter re-render nặng,
+    // nhưng vẫn cần urgent để consumer (KPI counters, badge "N/M ngày") đồng
+    // bộ với days. Consumer tự defer nếu cần (vd OverviewTab dùng useDeferredValue).
+    advanceProgress(PROGRESS_LABEL_OVERVIEW);
     setOverview(ov);
+  }, [advanceProgress]);
+
+  const refetchReferrers = useCallback(async () => {
+    const refs = await invoke<string[]>("list_click_referrers");
+    advanceProgress(PROGRESS_LABEL_REFERRERS);
     setReferrers(refs);
-  }, []);
+  }, [advanceProgress]);
 
   const refetch = useCallback(async () => {
     // Mutation/manual refresh → invalidate cache để fetch lại từ DB.
+    // SWR: dùng `refreshing` (không clear days) → UI giữ data cũ cho đến khi
+    // fetch xong, tránh blank flash sau khi user lưu/import.
     daysCacheRef.current.clear();
-    setLoading(true);
+    setRefreshing(true);
     setError(null);
+    setProgress({ done: 0, total: 3, label: PROGRESS_LABEL_DAYS });
     try {
-      await Promise.all([refetchDays(), refetchOverview()]);
+      await Promise.all([
+        refetchDays(),
+        refetchOverviewOnly(),
+        refetchReferrers(),
+      ]);
+      setProgress((p) => ({ ...p, label: PROGRESS_LABEL_DONE }));
     } catch (e) {
       setError((e as Error).message ?? String(e));
     } finally {
-      setLoading(false);
+      setRefreshing(false);
     }
-  }, [refetchDays, refetchOverview]);
+  }, [refetchDays, refetchOverviewOnly, refetchReferrers]);
 
   // Initial mount: fetch cả days + overview song song. Subsequent filter
   // changes: chỉ refetch days (overview không phụ thuộc filter).
@@ -162,26 +254,67 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
   const mountedRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
+    const isFirstMount = !mountedRef.current;
+
+    // SWR fast path: filter switch → cache hit → swap days đồng bộ.
+    // Sync setState (KHÔNG startTransition) để tab switch / filter switch
+    // thấy data mới ngay frame kế, không delay 1-2 frame như non-urgent.
+    if (!isFirstMount && daysCacheRef.current.has(filterKey)) {
+      const cached = daysCacheRef.current.get(filterKey)!;
+      setDays(cached);
+      setDaysFilterKey(filterKey);
+      setProgress({ done: 1, total: 1, label: PROGRESS_LABEL_DONE });
+      // PHẢI reset loading flags: nếu effect trước đó đã setRefreshing(true)
+      // rồi bị cancel (user spam-click filter), iife của effect đó skip
+      // finally do `cancelled=true` → refreshing kẹt true vĩnh viễn. Cache-hit
+      // path KHÔNG fetch nên data đã ready ngay → an toàn reset cả 2 flag.
+      setRefreshing(false);
+      setLoading(false);
+      return;
+    }
+
     setError(null);
+    if (isFirstMount) {
+      setLoading(true);
+      setProgress({ done: 0, total: 3, label: PROGRESS_LABEL_DAYS });
+    } else {
+      // Subsequent fetch + cache miss → SWR: giữ data hiện tại, show
+      // indicator nhỏ, swap khi fetch xong.
+      setRefreshing(true);
+      setProgress({ done: 0, total: 1, label: PROGRESS_LABEL_DAYS });
+    }
     (async () => {
       try {
-        if (!mountedRef.current) {
-          await Promise.all([refetchDays(), refetchOverview()]);
+        if (isFirstMount) {
+          await Promise.all([
+            refetchDays(),
+            refetchOverviewOnly(),
+            refetchReferrers(),
+          ]);
           mountedRef.current = true;
         } else {
           await refetchDays();
         }
+        if (!cancelled) {
+          setProgress((p) => ({ ...p, label: PROGRESS_LABEL_DONE }));
+        }
       } catch (e) {
         if (!cancelled) setError((e as Error).message ?? String(e));
       } finally {
-        if (!cancelled) setLoading(false);
+        // KHÔNG check `cancelled` cho setLoading/setRefreshing(false): trong
+        // StrictMode dev (double-mount) hoặc khi user spam filter, effect cũ bị
+        // cancel TRƯỚC khi finally chạy → nếu skip, loading kẹt true vĩnh viễn
+        // (UI stuck ở splash 100% với label "Đang tải..."). Effect mới sẽ
+        // setLoading(true) lại nếu cần (cache-miss path), nên brief flash
+        // false→true→false acceptable; còn hơn kẹt vĩnh viễn.
+        setLoading(false);
+        setRefreshing(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [refetchDays, refetchOverview]);
+  }, [refetchDays, refetchOverviewOnly, refetchReferrers, filterKey]);
 
   const saveManualEntry = useCallback(
     async (input: ManualEntryInput) => {
@@ -250,9 +383,12 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
 
   return {
     days,
+    daysFilterKey,
     overview,
     referrers,
     loading,
+    refreshing,
+    progress,
     error,
     refetch,
     saveManualEntry,

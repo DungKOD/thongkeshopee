@@ -44,7 +44,7 @@ pub struct OrderItemDetail {
 // `account_id`: Khi filter=All và row split per-account, chỉ trả orders của
 // đúng account đó. None hoặc empty = no filter (dialog aggregate cross-account).
 // FE serialize string vì content_id hash > 2^53.
-pub fn get_order_items_for_row(
+pub async fn get_order_items_for_row(
     state: State<'_, DbState>,
     day_date: String,
     sub_ids: [String; 5],

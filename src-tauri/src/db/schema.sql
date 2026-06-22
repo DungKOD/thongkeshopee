@@ -143,6 +143,10 @@ CREATE INDEX IF NOT EXISTS idx_orders_day_subid  ON raw_shopee_order_items(day_d
 CREATE INDEX IF NOT EXISTS idx_orders_item       ON raw_shopee_order_items(item_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status     ON raw_shopee_order_items(order_status);
 CREATE INDEX IF NOT EXISTS idx_orders_account    ON raw_shopee_order_items(shopee_account_id, day_date);
+-- click_time range index: load_referrer_efficiency filter `WHERE click_time >= ? AND
+-- click_time < ?` cần index để tránh full table scan. Click_time format chuẩn
+-- (YYYY-MM-DD HH:MM:SS hoặc ISO8601) → lexicographic comparison khớp DATE().
+CREATE INDEX IF NOT EXISTS idx_orders_click_time ON raw_shopee_order_items(click_time);
 
 -- =============================================================
 -- raw_fb_ads — unified FB ads (campaign + ad_group).

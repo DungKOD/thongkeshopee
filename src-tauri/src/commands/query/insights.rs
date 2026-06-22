@@ -9,9 +9,9 @@
 
 use tauri::State;
 
-use crate::db::DbState;
+use crate::db::ReadPool;
 
-use super::super::{CmdError, CmdResult};
+use super::super::CmdResult;
 use super::aggregate::{
     append_date_account_filters, append_subid_prefilter, is_prefix, params_to_refs,
     read_sub_id_match_mode, sub_ids_match, to_canonical, Canonical,
@@ -24,8 +24,8 @@ use super::{AccountFilterMode, DaysFilter};
 /// Unique referrer values (cột "Người giới thiệu" trong WebsiteClickReport).
 /// UI Settings dùng để hiển thị list checkbox cho user filter.
 #[tauri::command]
-pub fn list_click_referrers(state: State<'_, DbState>) -> CmdResult<Vec<String>> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+pub async fn list_click_referrers(pool: State<'_, ReadPool>) -> CmdResult<Vec<String>> {
+    let conn = pool.acquire();
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT COALESCE(referrer, '(khác)') FROM raw_shopee_clicks
          ORDER BY 1",
@@ -52,11 +52,11 @@ pub struct HourlyOrderBucket {
 }
 
 #[tauri::command]
-pub fn load_hourly_orders(
-    state: State<'_, DbState>,
+pub async fn load_hourly_orders(
+    pool: State<'_, ReadPool>,
     filter: Option<DaysFilter>,
 ) -> CmdResult<Vec<HourlyOrderBucket>> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let conn = pool.acquire();
     let f = filter.unwrap_or_default();
     let match_mode = read_sub_id_match_mode(&conn);
 
@@ -180,11 +180,11 @@ pub struct HourlyClickBucket {
 }
 
 #[tauri::command]
-pub fn load_hourly_clicks(
-    state: State<'_, DbState>,
+pub async fn load_hourly_clicks(
+    pool: State<'_, ReadPool>,
     filter: Option<DaysFilter>,
 ) -> CmdResult<Vec<HourlyClickBucket>> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let conn = pool.acquire();
     let f = filter.unwrap_or_default();
     let match_mode = read_sub_id_match_mode(&conn);
 
@@ -306,32 +306,39 @@ pub struct ReferrerEfficiency {
 }
 
 #[tauri::command]
-pub fn load_referrer_efficiency(
-    state: State<'_, DbState>,
+pub async fn load_referrer_efficiency(
+    pool: State<'_, ReadPool>,
     filter: Option<DaysFilter>,
 ) -> CmdResult<Vec<ReferrerEfficiency>> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let conn = pool.acquire();
     let f = filter.unwrap_or_default();
     let match_mode = read_sub_id_match_mode(&conn);
 
     // Click side filter trên `day_date` (= click date theo schema).
-    // Order side filter trên `DATE(click_time)` để đối xứng — đơn có click_time
-    // nằm trong range được attribute, không quan tâm order_time.
+    // Order side filter trên `click_time` half-open range để **sargable** —
+    // dùng được `idx_orders_click_time`. Trước đây dùng `DATE(click_time) >= ?`
+    // là non-sargable → SQLite buộc full table scan toàn bộ raw_shopee_order_items
+    // bất kể range bao nhiêu ngày. Đổi sang `click_time >= ? AND click_time < ?`
+    // (to_date + 1 day) → index range seek, đối xứng semantically với DATE().
+    //
+    // Format click_time: "YYYY-MM-DD HH:MM:SS" hoặc RFC3339 ("YYYY-MM-DD­T..."),
+    // cả 2 đều bắt đầu bằng "YYYY-MM-DD" → lexicographic compare khớp với
+    // DATE() comparison. NULL bị loại tự động vì comparison với NULL → unknown.
     let mut where_clicks = String::from(" WHERE 1=1");
     let mut where_orders = String::from(" WHERE click_time IS NOT NULL");
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let mut params_orders: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(v) = &f.from_date {
         where_clicks.push_str(" AND day_date >= ?");
-        where_orders.push_str(" AND DATE(click_time) >= ?");
+        where_orders.push_str(" AND click_time >= ?");
         params_vec.push(Box::new(v.clone()));
         params_orders.push(Box::new(v.clone()));
     }
     if let Some(v) = &f.to_date {
         where_clicks.push_str(" AND day_date <= ?");
-        where_orders.push_str(" AND DATE(click_time) <= ?");
+        where_orders.push_str(" AND click_time < ?");
         params_vec.push(Box::new(v.clone()));
-        params_orders.push(Box::new(v.clone()));
+        params_orders.push(Box::new(next_day_str(v)));
     }
     if let Some(AccountFilterMode::Account { id }) = f.account_filter.as_ref() {
         where_clicks.push_str(" AND shopee_account_id = ?");
@@ -604,11 +611,11 @@ pub struct ClickOrderDelayBucket {
 }
 
 #[tauri::command]
-pub fn load_click_order_delays(
-    state: State<'_, DbState>,
+pub async fn load_click_order_delays(
+    pool: State<'_, ReadPool>,
     filter: Option<DaysFilter>,
 ) -> CmdResult<Vec<ClickOrderDelayBucket>> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let conn = pool.acquire();
     let f = filter.unwrap_or_default();
     let match_mode = read_sub_id_match_mode(&conn);
 
@@ -719,11 +726,11 @@ pub struct CancellationByDayBucket {
 /// để 1 round-trip cover toàn bộ Overview range. FE sort + topN.
 /// Filter: from_date/to_date/account. `sub_ids` không dùng (Overview = all SP).
 #[tauri::command]
-pub fn load_cancellation_by_subid(
-    state: State<'_, DbState>,
+pub async fn load_cancellation_by_subid(
+    pool: State<'_, ReadPool>,
     filter: Option<DaysFilter>,
 ) -> CmdResult<Vec<CancellationByDayBucket>> {
-    let conn = state.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let conn = pool.acquire();
     let f = filter.unwrap_or_default();
 
     // 2-tầng: inner collapse line-items thành (sub_ids, day, order_id) +
@@ -774,6 +781,19 @@ pub fn load_cancellation_by_subid(
         })?
         .collect::<Result<_, _>>()?;
     Ok(rows)
+}
+
+/// "YYYY-MM-DD" → "YYYY-MM-DD" của ngày kế tiếp. Dùng cho half-open range
+/// `click_time < next_day(to_date)` — semantically tương đương `DATE(click_time)
+/// <= to_date` nhưng sargable (dùng được index trên click_time).
+/// Parse fail → fallback trả raw string (defensive, không kill query).
+fn next_day_str(date: &str) -> String {
+    use chrono::NaiveDate;
+    NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.succ_opt())
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| date.to_string())
 }
 
 /// Parse "YYYY-MM-DD HH:MM:SS" (Shopee format) or ISO8601 → epoch seconds.
