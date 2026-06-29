@@ -1,7 +1,14 @@
 import { useCallback } from "react";
 import { TabButton } from "./AppShellButtons";
 
-export type AppTab = "stats" | "overview" | "download" | "upload" | "bulkcamp";
+export type AppTab =
+  | "stats"
+  | "overview"
+  | "download"
+  | "upload"
+  | "bulkcamp"
+  | "shopee"
+  | "smartlink";
 
 interface AppTabsNavProps {
   activeTab: AppTab;
@@ -16,6 +23,8 @@ export function AppTabsNav({ activeTab, onChange }: AppTabsNavProps) {
   const onDownload = useCallback(() => onChange("download"), [onChange]);
   const onUpload = useCallback(() => onChange("upload"), [onChange]);
   const onBulkCamp = useCallback(() => onChange("bulkcamp"), [onChange]);
+  const onShopee = useCallback(() => onChange("shopee"), [onChange]);
+  const onSmartLink = useCallback(() => onChange("smartlink"), [onChange]);
   return (
     <nav className="flex gap-1 px-6">
       <TabButton
@@ -37,6 +46,12 @@ export function AppTabsNav({ activeTab, onChange }: AppTabsNavProps) {
         label="Download video"
       />
       <TabButton
+        active={activeTab === "shopee"}
+        onClick={onShopee}
+        icon="storefront"
+        label="Sản phẩm Shopee"
+      />
+      <TabButton
         active={activeTab === "upload"}
         onClick={onUpload}
         icon="upload"
@@ -47,6 +62,12 @@ export function AppTabsNav({ activeTab, onChange }: AppTabsNavProps) {
         onClick={onBulkCamp}
         icon="campaign"
         label="Bulk Camp"
+      />
+      <TabButton
+        active={activeTab === "smartlink"}
+        onClick={onSmartLink}
+        icon="link"
+        label="Smart Link"
       />
     </nav>
   );

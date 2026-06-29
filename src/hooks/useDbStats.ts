@@ -250,11 +250,23 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
 
   // Initial mount: fetch cả days + overview song song. Subsequent filter
   // changes: chỉ refetch days (overview không phụ thuộc filter).
-  // `mountedRef` phân biệt lần đầu (cần overview) với các lần sau.
+  // `mountedRef` đánh dấu "first-mount effect ĐÃ BẮT ĐẦU" (set sync trong
+  // body), KHÔNG phải "first-mount đã hoàn tất". Trước đây set sau Promise.all
+  // resolve → khi filter đổi giữa initial mount (vd AccountContext refresh
+  // validate filter), Effect-B body thấy mountedRef=false → setLoading(true)
+  // lại + reset progress → splash hiển thị lại + phải đợi Promise.all-B mới
+  // thoát (label kẹt ở "Đang tải nguồn click..." 100% khi B chậm/hang).
+  // Sync ngay khi body chạy: Effect-B luôn đi refresh path → giữ splash
+  // hiện tại, KHÔNG re-set loading=true. Tradeoff: nếu Effect-A's invokes
+  // fail hết, overview/referrers có thể trống → user phải click "Tải lại".
   const mountedRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
     const isFirstMount = !mountedRef.current;
+    // Set SYNC trong body: subsequent effect runs (filter change, StrictMode
+    // re-mount) sẽ thấy mountedRef=true → isFirstMount=false → đi refresh
+    // path, KHÔNG setLoading(true) lại.
+    if (isFirstMount) mountedRef.current = true;
 
     // SWR fast path: filter switch → cache hit → swap days đồng bộ.
     // Sync setState (KHÔNG startTransition) để tab switch / filter switch
@@ -291,7 +303,6 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
             refetchOverviewOnly(),
             refetchReferrers(),
           ]);
-          mountedRef.current = true;
         } else {
           await refetchDays();
         }
@@ -301,12 +312,8 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
       } catch (e) {
         if (!cancelled) setError((e as Error).message ?? String(e));
       } finally {
-        // KHÔNG check `cancelled` cho setLoading/setRefreshing(false): trong
-        // StrictMode dev (double-mount) hoặc khi user spam filter, effect cũ bị
-        // cancel TRƯỚC khi finally chạy → nếu skip, loading kẹt true vĩnh viễn
-        // (UI stuck ở splash 100% với label "Đang tải..."). Effect mới sẽ
-        // setLoading(true) lại nếu cần (cache-miss path), nên brief flash
-        // false→true→false acceptable; còn hơn kẹt vĩnh viễn.
+        // KHÔNG check `cancelled`: finally luôn clear flags để effect cũ bị
+        // cancel không kẹt loading/refreshing true vĩnh viễn.
         setLoading(false);
         setRefreshing(false);
       }
@@ -315,6 +322,22 @@ export function useDbStats({ filter }: UseDbStatsOptions) {
       cancelled = true;
     };
   }, [refetchDays, refetchOverviewOnly, refetchReferrers, filterKey]);
+
+  // Watchdog: progress đạt 100% mà loading/refreshing vẫn true sau 1.5s →
+  // force clear. Safety net cho edge case BE hang (vd 1 invoke trong
+  // Promise.all không bao giờ resolve do DB lock contention / Tauri IPC
+  // backlog) → user vẫn thấy được content thay vì kẹt splash vĩnh viễn.
+  // 1.5s đủ dài để không trigger trong flow bình thường (Promise.all resolve
+  // → setProgress(DONE) → finally clear flags, gap < 16ms typically).
+  useEffect(() => {
+    if (!loading && !refreshing) return;
+    if (progress.total === 0 || progress.done < progress.total) return;
+    const timer = setTimeout(() => {
+      setLoading(false);
+      setRefreshing(false);
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [loading, refreshing, progress.done, progress.total]);
 
   const saveManualEntry = useCallback(
     async (input: ManualEntryInput) => {

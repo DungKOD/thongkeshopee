@@ -5,6 +5,17 @@ export interface FbAdAccount {
   name: string;
   currency: string | null;
   timezoneName: string | null;
+  /// 8 hex SHA-256(access_token) — UI dùng để tô màu account cùng token.
+  tokenHash: string;
+}
+
+/// User Token đã lưu (scope ads_management) — meta only, raw fetch on-demand.
+export interface FbAdsAuthToken {
+  id: number;
+  label: string;
+  tokenHash: string;
+  addedAtMs: number;
+  expired: boolean;
 }
 
 export interface FbAdAccountWithToken {
@@ -131,6 +142,41 @@ export function fbAdsListAccounts(): Promise<FbAdAccount[]> {
 
 export function fbAdsDeleteAccount(accountId: string): Promise<void> {
   return invoke<void>("fb_ads_delete_account", { accountId });
+}
+
+export function fbAdsGetAccountToken(accountId: string): Promise<string> {
+  return invoke<string>("fb_ads_get_account_token", { accountId });
+}
+
+// ===== Auth Tokens =====
+
+export function fbAdsSaveAuthToken(
+  token: string,
+  label?: string | null,
+): Promise<number> {
+  return invoke<number>("fb_ads_save_auth_token", {
+    token,
+    label: label ?? null,
+  });
+}
+
+export function fbAdsListAuthTokens(): Promise<FbAdsAuthToken[]> {
+  return invoke<FbAdsAuthToken[]>("fb_ads_list_auth_tokens");
+}
+
+export function fbAdsGetAuthToken(id: number): Promise<string> {
+  return invoke<string>("fb_ads_get_auth_token", { id });
+}
+
+export function fbAdsUpdateAuthTokenLabel(
+  id: number,
+  label: string,
+): Promise<void> {
+  return invoke<void>("fb_ads_update_auth_token_label", { id, label });
+}
+
+export function fbAdsDeleteAuthToken(id: number): Promise<void> {
+  return invoke<void>("fb_ads_delete_auth_token", { id });
 }
 
 // ===== Templates =====

@@ -76,6 +76,7 @@ export function UploadVideoPage() {
           uploading={uploading}
           onEnqueued={handleEnqueued}
           onPublishNow={publishNow}
+          onStartQueue={startAll}
           onOpenPageManager={() => setPageManagerOpen(true)}
         />
       )}

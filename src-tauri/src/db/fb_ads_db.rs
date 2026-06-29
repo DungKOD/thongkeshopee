@@ -10,7 +10,6 @@
 //!
 //! Token Page plain text — exclude khỏi backup/restore main DB.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -28,6 +27,18 @@ CREATE TABLE IF NOT EXISTS fb_ad_accounts (
     timezone_name TEXT,
     access_token  TEXT NOT NULL,
     added_at_ms   INTEGER NOT NULL
+);
+
+-- User Token user paste vào "Xác thực token" cho FB Ads (scope ads_management).
+-- Khác với access_token trên fb_ad_accounts (token mỗi account riêng — từ /me/adaccounts).
+-- 1 User Token quản N Ad Accounts.
+CREATE TABLE IF NOT EXISTS fb_ads_auth_tokens (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    label         TEXT NOT NULL,
+    access_token  TEXT NOT NULL,
+    token_hash    TEXT NOT NULL UNIQUE,
+    added_at_ms   INTEGER NOT NULL,
+    expired       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS fb_camp_templates (
@@ -110,20 +121,9 @@ CREATE INDEX IF NOT EXISTS idx_fb_jobs_status
 /// Tauri managed state cho FB Ads DB connection.
 pub struct FbAdsDbState(pub Mutex<Connection>);
 
-fn app_data_root(app: &AppHandle) -> Result<PathBuf> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .context("không lấy được app_data_dir")?;
-    fs::create_dir_all(&base).with_context(|| {
-        format!("không tạo được thư mục app_data_dir: {}", base.display())
-    })?;
-    Ok(base)
-}
-
-/// DB path cho FB Ads ở root app_data.
-pub fn resolve_fb_ads_db_path(app: &AppHandle) -> Result<PathBuf> {
-    Ok(app_data_root(app)?.join(DB_FILENAME))
+/// DB path cho FB Ads trong workspace folder.
+pub fn resolve_fb_ads_db_path_in(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(DB_FILENAME)
 }
 
 /// Mở hoặc tạo FB Ads DB tại `path`, apply PRAGMA + schema.
@@ -145,9 +145,24 @@ pub fn init_fb_ads_db_at(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Setup hook — init DB + manage state.
-pub fn setup(app: &AppHandle) -> Result<()> {
-    let path = resolve_fb_ads_db_path(app)?;
+/// Mở FB Ads DB đã tồn tại — chỉ apply PRAGMA, KHÔNG re-apply schema. Cho
+/// workspace hot-swap (xem doc `crate::db::open_existing_db`).
+pub fn open_existing_fb_ads_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("không mở được FB Ads DB tại {}", path.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;",
+    )
+    .context("không apply được PRAGMA cho FB Ads DB khi open existing")?;
+    Ok(conn)
+}
+
+/// Setup hook — init DB trong workspace folder + manage state.
+pub fn setup_in(app: &AppHandle, workspace_root: &Path) -> Result<()> {
+    let path = resolve_fb_ads_db_path_in(workspace_root);
     let conn = init_fb_ads_db_at(&path)?;
     app.manage(FbAdsDbState(Mutex::new(conn)));
     Ok(())

@@ -4,6 +4,7 @@
 //! Phase 2 (TODO): batch execution với upload + create.
 
 use rusqlite::params;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, State};
 
 use crate::commands::{CmdError, CmdResult};
@@ -12,6 +13,17 @@ use crate::db::FbAdsDbState;
 use super::executor;
 use super::graph_api;
 use super::types::*;
+
+/// Hash 8 hex đầu của SHA-256(token) — UI dùng phân biệt token bằng màu, không
+/// reverse được token thật.
+fn token_short_hash(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = String::with_capacity(8);
+    for b in &digest[..4] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
 
 const USER_AGENT: &str = "ThongKeShopee/0.12.0 (FbAdsBulkCamp)";
 
@@ -76,20 +88,159 @@ pub fn fb_ads_list_accounts(
 ) -> CmdResult<Vec<FbAdAccount>> {
     let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
     let mut stmt = conn.prepare(
-        "SELECT account_id, name, currency, timezone_name
+        "SELECT account_id, name, currency, timezone_name, access_token
          FROM fb_ad_accounts ORDER BY added_at_ms ASC",
     )?;
     let accounts: Vec<FbAdAccount> = stmt
         .query_map([], |r| {
+            let token: String = r.get(4)?;
             Ok(FbAdAccount {
                 account_id: r.get(0)?,
                 name: r.get(1)?,
                 currency: r.get(2)?,
                 timezone_name: r.get(3)?,
+                token_hash: token_short_hash(&token),
             })
         })?
         .collect::<Result<_, _>>()?;
     Ok(accounts)
+}
+
+/// Lấy access_token đã lưu của 1 Ad Account — UI dùng cho copy/reveal.
+#[tauri::command]
+pub fn fb_ads_get_account_token(
+    db: State<'_, FbAdsDbState>,
+    account_id: String,
+) -> CmdResult<String> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let token: String = conn
+        .query_row(
+            "SELECT access_token FROM fb_ad_accounts WHERE account_id = ?1",
+            params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                CmdError::msg("Ad Account không tồn tại trong DB")
+            }
+            other => CmdError::Db(other),
+        })?;
+    Ok(token)
+}
+
+// ============================================================
+// Auth Token management (User Token paste vào)
+// ============================================================
+
+#[tauri::command]
+pub fn fb_ads_save_auth_token(
+    db: State<'_, FbAdsDbState>,
+    token: String,
+    label: Option<String>,
+) -> CmdResult<i64> {
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(CmdError::msg("Token rỗng"));
+    }
+    let hash = token_short_hash(&token);
+    let label = label.unwrap_or_else(|| format!("Token #{}", &hash));
+
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM fb_ads_auth_tokens WHERE token_hash = ?1",
+            params![hash],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+    {
+        conn.execute(
+            "UPDATE fb_ads_auth_tokens SET expired = 0 WHERE id = ?1",
+            params![id],
+        )?;
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO fb_ads_auth_tokens(label, access_token, token_hash, added_at_ms, expired)
+         VALUES(?1, ?2, ?3, ?4, 0)",
+        params![label, token, hash, now_ms()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+#[tauri::command]
+pub fn fb_ads_list_auth_tokens(
+    db: State<'_, FbAdsDbState>,
+) -> CmdResult<Vec<FbAdsAuthToken>> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, label, token_hash, added_at_ms, expired
+         FROM fb_ads_auth_tokens ORDER BY added_at_ms ASC",
+    )?;
+    let tokens: Vec<FbAdsAuthToken> = stmt
+        .query_map([], |r| {
+            Ok(FbAdsAuthToken {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                token_hash: r.get(2)?,
+                added_at_ms: r.get(3)?,
+                expired: r.get::<_, i64>(4)? != 0,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(tokens)
+}
+
+#[tauri::command]
+pub fn fb_ads_get_auth_token(
+    db: State<'_, FbAdsDbState>,
+    id: i64,
+) -> CmdResult<String> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    let token: String = conn
+        .query_row(
+            "SELECT access_token FROM fb_ads_auth_tokens WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                CmdError::msg("Auth token không tồn tại")
+            }
+            other => CmdError::Db(other),
+        })?;
+    Ok(token)
+}
+
+#[tauri::command]
+pub fn fb_ads_update_auth_token_label(
+    db: State<'_, FbAdsDbState>,
+    id: i64,
+    label: String,
+) -> CmdResult<()> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(CmdError::msg("Label rỗng"));
+    }
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    conn.execute(
+        "UPDATE fb_ads_auth_tokens SET label = ?1 WHERE id = ?2",
+        params![label, id],
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn fb_ads_delete_auth_token(
+    db: State<'_, FbAdsDbState>,
+    id: i64,
+) -> CmdResult<()> {
+    let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+    conn.execute(
+        "DELETE FROM fb_ads_auth_tokens WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
 }
 
 #[tauri::command]

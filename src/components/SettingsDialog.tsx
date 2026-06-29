@@ -6,8 +6,10 @@ import type {
   ProfitFees,
   Settings,
   SubIdMatchMode,
+  VideoWatermarkSettings,
 } from "../hooks/useSettings";
 import { ImportHistorySection } from "./ImportHistorySection";
+import { WorkspaceSection } from "./WorkspaceSection";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { invoke } from "../lib/tauri";
 import { useAuth } from "../contexts/AuthContext";
@@ -22,6 +24,11 @@ interface AppDataPaths {
   appDataDir: string;
   activeDbPath: string;
   activeImportsDir: string;
+  activeWorkspace: {
+    id: string;
+    name: string;
+    color: string;
+  };
 }
 
 interface SettingsDialogProps {
@@ -32,6 +39,11 @@ interface SettingsDialogProps {
   onToggleClickSource: (source: string, enabled: boolean) => void;
   onSetProfitFee: (key: keyof ProfitFees, value: number) => void;
   onSetSubIdMatchMode: (mode: SubIdMatchMode) => void;
+  onSetVideoWatermark: (
+    key: keyof VideoWatermarkSettings,
+    value: number,
+  ) => void;
+  onSetVideoWatermarkAntiTheft: (enabled: boolean) => void;
   onClose: () => void;
   /** Trigger reload lịch sử import ngoài (bump khi có import/delete). */
   importHistoryReloadKey?: number;
@@ -47,6 +59,8 @@ export function SettingsDialog({
   onToggleClickSource,
   onSetProfitFee,
   onSetSubIdMatchMode,
+  onSetVideoWatermark,
+  onSetVideoWatermarkAntiTheft,
   onClose,
   importHistoryReloadKey,
   onImportReverted,
@@ -231,6 +245,8 @@ export function SettingsDialog({
         </header>
 
         <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-5">
+          <WorkspaceSection />
+
           <section>
             <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
               <span className="material-symbols-rounded text-base">
@@ -382,6 +398,81 @@ export function SettingsDialog({
                   </div>
                 </div>
               </label>
+            </div>
+          </section>
+
+          <section>
+            <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+              <span className="material-symbols-rounded text-base">
+                branding_watermark
+              </span>
+              Logo Page gắn lên video tải về
+            </h3>
+            <p className="mb-3 text-xs text-white/50">
+              Tinh chỉnh kích thước, độ trong, padding của logo Page hiển thị ở
+              góc trên phải. Bật/tắt + chọn Page ở tab "Tải video".
+            </p>
+            <div className="space-y-3 rounded-xl bg-surface-6 p-4">
+              <WatermarkSlider
+                label="Kích thước logo"
+                min={3}
+                max={30}
+                step={1}
+                unit="%"
+                value={settings.videoWatermark.sizePct}
+                onChange={(v) => onSetVideoWatermark("sizePct", v)}
+                hint="% so với chiều rộng video"
+              />
+              <WatermarkSlider
+                label="Độ trong (opacity)"
+                min={0.3}
+                max={1}
+                step={0.05}
+                unit=""
+                value={settings.videoWatermark.opacity}
+                onChange={(v) => onSetVideoWatermark("opacity", v)}
+                hint="1.0 = đặc, 0.5 = nửa trong suốt"
+                format={(v) => v.toFixed(2)}
+              />
+              <WatermarkSlider
+                label="Khoảng cách lề"
+                min={0}
+                max={10}
+                step={1}
+                unit="%"
+                value={settings.videoWatermark.paddingPct}
+                onChange={(v) => onSetVideoWatermark("paddingPct", v)}
+                hint="% từ cạnh trên + cạnh phải"
+              />
+
+              <div className="mt-1 border-t border-surface-8 pt-3">
+                <label className="flex cursor-pointer items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={settings.videoWatermark.antiTheft}
+                    onChange={(e) =>
+                      onSetVideoWatermarkAntiTheft(e.currentTarget.checked)
+                    }
+                    className="mt-0.5 h-4 w-4 accent-violet-500"
+                  />
+                  <div className="min-w-0 flex-1 text-sm">
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-white/90">
+                        Chế độ chống ăn chôm
+                      </span>
+                      <span className="rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-violet-300">
+                        anti-theft
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-white/55">
+                      Logo nhảy 4 góc (top-right → bottom-left → top-left →
+                      bottom-right) mỗi 5 giây. Kẻ trộm muốn crop logo phải
+                      crop cả 4 góc = mất nội dung trung tâm. Hữu ích cho
+                      Reels/TikTok dài ≥ 5s.
+                    </p>
+                  </div>
+                </label>
+              </div>
             </div>
           </section>
 
@@ -845,6 +936,55 @@ function DeviceSessionSection({
         </div>
       )}
     </section>
+  );
+}
+
+interface WatermarkSliderProps {
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  unit: string;
+  value: number;
+  onChange: (v: number) => void;
+  hint?: string;
+  format?: (v: number) => string;
+}
+
+function WatermarkSlider({
+  label,
+  min,
+  max,
+  step,
+  unit,
+  value,
+  onChange,
+  hint,
+  format,
+}: WatermarkSliderProps) {
+  const display = format ? format(value) : Math.round(value).toString();
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between gap-2 text-sm">
+        <span className="font-medium text-white/85">{label}</span>
+        <span className="rounded-md bg-shopee-500/20 px-2 py-0.5 font-mono text-xs font-semibold text-shopee-300 tabular-nums">
+          {display}
+          {unit}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.currentTarget.value))}
+        className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-surface-4 accent-shopee-500"
+      />
+      {hint && (
+        <p className="mt-1 text-[11px] text-white/40">{hint}</p>
+      )}
+    </div>
   );
 }
 

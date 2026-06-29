@@ -19,7 +19,11 @@ pub mod manual;
 pub mod preview;
 pub mod query;
 pub mod screenshot;
+pub mod shopee_affiliate;
+pub mod shopee_product;
 pub mod video;
+pub mod video_watermark;
+pub mod workspace;
 
 /// Wrapper lỗi cho Tauri command: serialize thành string để UI nhận được.
 /// Rule: không panic, mọi lỗi đều qua đây.

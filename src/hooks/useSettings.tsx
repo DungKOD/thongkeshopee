@@ -28,25 +28,52 @@ export const sumFiltered = sumFilteredPure;
 ///   khi FB campaign đặt tên dài hơn subid Shopee.
 export type SubIdMatchMode = "exact" | "substring";
 
+/// Cấu hình watermark logo Page gắn lên video tải về. Áp dụng cho tab Download.
+export interface VideoWatermarkSettings {
+  /// % chiều rộng video — chiều rộng logo. 1..=50.
+  sizePct: number;
+  /// Opacity 0..=1.
+  opacity: number;
+  /// % chiều rộng video — padding trên + phải. 0..=20.
+  paddingPct: number;
+  /// Chống ăn chôm: logo nhảy 4 góc mỗi 5s (random). Default ON — mọi video
+  /// tải về sẽ tự động có random 4 góc để chống trộm. User có thể tắt trong
+  /// Settings nếu muốn logo cố định ở top-right.
+  antiTheft: boolean;
+}
+
 export interface Settings {
   clickSources: Record<string, boolean>;
   profitFees: ProfitFees;
   subIdMatchMode: SubIdMatchMode;
+  videoWatermark: VideoWatermarkSettings;
 }
 
 const DEFAULT_PROFIT_FEES: ProfitFees = {
   taxAndPlatformRate: 10.98,
   returnReserveRate: 9,
 };
+const DEFAULT_VIDEO_WATERMARK: VideoWatermarkSettings = {
+  sizePct: 12,
+  opacity: 0.9,
+  paddingPct: 4,
+  // Default ON — bảo vệ video khỏi bị trộm crop logo cố định góc.
+  antiTheft: true,
+};
 const DEFAULT_SETTINGS: Settings = {
   clickSources: {},
   profitFees: DEFAULT_PROFIT_FEES,
   subIdMatchMode: "exact",
+  videoWatermark: DEFAULT_VIDEO_WATERMARK,
 };
 
 const KEY_PROFIT_FEE_TAX = "profit_fee.tax_and_platform_rate";
 const KEY_PROFIT_FEE_RETURN = "profit_fee.return_reserve_rate";
 const KEY_SUB_ID_MATCH_MODE = "subIdMatchMode";
+const KEY_WATERMARK_SIZE = "video_watermark.size_pct";
+const KEY_WATERMARK_OPACITY = "video_watermark.opacity";
+const KEY_WATERMARK_PADDING = "video_watermark.padding_pct";
+const KEY_WATERMARK_ANTI_THEFT = "video_watermark.anti_theft";
 const CLICK_SOURCE_PREFIX = "click_source.";
 
 interface SettingEntry {
@@ -59,6 +86,7 @@ function entriesToSettings(entries: SettingEntry[]): Settings {
     clickSources: {},
     profitFees: { ...DEFAULT_PROFIT_FEES },
     subIdMatchMode: "exact",
+    videoWatermark: { ...DEFAULT_VIDEO_WATERMARK },
   };
   for (const { key, value } of entries) {
     let parsed: unknown;
@@ -79,6 +107,22 @@ function entriesToSettings(entries: SettingEntry[]): Settings {
       if (parsed === "exact" || parsed === "substring") {
         s.subIdMatchMode = parsed;
       }
+    } else if (key === KEY_WATERMARK_SIZE) {
+      if (typeof parsed === "number" && parsed >= 1 && parsed <= 50) {
+        s.videoWatermark.sizePct = parsed;
+      }
+    } else if (key === KEY_WATERMARK_OPACITY) {
+      if (typeof parsed === "number" && parsed >= 0 && parsed <= 1) {
+        s.videoWatermark.opacity = parsed;
+      }
+    } else if (key === KEY_WATERMARK_PADDING) {
+      if (typeof parsed === "number" && parsed >= 0 && parsed <= 20) {
+        s.videoWatermark.paddingPct = parsed;
+      }
+    } else if (key === KEY_WATERMARK_ANTI_THEFT) {
+      if (typeof parsed === "boolean") {
+        s.videoWatermark.antiTheft = parsed;
+      }
     } else if (key.startsWith(CLICK_SOURCE_PREFIX)) {
       const src = key.slice(CLICK_SOURCE_PREFIX.length);
       if (src && typeof parsed === "boolean") {
@@ -96,6 +140,8 @@ interface SettingsContextValue {
   getEnabledSet: () => Set<string>;
   setProfitFee: (key: keyof ProfitFees, value: number) => void;
   setSubIdMatchMode: (mode: SubIdMatchMode) => void;
+  setVideoWatermark: (key: keyof VideoWatermarkSettings, value: number) => void;
+  setVideoWatermarkAntiTheft: (enabled: boolean) => void;
   reload: () => Promise<void>;
   hydrated: boolean;
 }
@@ -222,6 +268,44 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [persistKey],
   );
 
+  const setVideoWatermark = useCallback(
+    (key: keyof VideoWatermarkSettings, value: number) => {
+      // Chỉ áp cho field number — antiTheft (boolean) dùng setter riêng.
+      if (key === "antiTheft") return;
+      const clamp = (lo: number, hi: number) =>
+        Math.min(hi, Math.max(lo, Number.isFinite(value) ? value : lo));
+      let safe = value;
+      let dbKey: string;
+      if (key === "sizePct") {
+        safe = clamp(1, 50);
+        dbKey = KEY_WATERMARK_SIZE;
+      } else if (key === "opacity") {
+        safe = clamp(0, 1);
+        dbKey = KEY_WATERMARK_OPACITY;
+      } else {
+        safe = clamp(0, 20);
+        dbKey = KEY_WATERMARK_PADDING;
+      }
+      setSettings((prev) => ({
+        ...prev,
+        videoWatermark: { ...prev.videoWatermark, [key]: safe },
+      }));
+      void persistKey(dbKey, safe);
+    },
+    [persistKey],
+  );
+
+  const setVideoWatermarkAntiTheft = useCallback(
+    (enabled: boolean) => {
+      setSettings((prev) => ({
+        ...prev,
+        videoWatermark: { ...prev.videoWatermark, antiTheft: enabled },
+      }));
+      void persistKey(KEY_WATERMARK_ANTI_THEFT, enabled);
+    },
+    [persistKey],
+  );
+
   // useMemo: KHÔNG tạo object literal mới mỗi render. Nếu thiếu, mọi
   // consumer useSettings() (hàng trăm VideoRow + DayBlock) sẽ re-render
   // bất cứ khi nào SettingsProvider re-render — kể cả khi data thực không
@@ -234,6 +318,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       getEnabledSet,
       setProfitFee,
       setSubIdMatchMode,
+      setVideoWatermark,
+      setVideoWatermarkAntiTheft,
       reload,
       hydrated,
     }),
@@ -244,6 +330,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       getEnabledSet,
       setProfitFee,
       setSubIdMatchMode,
+      setVideoWatermark,
+      setVideoWatermarkAntiTheft,
       reload,
       hydrated,
     ],

@@ -22,6 +22,7 @@ pub mod fb_reels_db;
 pub mod read_pool;
 pub mod types;
 pub mod video_db;
+pub mod workspace;
 
 pub use fb_ads_db::FbAdsDbState;
 pub use fb_reels_db::FbReelsDbState;
@@ -48,8 +49,8 @@ pub fn now_rfc3339_z() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// Resolve app_data_dir root (base cho mọi path khác).
-fn app_data_root(app: &AppHandle) -> Result<PathBuf> {
+/// Resolve app_data_dir root (base cho registry + folder workspaces).
+pub fn app_data_root(app: &AppHandle) -> Result<PathBuf> {
     let base = app
         .path()
         .app_data_dir()
@@ -59,9 +60,9 @@ fn app_data_root(app: &AppHandle) -> Result<PathBuf> {
     Ok(base)
 }
 
-/// DB path single-file ở root app_data dir.
-pub fn resolve_db_path(app: &AppHandle) -> Result<PathBuf> {
-    Ok(app_data_root(app)?.join(DB_FILENAME))
+/// Main DB path trong workspace folder.
+pub fn resolve_db_path_in(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(DB_FILENAME)
 }
 
 /// Active DB path — query `PRAGMA database_list` từ connection đang mở.
@@ -114,6 +115,29 @@ pub fn init_db_at(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Mở connection vào DB đã tồn tại — chỉ apply PRAGMA, KHÔNG re-apply schema /
+/// seed / ANALYZE. Dùng cho workspace hot-swap: DB target đã setup đầy đủ ở
+/// lần `init_db_at` đầu tiên (lúc create_workspace hoặc lần đầu app start),
+/// switch chỉ cần connection mới trỏ tới file đó.
+///
+/// Lý do tách khỏi `init_db_at`: ANALYZE trên DB lớn (>500MB) có thể tốn
+/// nhiều giây → switch_workspace bị "đơ" rõ rệt. Schema re-apply tốn thêm
+/// ~50ms parse 100+ CREATE TABLE IF NOT EXISTS.
+pub fn open_existing_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("không mở được DB tại {}", path.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -32768;
+         PRAGMA mmap_size = 268435456;",
+    )
+    .context("không apply được PRAGMA khi open existing DB")?;
+    Ok(conn)
+}
+
 /// Seed account "Mặc định" với id = content_id(name). Idempotent.
 fn seed_default_account(conn: &Connection) -> Result<()> {
     let id = content_id::shopee_account_id(DEFAULT_ACCOUNT_NAME);
@@ -126,9 +150,21 @@ fn seed_default_account(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Setup hook cho `tauri::Builder`: init main DB ở root + video DB + state.
+/// Setup hook cho `tauri::Builder`: resolve workspace active → init 4 DB +
+/// read pool trong workspace folder. Migrate layout cũ (DB ở root) lần đầu.
 pub fn setup(app: &AppHandle) -> Result<()> {
-    let path = resolve_db_path(app)?;
+    let app_data = app_data_root(app)?;
+    let active_ws = workspace::ensure_initialized(&app_data)
+        .context("không khởi tạo được workspace registry")?;
+    let workspace_root = workspace::workspace_dir(&app_data, &active_ws.id);
+    fs::create_dir_all(&workspace_root).with_context(|| {
+        format!(
+            "không tạo được workspace folder: {}",
+            workspace_root.display()
+        )
+    })?;
+
+    let path = resolve_db_path_in(&workspace_root);
     let conn = init_db_at(&path)?;
     app.manage(DbState(Mutex::new(conn)));
 
@@ -139,9 +175,9 @@ pub fn setup(app: &AppHandle) -> Result<()> {
         .context("không tạo read pool")?;
     app.manage(pool);
 
-    video_db::setup(app)?;
-    fb_reels_db::setup(app)?;
-    fb_ads_db::setup(app)?;
+    video_db::setup_in(app, &workspace_root)?;
+    fb_reels_db::setup_in(app, &workspace_root)?;
+    fb_ads_db::setup_in(app, &workspace_root)?;
     Ok(())
 }
 

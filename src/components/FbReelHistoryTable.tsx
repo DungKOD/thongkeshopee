@@ -1,7 +1,9 @@
 import { useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  fbDebugVideoInfo,
   fbDeletePost,
+  fbRefetchPostStatus,
   type FbReelPost,
   type FbReelStatus,
 } from "../lib/fbReels";
@@ -20,6 +22,7 @@ const STATUS_FILTERS: { value: FbReelStatus | "all"; label: string }[] = [
   { value: "pending", label: "Chờ đăng" },
   { value: "uploading", label: "Đang upload" },
   { value: "publishing", label: "Đang publish" },
+  { value: "processing", label: "FB đang xử lý" },
   { value: "scheduled", label: "Đã lên lịch" },
   { value: "published", label: "Đã đăng" },
   { value: "failed", label: "Lỗi" },
@@ -43,6 +46,13 @@ const STATUS_STYLES: Record<
     label: "Đang publish",
     cls: "bg-blue-500/20 text-blue-200 border-blue-500/40",
     icon: "send",
+  },
+  // FB đã nhận video, đang transcode + validate. App đợi background poll
+  // (60s/lần) hoặc user bấm Cập nhật để verify FB đã publish thật chưa.
+  processing: {
+    label: "FB đang xử lý",
+    cls: "bg-violet-500/20 text-violet-200 border-violet-500/40",
+    icon: "hourglass_top",
   },
   scheduled: {
     label: "Đã lên lịch",
@@ -75,10 +85,23 @@ export function FbReelHistoryTable({
     return posts.filter((p) => p.status === statusFilter);
   }, [posts, statusFilter]);
 
-  const pendingCount = useMemo(
-    () => posts.filter((p) => p.status === "pending").length,
-    [posts],
-  );
+  const counts = useMemo(() => {
+    const c = {
+      pending: 0,
+      processing: 0,
+      scheduled: 0,
+      published: 0,
+      failed: 0,
+    };
+    for (const p of posts) {
+      if (p.status === "pending") c.pending++;
+      else if (p.status === "processing") c.processing++;
+      else if (p.status === "scheduled") c.scheduled++;
+      else if (p.status === "published") c.published++;
+      else if (p.status === "failed") c.failed++;
+    }
+    return c;
+  }, [posts]);
 
   const handleDelete = async (postId: number) => {
     if (!confirm("Xóa post khỏi lịch sử? (không un-publish trên FB)")) return;
@@ -92,6 +115,15 @@ export function FbReelHistoryTable({
 
   const handleOpenPermalink = (url: string) => {
     void openUrl(url);
+  };
+
+  const handleRefetch = async (postId: number) => {
+    try {
+      await fbRefetchPostStatus(postId);
+      onChanged();
+    } catch (e) {
+      alert((e as Error).message ?? String(e));
+    }
   };
 
   if (posts.length === 0) {
@@ -112,9 +144,36 @@ export function FbReelHistoryTable({
           <h3 className="text-sm font-semibold uppercase tracking-wider text-white/65">
             Hàng đợi & lịch sử
           </h3>
-          <p className="text-[11px] text-white/45">
-            {posts.length} post · {pendingCount} chờ đăng
-          </p>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
+            <span className="rounded-full bg-white/8 px-2 py-0.5 text-white/55">
+              Tổng {posts.length}
+            </span>
+            {counts.pending > 0 && (
+              <span className="rounded-full bg-white/10 px-2 py-0.5 text-white/70">
+                {counts.pending} chờ đăng
+              </span>
+            )}
+            {counts.processing > 0 && (
+              <span className="rounded-full bg-violet-500/20 px-2 py-0.5 text-violet-200">
+                {counts.processing} FB đang xử lý
+              </span>
+            )}
+            {counts.scheduled > 0 && (
+              <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-amber-200">
+                {counts.scheduled} đã lên lịch
+              </span>
+            )}
+            {counts.published > 0 && (
+              <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-emerald-200">
+                {counts.published} đã đăng
+              </span>
+            )}
+            {counts.failed > 0 && (
+              <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-red-200">
+                {counts.failed} lỗi
+              </span>
+            )}
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <select
@@ -133,7 +192,7 @@ export function FbReelHistoryTable({
           <button
             type="button"
             onClick={onStartAll}
-            disabled={uploading || pendingCount === 0}
+            disabled={uploading || counts.pending === 0}
             className="btn-ripple flex items-center gap-2 rounded-lg bg-blue-500 px-4 py-2 text-sm font-medium text-white hover:bg-blue-600 disabled:opacity-50"
           >
             {uploading ? (
@@ -148,7 +207,7 @@ export function FbReelHistoryTable({
                 <span className="material-symbols-rounded text-base">
                   play_arrow
                 </span>
-                Bắt đầu đăng ({pendingCount})
+                Bắt đầu đăng ({counts.pending})
               </>
             )}
           </button>
@@ -163,6 +222,7 @@ export function FbReelHistoryTable({
             onRetry={onRetry}
             onDelete={handleDelete}
             onOpenPermalink={handleOpenPermalink}
+            onRefetch={handleRefetch}
             uploading={uploading}
           />
         ))}
@@ -177,6 +237,7 @@ interface PostRowProps {
   onRetry: (postId: number) => void;
   onDelete: (postId: number) => Promise<void>;
   onOpenPermalink: (url: string) => void;
+  onRefetch: (postId: number) => Promise<void>;
 }
 
 function PostRow({
@@ -185,20 +246,71 @@ function PostRow({
   onRetry,
   onDelete,
   onOpenPermalink,
+  onRefetch,
 }: PostRowProps) {
   const meta = STATUS_STYLES[post.status];
-  const isActive = post.status === "uploading" || post.status === "publishing";
+  const isActive =
+    post.status === "uploading" ||
+    post.status === "publishing" ||
+    post.status === "processing";
   const fileName = post.filePath.split(/[\\/]/).pop() ?? post.filePath;
+  // "Cập nhật" button: cho row scheduled (verify FB đã đăng chưa), processing
+  // (FB đang transcode), HOẶC published mà chưa có permalink (FB transcoding
+  // chậm). Background poll đã chạy 60s/lần, nút này cho user force-check ngay.
+  const showRefetchBtn =
+    post.status === "scheduled" ||
+    post.status === "processing" ||
+    (post.status === "published" && !post.fbPermalink);
+  // "Xem chi tiết FB" — gọi GET /{video_id} trả raw JSON cho user/dev copy
+  // diagnostic. Chỉ hiện khi đã có video_id (đã qua start_upload).
+  const showDebugBtn =
+    post.fbVideoId !== null &&
+    (post.status === "processing" ||
+      post.status === "failed" ||
+      post.status === "scheduled" ||
+      (post.status === "published" && !post.fbPermalink));
+
+  const [debugInfo, setDebugInfo] = useState<string | null>(null);
+  const [debugLoading, setDebugLoading] = useState(false);
+
+  const handleShowDebug = async () => {
+    setDebugLoading(true);
+    try {
+      const raw = await fbDebugVideoInfo(post.id);
+      setDebugInfo(raw);
+    } catch (e) {
+      setDebugInfo(`Lỗi gọi FB: ${(e as Error).message ?? String(e)}`);
+    } finally {
+      setDebugLoading(false);
+    }
+  };
+
+  const handleCopyDebug = async () => {
+    if (!debugInfo) return;
+    try {
+      await navigator.clipboard.writeText(debugInfo);
+    } catch {
+      // clipboard không cho phép — user select & copy thủ công.
+    }
+  };
 
   return (
     <li className="rounded-lg border border-surface-8 bg-surface-2 p-3">
       <div className="flex items-start gap-3">
         <span
           className={`material-symbols-rounded text-2xl ${
-            isActive ? "animate-pulse text-blue-300" : "text-white/45"
+            isActive
+              ? post.status === "processing"
+                ? "animate-pulse text-violet-300"
+                : "animate-pulse text-blue-300"
+              : "text-white/45"
           }`}
         >
-          {isActive ? "cloud_upload" : "movie"}
+          {!isActive
+            ? "movie"
+            : post.status === "processing"
+              ? "hourglass_top"
+              : "cloud_upload"}
         </span>
 
         <div className="min-w-0 flex-1">
@@ -240,15 +352,33 @@ function PostRow({
 
           {isActive && (
             <div className="mt-2">
-              <div className="h-1.5 overflow-hidden rounded-full bg-surface-1">
-                <div
-                  className="h-full bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-300"
-                  style={{ width: `${post.progress}%` }}
-                />
-              </div>
+              {post.status === "publishing" || post.status === "processing" ? (
+                // publishing/processing không có progress thực — hiện
+                // indeterminate animation thay vì stuck 100% (gây tưởng đơ).
+                // processing dùng màu violet để phân biệt với publishing (xanh).
+                <div className="h-1.5 overflow-hidden rounded-full bg-surface-1">
+                  <div
+                    className={`animate-progress-indeterminate h-full w-1/3 bg-gradient-to-r ${
+                      post.status === "processing"
+                        ? "from-violet-500 to-violet-300"
+                        : "from-blue-500 to-blue-300"
+                    }`}
+                  />
+                </div>
+              ) : (
+                <div className="h-1.5 overflow-hidden rounded-full bg-surface-1">
+                  <div
+                    className="h-full bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-300"
+                    style={{ width: `${post.progress}%` }}
+                  />
+                </div>
+              )}
               <div className="mt-0.5 text-[11px] text-white/55">
-                {post.progress}%
-                {post.status === "publishing" && " · đang publish..."}
+                {post.status === "publishing"
+                  ? "Đang gọi FB publish API..."
+                  : post.status === "processing"
+                    ? "FB đang transcode + validate video (có thể mất 30-90s)"
+                    : `${post.progress}% · upload binary`}
               </div>
             </div>
           )}
@@ -257,6 +387,47 @@ function PostRow({
             <p className="mt-1 line-clamp-3 text-[11px] text-red-300">
               {post.errorMessage}
             </p>
+          )}
+
+          {debugInfo !== null && (
+            <div className="mt-2 rounded-md border border-violet-500/40 bg-violet-950/30 p-2">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-[11px] font-semibold uppercase text-violet-200">
+                  FB raw response
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyDebug()}
+                    className="rounded px-1.5 py-0.5 text-[11px] text-violet-200 hover:bg-violet-500/30"
+                    title="Copy JSON"
+                  >
+                    <span className="material-symbols-rounded text-xs">
+                      content_copy
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDebugInfo(null)}
+                    className="rounded px-1.5 py-0.5 text-[11px] text-violet-200 hover:bg-violet-500/30"
+                    title="Đóng"
+                  >
+                    <span className="material-symbols-rounded text-xs">
+                      close
+                    </span>
+                  </button>
+                </div>
+              </div>
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-black/30 p-2 font-mono text-[10px] leading-tight text-violet-100">
+                {debugInfo}
+              </pre>
+              <p className="mt-1 text-[10px] text-violet-300/70">
+                Xem field <code>status.publishing_phase</code> +{" "}
+                <code>processing_phase</code> để biết FB đang ở bước nào.
+                <code>publish_status</code> hoặc <code>errors</code> tiết
+                lộ lý do video không lên.
+              </p>
+            </div>
           )}
         </div>
 
@@ -270,6 +441,35 @@ function PostRow({
             >
               <span className="material-symbols-rounded text-base">
                 open_in_new
+              </span>
+            </button>
+          )}
+          {showRefetchBtn && (
+            <button
+              type="button"
+              onClick={() => void onRefetch(post.id)}
+              className="flex h-7 w-7 items-center justify-center rounded-full text-cyan-300 hover:bg-cyan-500/20"
+              title={
+                post.status === "scheduled"
+                  ? "Kiểm tra FB đã đăng chưa"
+                  : "Cập nhật permalink (FB đang transcode)"
+              }
+            >
+              <span className="material-symbols-rounded text-base">
+                cached
+              </span>
+            </button>
+          )}
+          {showDebugBtn && (
+            <button
+              type="button"
+              onClick={() => void handleShowDebug()}
+              disabled={debugLoading}
+              className="flex h-7 w-7 items-center justify-center rounded-full text-violet-300 hover:bg-violet-500/20 disabled:opacity-50"
+              title="Xem JSON FB trả về cho video này (debug)"
+            >
+              <span className="material-symbols-rounded text-base">
+                {debugLoading ? "sync" : "bug_report"}
               </span>
             </button>
           )}

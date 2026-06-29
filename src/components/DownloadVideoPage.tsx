@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
@@ -7,6 +7,14 @@ import {
   logVideoDownload,
   type VideoDownloadLog,
 } from "../lib/video";
+import {
+  applyVideoWatermark,
+  type WatermarkProgressEvent,
+  type WatermarkStageEvent,
+} from "../lib/videoWatermark";
+import { useFbPages } from "../hooks/useFbPages";
+import { useSettings } from "../hooks/useSettings";
+import type { FbPage } from "../lib/fbReels";
 import { fmtBytes, fmtHistoryTime } from "../formulas";
 
 interface VideoInfo {
@@ -25,7 +33,19 @@ interface ProgressPayload {
   total: number;
 }
 
-type ItemStatus = "fetching" | "ready" | "downloading" | "done" | "failed";
+type ItemStatus =
+  | "fetching"
+  | "ready"
+  | "downloading"
+  | "watermarking"
+  | "done"
+  | "failed";
+
+interface WatermarkState {
+  stage: WatermarkStageEvent["stage"];
+  message: string;
+  percent: number;
+}
 
 interface BatchItem {
   id: string;
@@ -33,6 +53,9 @@ interface BatchItem {
   status: ItemStatus;
   info: VideoInfo | null;
   progress: ProgressPayload | null;
+  watermark: WatermarkState | null;
+  /// Path file local sau khi download xong — dùng để gọi watermark.
+  savedPath: string;
   error: string;
 }
 
@@ -61,6 +84,9 @@ const PLATFORMS: PlatformChip[] = [
 const MAX_CONCURRENT = 3;
 const MAX_CONCURRENT_FETCH = 2;
 const HISTORY_PAGE_SIZE = 50;
+
+const LS_WATERMARK_ENABLED = "download:watermark:enabled";
+const LS_WATERMARK_PAGE_ID = "download:watermark:pageId";
 
 function genId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -93,6 +119,72 @@ export function DownloadVideoPage() {
   const [history, setHistory] = useState<VideoDownloadLog[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
+  // Watermark state: persist toggle + page chọn vào localStorage để giữ qua
+  // tab switch + reload. localStorage thay vì app_settings vì state này là UI-
+  // only (không cần share giữa devices).
+  const { pages: fbPages } = useFbPages();
+  const { settings } = useSettings();
+  const [watermarkEnabled, setWatermarkEnabled] = useState<boolean>(() => {
+    try {
+      return JSON.parse(localStorage.getItem(LS_WATERMARK_ENABLED) ?? "false");
+    } catch {
+      return false;
+    }
+  });
+  const [watermarkPageId, setWatermarkPageId] = useState<string>(() => {
+    try {
+      return localStorage.getItem(LS_WATERMARK_PAGE_ID) ?? "";
+    } catch {
+      return "";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        LS_WATERMARK_ENABLED,
+        JSON.stringify(watermarkEnabled),
+      );
+    } catch {
+      /* quota */
+    }
+  }, [watermarkEnabled]);
+  useEffect(() => {
+    try {
+      if (watermarkPageId) {
+        localStorage.setItem(LS_WATERMARK_PAGE_ID, watermarkPageId);
+      } else {
+        localStorage.removeItem(LS_WATERMARK_PAGE_ID);
+      }
+    } catch {
+      /* quota */
+    }
+  }, [watermarkPageId]);
+  // Auto-pick page đầu tiên nếu user bật toggle mà chưa chọn page nào.
+  useEffect(() => {
+    if (watermarkEnabled && !watermarkPageId && fbPages.length > 0) {
+      setWatermarkPageId(fbPages[0].pageId);
+    }
+  }, [watermarkEnabled, watermarkPageId, fbPages]);
+  // Nếu Page đã chọn bị xóa khỏi danh sách → reset.
+  useEffect(() => {
+    if (
+      watermarkPageId &&
+      fbPages.length > 0 &&
+      !fbPages.some((p) => p.pageId === watermarkPageId)
+    ) {
+      setWatermarkPageId(fbPages[0]?.pageId ?? "");
+    }
+  }, [fbPages, watermarkPageId]);
+
+  const watermarkActive = useMemo(
+    () => watermarkEnabled && !!watermarkPageId,
+    [watermarkEnabled, watermarkPageId],
+  );
+  const selectedPage = useMemo(
+    () => fbPages.find((p) => p.pageId === watermarkPageId) ?? null,
+    [fbPages, watermarkPageId],
+  );
+
   const refreshHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
@@ -123,52 +215,167 @@ export function DownloadVideoPage() {
     };
   }, []);
 
-  const downloadOne = useCallback(async (item: BatchItem, dir: string) => {
-    if (!item.info) return;
-    const filename =
-      item.info.filename ||
-      `${item.info.platform.toLowerCase()}_${Date.now()}.mp4`;
-    const savePath = `${dir}/${filename}`;
-
-    setItems((prev) =>
-      prev.map((i) =>
-        i.id === item.id
-          ? {
-              ...i,
-              status: "downloading",
-              progress: { downloadId: item.id, downloaded: 0, total: 0 },
-              error: "",
-            }
-          : i,
-      ),
+  // Watermark progress + stage listeners. `watermarkId` = item.id (1 watermark
+  // per video). Backend emit cả 2 channel song song; UI merge vào `watermark`
+  // field. Tách 2 channel để FE biết khi nào đang download ffmpeg (stage) vs
+  // tiến độ encode (progress %).
+  useEffect(() => {
+    const unsubProgress = listen<WatermarkProgressEvent>(
+      "watermark-progress",
+      (e) => {
+        const p = e.payload;
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === p.watermarkId
+              ? {
+                  ...item,
+                  watermark: {
+                    stage: item.watermark?.stage ?? "encoding",
+                    message:
+                      item.watermark?.message ?? "Đang gắn logo...",
+                    percent: p.percent,
+                  },
+                }
+              : item,
+          ),
+        );
+      },
     );
-    setDownloadingCount((n) => n + 1);
-
-    try {
-      await invoke<string>("download_video", {
-        downloadUrl: item.info.downloadUrl,
-        savePath,
-        downloadId: item.id,
-      });
+    const unsubStage = listen<WatermarkStageEvent>("watermark-stage", (e) => {
+      const p = e.payload;
       setItems((prev) =>
-        prev.map((i) =>
-          i.id === item.id ? { ...i, status: "done", progress: null } : i,
+        prev.map((item) =>
+          item.id === p.watermarkId
+            ? {
+                ...item,
+                watermark: {
+                  stage: p.stage,
+                  message: p.message,
+                  percent: item.watermark?.percent ?? 0,
+                },
+              }
+            : item,
         ),
       );
-      void logVideoDownload(item.url, "success");
-    } catch (e) {
+    });
+    return () => {
+      unsubProgress.then((fn) => fn());
+      unsubStage.then((fn) => fn());
+    };
+  }, []);
+
+  const downloadOne = useCallback(
+    async (
+      item: BatchItem,
+      dir: string,
+      watermark: { enabled: boolean; pageId: string } | null,
+      watermarkOptions: {
+        sizePct: number;
+        opacity: number;
+        paddingPct: number;
+        antiTheft: boolean;
+      },
+    ) => {
+      if (!item.info) return;
+      const filename =
+        item.info.filename ||
+        `${item.info.platform.toLowerCase()}_${Date.now()}.mp4`;
+      const savePath = `${dir}/${filename}`;
+
       setItems((prev) =>
         prev.map((i) =>
           i.id === item.id
-            ? { ...i, status: "failed", error: String(e), progress: null }
+            ? {
+                ...i,
+                status: "downloading",
+                progress: { downloadId: item.id, downloaded: 0, total: 0 },
+                savedPath: savePath,
+                watermark: null,
+                error: "",
+              }
             : i,
         ),
       );
-      void logVideoDownload(item.url, "failed");
-    } finally {
-      setDownloadingCount((n) => n - 1);
-    }
-  }, []);
+      setDownloadingCount((n) => n + 1);
+
+      try {
+        await invoke<string>("download_video", {
+          downloadUrl: item.info.downloadUrl,
+          savePath,
+          downloadId: item.id,
+        });
+
+        // Sau khi tải xong: nếu watermark active, chạy gắn logo. Lỗi watermark
+        // KHÔNG đánh dấu item là failed — file đã tải về OK, chỉ logo fail.
+        // FE hiện trạng thái "done" + warning nhỏ để user retry watermark.
+        if (watermark && watermark.enabled && watermark.pageId) {
+          setItems((prev) =>
+            prev.map((i) =>
+              i.id === item.id
+                ? {
+                    ...i,
+                    status: "watermarking",
+                    progress: null,
+                    watermark: {
+                      stage: "preparing",
+                      message: "Đang chuẩn bị gắn logo...",
+                      percent: 0,
+                    },
+                  }
+                : i,
+            ),
+          );
+          try {
+            await applyVideoWatermark(
+              savePath,
+              watermark.pageId,
+              watermarkOptions,
+              item.id,
+            );
+            setItems((prev) =>
+              prev.map((i) =>
+                i.id === item.id
+                  ? { ...i, status: "done", watermark: null }
+                  : i,
+              ),
+            );
+          } catch (wErr) {
+            setItems((prev) =>
+              prev.map((i) =>
+                i.id === item.id
+                  ? {
+                      ...i,
+                      status: "done",
+                      watermark: null,
+                      error: `Tải OK, gắn logo lỗi: ${String(wErr)}`,
+                    }
+                  : i,
+              ),
+            );
+          }
+        } else {
+          setItems((prev) =>
+            prev.map((i) =>
+              i.id === item.id ? { ...i, status: "done", progress: null } : i,
+            ),
+          );
+        }
+        void logVideoDownload(item.url, "success");
+      } catch (e) {
+        setItems((prev) =>
+          prev.map((i) =>
+            i.id === item.id
+              ? { ...i, status: "failed", error: String(e), progress: null }
+              : i,
+          ),
+        );
+        void logVideoDownload(item.url, "failed");
+      } finally {
+        setDownloadingCount((n) => n - 1);
+      }
+    },
+    [],
+  );
 
   const fetchOne = useCallback(async (item: BatchItem) => {
     setItems((prev) =>
@@ -204,6 +411,8 @@ export function DownloadVideoPage() {
       status: "fetching" as ItemStatus,
       info: null,
       progress: null,
+      watermark: null,
+      savedPath: "",
       error: "",
     }));
     setItems(newItems);
@@ -227,12 +436,29 @@ export function DownloadVideoPage() {
     const readyItems = items.filter((i) => i.status === "ready");
     if (readyItems.length === 0) return;
 
-    // Pool pattern: tối đa MAX_CONCURRENT luồng đồng thời
+    // Snapshot watermark config 1 lần trước khi pool — tránh race state đổi
+    // giữa batch. User toggle giữa chừng không ảnh hưởng video đang xử lý.
+    const wmConfig = watermarkActive
+      ? { enabled: true, pageId: watermarkPageId }
+      : null;
+    const wmOptions = {
+      sizePct: settings.videoWatermark.sizePct,
+      opacity: settings.videoWatermark.opacity,
+      paddingPct: settings.videoWatermark.paddingPct,
+      antiTheft: settings.videoWatermark.antiTheft,
+    };
+
+    // Pool pattern: tối đa MAX_CONCURRENT luồng đồng thời. Mỗi luồng:
+    // download → (optional) watermark, giữ slot pool cho tới khi cả 2 xong.
+    // Tốc độ batch không bị watermark step làm chậm chuyển sang video kế.
     const pool = new Set<Promise<void>>();
     for (const item of readyItems) {
-      const p: Promise<void> = downloadOne(item, saveDir).finally(() =>
-        pool.delete(p),
-      );
+      const p: Promise<void> = downloadOne(
+        item,
+        saveDir,
+        wmConfig,
+        wmOptions,
+      ).finally(() => pool.delete(p));
       pool.add(p);
       if (pool.size >= MAX_CONCURRENT) await Promise.race(pool);
     }
@@ -293,6 +519,20 @@ export function DownloadVideoPage() {
           </div>
         </div>
       </section>
+
+      {/* ===== Watermark control ===== */}
+      <WatermarkControl
+        enabled={watermarkEnabled}
+        onToggle={setWatermarkEnabled}
+        pageId={watermarkPageId}
+        onPageChange={setWatermarkPageId}
+        pages={fbPages}
+        selectedPage={selectedPage}
+        sizePct={settings.videoWatermark.sizePct}
+        opacity={settings.videoWatermark.opacity}
+        paddingPct={settings.videoWatermark.paddingPct}
+        antiTheft={settings.videoWatermark.antiTheft}
+      />
 
       {/* ===== URL input ===== */}
       <section className="space-y-3 rounded-2xl bg-surface-2 p-4 shadow-elev-2">
@@ -440,7 +680,21 @@ export function DownloadVideoPage() {
                 key={item.id}
                 item={item}
                 canRetryDownload={!!saveDir && !!item.info}
-                onRetryDownload={() => void downloadOne(item, saveDir)}
+                onRetryDownload={() =>
+                  void downloadOne(
+                    item,
+                    saveDir,
+                    watermarkActive
+                      ? { enabled: true, pageId: watermarkPageId }
+                      : null,
+                    {
+                      sizePct: settings.videoWatermark.sizePct,
+                      opacity: settings.videoWatermark.opacity,
+                      paddingPct: settings.videoWatermark.paddingPct,
+                      antiTheft: settings.videoWatermark.antiTheft,
+                    },
+                  )
+                }
                 onRetryFetch={() => void fetchOne(item)}
               />
             ))}
@@ -543,6 +797,157 @@ export function DownloadVideoPage() {
 
 // ===== Sub-components =====
 
+interface WatermarkControlProps {
+  enabled: boolean;
+  onToggle: (v: boolean) => void;
+  pageId: string;
+  onPageChange: (id: string) => void;
+  pages: FbPage[];
+  selectedPage: FbPage | null;
+  sizePct: number;
+  opacity: number;
+  paddingPct: number;
+  antiTheft: boolean;
+}
+
+function WatermarkControl({
+  enabled,
+  onToggle,
+  pageId,
+  onPageChange,
+  pages,
+  selectedPage,
+  sizePct,
+  opacity,
+  paddingPct,
+  antiTheft,
+}: WatermarkControlProps) {
+  const hasPages = pages.length > 0;
+  const active = enabled && hasPages && !!pageId;
+
+  return (
+    <section
+      className={`overflow-hidden rounded-2xl border shadow-elev-2 transition-colors ${
+        active
+          ? "border-violet-500/40 bg-gradient-to-br from-violet-950/40 via-surface-2 to-surface-2"
+          : "border-surface-8 bg-surface-2"
+      }`}
+    >
+      <div className="flex flex-wrap items-center gap-3 px-4 py-3">
+        <span
+          className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
+            active
+              ? "bg-violet-500/20 text-violet-300"
+              : "bg-surface-6 text-white/50"
+          }`}
+        >
+          <span className="material-symbols-rounded text-xl">
+            branding_watermark
+          </span>
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-white/90">
+              Tự động gắn logo Page lên video
+            </span>
+            {active && (
+              <span className="rounded-full bg-violet-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-violet-300">
+                Bật
+              </span>
+            )}
+            {active && antiTheft && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300"
+                title="Logo nhảy 4 góc mỗi 5s — chống ăn chôm video"
+              >
+                <span className="material-symbols-rounded text-xs">
+                  shield
+                </span>
+                Anti-theft
+              </span>
+            )}
+          </div>
+          <p className="mt-0.5 text-xs text-white/55">
+            Sau khi tải xong, app tự overlay avatar Page vào góc trên phải.
+            Tinh chỉnh size/opacity/padding ở Cài đặt.
+          </p>
+        </div>
+        <label className="inline-flex cursor-pointer items-center gap-2">
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={!hasPages}
+            onChange={(e) => onToggle(e.currentTarget.checked)}
+            className="peer sr-only"
+          />
+          <span
+            className={`relative h-6 w-11 rounded-full transition-colors ${
+              enabled && hasPages
+                ? "bg-violet-500"
+                : "bg-surface-8"
+            } peer-disabled:opacity-50`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                enabled ? "translate-x-5" : ""
+              }`}
+            />
+          </span>
+        </label>
+      </div>
+
+      {!hasPages ? (
+        <div className="flex items-start gap-2 border-t border-surface-8 bg-surface-1/60 px-4 py-2.5 text-xs text-amber-200">
+          <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
+            info
+          </span>
+          <span>
+            Chưa có Page nào — sang tab "Đăng video" để thêm Page trước.
+          </span>
+        </div>
+      ) : enabled ? (
+        <div className="flex flex-wrap items-center gap-3 border-t border-violet-500/20 bg-violet-950/20 px-4 py-2.5">
+          <span className="text-xs font-medium text-white/55">Chọn Page:</span>
+          <select
+            value={pageId}
+            onChange={(e) => onPageChange(e.currentTarget.value)}
+            className="min-w-0 flex-1 rounded-lg border border-violet-500/30 bg-surface-1 px-3 py-1.5 text-sm text-white/90 focus:border-violet-400 focus:outline-none focus:ring-1 focus:ring-violet-400"
+          >
+            {pages.map((p) => (
+              <option key={p.pageId} value={p.pageId}>
+                {p.name}
+                {p.tokenExpired ? " (token hết hạn)" : ""}
+              </option>
+            ))}
+          </select>
+          <span className="ml-auto flex shrink-0 items-center gap-2 text-[11px] text-white/45">
+            <span className="font-mono tabular-nums">{Math.round(sizePct)}%</span>
+            <span className="text-white/25">·</span>
+            <span className="font-mono tabular-nums">
+              {opacity.toFixed(2)}
+            </span>
+            <span className="text-white/25">·</span>
+            <span className="font-mono tabular-nums">
+              {Math.round(paddingPct)}%
+            </span>
+          </span>
+          {selectedPage?.tokenExpired && (
+            <div className="flex w-full items-start gap-1.5 rounded-lg border border-amber-500/30 bg-amber-950/20 px-2.5 py-1.5 text-[11px] text-amber-200">
+              <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
+                warning
+              </span>
+              <span>
+                Token Page hết hạn — vẫn có thể gắn logo (avatar Page là public),
+                nhưng nên cập nhật token ở tab "Đăng video".
+              </span>
+            </div>
+          )}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function Step({ n, children }: { n: number; children: React.ReactNode }) {
   return (
     <div className="flex items-start gap-3">
@@ -588,6 +993,11 @@ function BatchItemRow({
     downloading: (
       <span className="material-symbols-rounded animate-spin text-base text-green-400">
         sync
+      </span>
+    ),
+    watermarking: (
+      <span className="material-symbols-rounded animate-spin text-base text-violet-400">
+        auto_fix_high
       </span>
     ),
     done: (
@@ -674,6 +1084,42 @@ function BatchItemRow({
               )}
             </div>
           </div>
+        )}
+
+        {/* Watermark progress bar */}
+        {status === "watermarking" && item.watermark && (
+          <div className="space-y-0.5">
+            <div className="relative h-1.5 overflow-hidden rounded-full bg-violet-500/20">
+              {item.watermark.stage === "encoding" &&
+              item.watermark.percent > 0 ? (
+                <div
+                  className="h-full rounded-full bg-violet-500 transition-[width] duration-150 ease-out"
+                  style={{ width: `${item.watermark.percent}%` }}
+                />
+              ) : (
+                <div className="animate-progress-indeterminate absolute inset-y-0 w-1/3 rounded-full bg-violet-500" />
+              )}
+            </div>
+            <div className="flex justify-between text-[10px] tabular-nums text-white/40">
+              <span className="truncate">{item.watermark.message}</span>
+              {item.watermark.stage === "encoding" &&
+                item.watermark.percent > 0 && (
+                  <span className="font-semibold text-violet-300">
+                    {item.watermark.percent.toFixed(0)}%
+                  </span>
+                )}
+            </div>
+          </div>
+        )}
+
+        {/* Done with warning (tải xong nhưng watermark fail) */}
+        {status === "done" && error && (
+          <p className="line-clamp-2 text-xs text-amber-300/80">
+            <span className="material-symbols-rounded mr-1 align-middle text-sm text-amber-400">
+              warning
+            </span>
+            {error}
+          </p>
         )}
 
         {/* Error */}

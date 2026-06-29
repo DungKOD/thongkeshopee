@@ -326,21 +326,43 @@ function DayBlockImpl({
   // Sort rows theo Lợi nhuận giảm dần (cao → thấp). Profit phụ thuộc fees
   // (tax/reserve) nên phải compute FE-side, Rust sort fallback theo tên
   // (query.rs) — ở đây override.
-  const { sortedRows, totalGain, totalLoss, gainCount, lossCount } = useMemo(() => {
+  const {
+    sortedRows,
+    totalGain,
+    totalLoss,
+    gainCount,
+    lossCount,
+    gainSpend,
+    lossSpend,
+  } = useMemo(() => {
     const computed = day.rows.map((r) => {
       const shopee = sumFiltered(r.shopeeClicksByReferrer, settings.clickSources);
-      return { row: r, profit: computeUiRow(r, settings.profitFees, shopee).profit };
+      return {
+        row: r,
+        profit: computeUiRow(r, settings.profitFees, shopee).profit,
+        spend: r.totalSpend ?? 0,
+      };
     });
     computed.sort((a, b) => b.profit - a.profit);
     let gain = 0;
     let loss = 0;
     let gainCount = 0;
     let lossCount = 0;
-    for (const { profit } of computed) {
-      if (profit > 0) { gain += profit; gainCount++; }
-      else if (profit < 0) { loss += profit; lossCount++; }
+    let gainSpend = 0;
+    let lossSpend = 0;
+    for (const { profit, spend } of computed) {
+      if (profit > 0) { gain += profit; gainCount++; gainSpend += spend; }
+      else if (profit < 0) { loss += profit; lossCount++; lossSpend += spend; }
     }
-    return { sortedRows: computed.map((c) => c.row), totalGain: gain, totalLoss: loss, gainCount, lossCount };
+    return {
+      sortedRows: computed.map((c) => c.row),
+      totalGain: gain,
+      totalLoss: loss,
+      gainCount,
+      lossCount,
+      gainSpend,
+      lossSpend,
+    };
   }, [day.rows, settings.clickSources, settings.profitFees]);
   const totalsProfitCls =
     totals.profit > 0
@@ -486,25 +508,32 @@ function DayBlockImpl({
                   </span>
                   {fmtVnd(net)}
                 </div>
-                {/* Dòng dưới: chip lãi + chip lỗ kèm số sản phẩm */}
+                {/* Dòng dưới: chip lãi + chip lỗ kèm số sản phẩm + tổng spend.
+                    `chi {spend}` = tổng tiền ads đã tiêu cho nhóm camp lãi /
+                    camp lỗ — biết nhanh "đang đốt bao nhiêu vào nhóm lỗ" và
+                    "đầu tư bao nhiêu cho nhóm lãi". */}
                 <div className="flex items-center gap-1.5">
                   {totalGain > 0 && (
                     <div
                       className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2.5 py-0.5 text-xs font-semibold tabular-nums text-green-400"
-                      title={`${gainCount} sản phẩm có lãi / ${day.rows.length} sản phẩm`}
+                      title={`${gainCount} sản phẩm có lãi / ${day.rows.length} sản phẩm\nTổng chi cho nhóm lãi: ${fmtVnd(gainSpend)}`}
                     >
                       <span className="material-symbols-rounded text-xs">trending_up</span>
                       {fmtVnd(totalGain)}
+                      {/* Spend = tiền ads (FB) → màu blue Facebook giúp tách
+                          visually khỏi profit (green/red) trong cùng 1 chip. */}
+                      <span className="text-blue-400">· chi {fmtVnd(gainSpend)}</span>
                       <span className="text-green-400/60">· {gainCount}/{day.rows.length}</span>
                     </div>
                   )}
                   {totalLoss < 0 && (
                     <div
                       className="inline-flex items-center gap-1 rounded-full bg-red-500/15 px-2.5 py-0.5 text-xs font-semibold tabular-nums text-red-400"
-                      title={`${lossCount} sản phẩm lỗ / ${day.rows.length} sản phẩm`}
+                      title={`${lossCount} sản phẩm lỗ / ${day.rows.length} sản phẩm\nTổng chi cho nhóm lỗ: ${fmtVnd(lossSpend)}`}
                     >
                       <span className="material-symbols-rounded text-xs">trending_down</span>
                       {fmtVnd(totalLoss)}
+                      <span className="text-blue-400">· chi {fmtVnd(lossSpend)}</span>
                       <span className="text-red-400/60">· {lossCount}/{day.rows.length}</span>
                     </div>
                   )}

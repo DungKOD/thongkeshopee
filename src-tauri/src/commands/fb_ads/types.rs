@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Ad Account user lưu — không trả token ra UI.
+/// Ad Account user lưu — không trả token ra UI. `token_hash` là 8 hex SHA-256
+/// để UI tô màu group account cùng token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FbAdAccount {
@@ -10,6 +11,19 @@ pub struct FbAdAccount {
     pub name: String,
     pub currency: Option<String>,
     pub timezone_name: Option<String>,
+    pub token_hash: String,
+}
+
+/// User Token đã lưu — meta only, raw token fetch on-demand. UI dùng
+/// `token_hash` làm hue để phân biệt nhiều token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FbAdsAuthToken {
+    pub id: i64,
+    pub label: String,
+    pub token_hash: String,
+    pub added_at_ms: i64,
+    pub expired: bool,
 }
 
 /// Ad Account kèm token — dùng khi validate token mới hoặc save.

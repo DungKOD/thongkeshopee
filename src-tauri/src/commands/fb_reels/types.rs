@@ -2,12 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Page hiển thị cho UI — không có access_token vì UI không cần.
+/// Page hiển thị cho UI — không có access_token vì UI không cần. Kèm flag
+/// `token_expired` để UI hiện badge "Token hết hạn" + chặn upload.
+///
+/// `token_hash` là 8 ký tự hex đầu của SHA-256(access_token) — UI dùng để tô
+/// màu các page chia sẻ cùng 1 token (vd cùng được fetch từ 1 User Token).
+/// Không leak token thật: hash 32-bit không reversible cho chuỗi 200 ký tự.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FbPage {
     pub page_id: String,
     pub name: String,
+    pub token_expired: bool,
+    pub token_hash: String,
 }
 
 /// Page kèm access_token — chỉ dùng khi save sau khi validate token,
@@ -18,6 +25,18 @@ pub struct FbPageWithToken {
     pub page_id: String,
     pub name: String,
     pub access_token: String,
+}
+
+/// User Token đã lưu — meta only, không expose raw token. UI dùng `token_hash`
+/// (8 hex) làm hue cho màu phân biệt. Mỗi auth token quản N Pages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FbAuthToken {
+    pub id: i64,
+    pub label: String,
+    pub token_hash: String,
+    pub added_at_ms: i64,
+    pub expired: bool,
 }
 
 /// 1 record trong bảng `fb_reel_posts`.

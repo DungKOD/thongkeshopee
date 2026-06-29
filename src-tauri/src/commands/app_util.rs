@@ -3,9 +3,22 @@
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::db::{resolve_active_db_path, resolve_active_imports_dir, DbState};
+use crate::db::workspace as ws;
+use crate::db::{
+    app_data_root, resolve_active_db_path, resolve_active_imports_dir, DbState,
+};
 
 use super::{CmdError, CmdResult};
+
+/// Snapshot workspace active inline trong AppDataPaths — UI top bar dùng để
+/// hiển thị badge tên/màu mà không cần invoke riêng.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveWorkspaceInfo {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+}
 
 /// Đường dẫn data app lưu local — phục vụ UI "Copy path" cho support/debug.
 #[derive(Debug, Serialize)]
@@ -14,6 +27,7 @@ pub struct AppDataPaths {
     pub app_data_dir: String,
     pub active_db_path: String,
     pub active_imports_dir: String,
+    pub active_workspace: ActiveWorkspaceInfo,
 }
 
 /// Query đường dẫn data app cho UI. Gọi khi mở SettingsDialog.
@@ -37,10 +51,22 @@ pub fn get_app_data_paths(
         .map_err(|e| CmdError::msg(e.to_string()))?
         .to_string_lossy()
         .to_string();
+
+    let root = app_data_root(&app).map_err(|e| CmdError::msg(e.to_string()))?;
+    let registry = ws::load_registry(&root)
+        .map_err(|e| CmdError::msg(e.to_string()))?
+        .ok_or_else(|| CmdError::msg("registry chưa init"))?;
+    let active = registry.active().clone();
+
     Ok(AppDataPaths {
         app_data_dir,
         active_db_path,
         active_imports_dir,
+        active_workspace: ActiveWorkspaceInfo {
+            id: active.id,
+            name: active.name,
+            color: active.color,
+        },
     })
 }
 
@@ -87,15 +113,18 @@ pub fn clear_app_data(app: AppHandle, db: State<'_, DbState>) -> CmdResult<()> {
         .map_err(|e| CmdError::msg(e.to_string()))?;
     }
 
-    let imports_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| CmdError::msg(e.to_string()))?
-        .join(crate::db::IMPORTS_SUBDIR);
+    // Imports folder thuộc workspace đang active — `resolve_active_imports_dir`
+    // lấy parent của DB path → tự động đúng folder của workspace, không đụng
+    // imports của workspace khác.
+    let imports_dir = {
+        let conn = db.0.lock().map_err(|_| CmdError::LockPoisoned)?;
+        resolve_active_imports_dir(&conn).map_err(|e| CmdError::msg(e.to_string()))?
+    };
 
     if imports_dir.exists() {
         std::fs::remove_dir_all(&imports_dir).map_err(|e| CmdError::msg(e.to_string()))?;
     }
 
+    let _ = app; // giữ tham số để giữ ABI command — UI không phải đổi.
     Ok(())
 }

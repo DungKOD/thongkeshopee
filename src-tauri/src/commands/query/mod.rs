@@ -1114,6 +1114,106 @@ mod tests {
         assert_eq!(map[&file_empty], 0);
     }
 
+    /// Seed 1 row vào raw_fb_ads_hierarchy. Dùng cho test impressions.
+    fn seed_fb_hier(
+        conn: &Connection,
+        day_date: &str,
+        sub_ids: [&str; 5],
+        spend: f64,
+        clicks: i64,
+        impressions: i64,
+    ) {
+        let file_id = seed_imported_file(conn, "fb_hierarchy", day_date);
+        conn.execute(
+            "INSERT INTO raw_fb_ads_hierarchy
+             (campaign_name, ad_set_name, ad_name, occurrence_idx,
+              sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
+              spend, clicks, cpc, impressions, day_date, source_file_id)
+             VALUES(?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                format!("camp-{}", sub_ids.join("-")),
+                format!("adset-{}", sub_ids.join("-")),
+                format!("ad-{}", sub_ids.join("-")),
+                sub_ids[0],
+                sub_ids[1],
+                sub_ids[2],
+                sub_ids[3],
+                sub_ids[4],
+                spend,
+                clicks,
+                if clicks > 0 { spend / clicks as f64 } else { 0.0 },
+                impressions,
+                day_date,
+                file_id,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Regression: FB hierarchy phải đẩy `impressions` lên row + day_totals.
+    /// Bug trước fix: `batch_fetch_fb_hier` không SELECT impressions → row.impressions
+    /// luôn = None với data hier-only → CPM / CTR FB ở Funnel/Efficiency tính sai.
+    #[test]
+    fn fb_hierarchy_impressions_propagate_to_totals() {
+        let conn = seed_conn();
+        let date = "2026-05-20";
+        seed_day(&conn, date);
+        // Hier-only (không có raw_fb_ads cùng tuple) để loại nghi vấn dedup logic.
+        seed_fb_hier(
+            &conn,
+            date,
+            ["camp", "imp", "", "", ""],
+            500.0,
+            40,
+            12_345,
+        );
+
+        let days = list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+        assert_eq!(day.rows.len(), 1, "expected 1 row từ FB hier");
+        let row = &day.rows[0];
+        assert!(row.has_fb);
+        // Impressions phải = giá trị seed, không phải None.
+        assert_eq!(
+            row.impressions,
+            Some(12_345),
+            "row.impressions phải lấy từ raw_fb_ads_hierarchy"
+        );
+        assert_eq!(
+            day.totals.impressions, 12_345,
+            "day_totals.impressions phải cộng impressions từ hier"
+        );
+    }
+
+    /// Khi cùng tuple có cả legacy raw_fb_ads và hier: hier replace legacy
+    /// (logic tuple-level dedup), nhưng impressions của hier vẫn được giữ.
+    #[test]
+    fn fb_hierarchy_impressions_replace_legacy_for_same_tuple() {
+        let conn = seed_conn();
+        let date = "2026-05-21";
+        seed_day(&conn, date);
+        // Legacy: cùng tuple, có impressions riêng.
+        seed_fb_ad(&conn, date, ["camp", "dup", "", "", ""], 300.0, 30);
+        // Hier replace legacy cho tuple này.
+        seed_fb_hier(
+            &conn,
+            date,
+            ["camp", "dup", "", "", ""],
+            500.0,
+            40,
+            9_999,
+        );
+
+        let days = list_days_with_rows_impl(&conn, DaysFilter::default()).unwrap();
+        let day = &days[0];
+        assert_eq!(day.rows.len(), 1);
+        let row = &day.rows[0];
+        // Spend từ hier (legacy bị dedup loại).
+        assert_eq!(row.total_spend, Some(500.0));
+        assert_eq!(row.impressions, Some(9_999), "impressions phải từ hier");
+        assert_eq!(day.totals.impressions, 9_999);
+    }
+
     // ========================================================================
     // E2E với data thực từ docs/ — chạy manual: `cargo test --lib -- --ignored`.
     //

@@ -26,6 +26,23 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             db::setup(app.handle())?;
+            // FB Reels: register lock state + reset rows kẹt từ session trước +
+            // spawn background poll cho scheduled/permalink. Lỗi recovery /
+            // background không fatal — eprintln warn để debug.
+            app.manage(std::sync::Arc::new(
+                commands::fb_reels::UploadLocks::new(),
+            ));
+            {
+                let state = app.state::<db::FbReelsDbState>();
+                match commands::fb_reels::run_startup_recovery(&state) {
+                    Ok(n) if n > 0 => {
+                        eprintln!("[fb_reels] startup recovery: {n} stuck rows → failed");
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[fb_reels] startup recovery error: {e}"),
+                }
+            }
+            commands::fb_reels::spawn_background_maintenance(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -69,10 +86,19 @@ pub fn run() {
             commands::batch::revert_import,
             commands::batch::delete_import_history_entry,
             commands::batch::delete_all_reverted_history,
+            commands::shopee_product::fetch_shopee_product,
+            commands::shopee_affiliate::shopee_aff_open_login_window,
+            commands::shopee_affiliate::shopee_aff_capture_cookies,
+            commands::shopee_affiliate::shopee_aff_get_status,
+            commands::shopee_affiliate::shopee_aff_clear_cookies,
+            commands::shopee_affiliate::shopee_aff_close_login_window,
+            commands::shopee_affiliate::shopee_aff_convert_links,
             commands::video::get_video_info,
             commands::video::download_video,
             commands::video::log_video_download,
             commands::video::list_video_downloads,
+            commands::video_watermark::apply_video_watermark,
+            commands::video_watermark::clear_page_logo_cache,
             commands::app_util::restart_app,
             commands::app_util::get_app_data_paths,
             commands::app_util::clear_app_data,
@@ -83,15 +109,29 @@ pub fn run() {
             commands::fb_reels::fb_validate_token,
             commands::fb_reels::fb_save_pages,
             commands::fb_reels::fb_list_pages,
+            commands::fb_reels::fb_get_page_token,
             commands::fb_reels::fb_delete_page,
+            commands::fb_reels::fb_save_auth_token,
+            commands::fb_reels::fb_list_auth_tokens,
+            commands::fb_reels::fb_get_auth_token,
+            commands::fb_reels::fb_update_auth_token_label,
+            commands::fb_reels::fb_delete_auth_token,
             commands::fb_reels::fb_enqueue_reel,
             commands::fb_reels::fb_upload_reel,
             commands::fb_reels::fb_list_posts,
             commands::fb_reels::fb_delete_post,
+            commands::fb_reels::fb_refetch_post_status,
+            commands::fb_reels::fb_debug_video_info,
             commands::fb_ads::fb_ads_validate_token,
             commands::fb_ads::fb_ads_save_accounts,
             commands::fb_ads::fb_ads_list_accounts,
             commands::fb_ads::fb_ads_delete_account,
+            commands::fb_ads::fb_ads_get_account_token,
+            commands::fb_ads::fb_ads_save_auth_token,
+            commands::fb_ads::fb_ads_list_auth_tokens,
+            commands::fb_ads::fb_ads_get_auth_token,
+            commands::fb_ads::fb_ads_update_auth_token_label,
+            commands::fb_ads::fb_ads_delete_auth_token,
             commands::fb_ads::fb_ads_list_fb_campaigns,
             commands::fb_ads::fb_ads_save_template,
             commands::fb_ads::fb_ads_list_templates,
@@ -105,6 +145,13 @@ pub fn run() {
             commands::fb_ads::fb_ads_retry_job,
             commands::fb_ads::fb_ads_list_batches,
             commands::fb_ads::fb_ads_list_jobs,
+            commands::workspace::list_workspaces,
+            commands::workspace::get_active_workspace,
+            commands::workspace::create_workspace,
+            commands::workspace::rename_workspace,
+            commands::workspace::update_workspace_color,
+            commands::workspace::switch_workspace,
+            commands::workspace::delete_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

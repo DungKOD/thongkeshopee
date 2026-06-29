@@ -1,7 +1,6 @@
 //! Separate SQLite DB cho video download logs.
 //! Lưu local-only ở `{app_data}/video_logs.db`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -26,20 +25,9 @@ CREATE INDEX IF NOT EXISTS idx_video_downloads_time
 /// Tauri managed state cho video DB connection.
 pub struct VideoDbState(pub Mutex<Connection>);
 
-fn app_data_root(app: &AppHandle) -> Result<PathBuf> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .context("không lấy được app_data_dir")?;
-    fs::create_dir_all(&base).with_context(|| {
-        format!("không tạo được thư mục app_data_dir: {}", base.display())
-    })?;
-    Ok(base)
-}
-
-/// DB path cho video logs ở root app_data.
-pub fn resolve_video_db_path(app: &AppHandle) -> Result<PathBuf> {
-    Ok(app_data_root(app)?.join(DB_FILENAME))
+/// DB path cho video logs trong workspace folder.
+pub fn resolve_video_db_path_in(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(DB_FILENAME)
 }
 
 /// Mở hoặc tạo video DB tại `path`, apply PRAGMA + schema.
@@ -60,9 +48,23 @@ pub fn init_video_db_at(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Setup hook — init DB + manage state.
-pub fn setup(app: &AppHandle) -> Result<()> {
-    let path = resolve_video_db_path(app)?;
+/// Mở video DB đã tồn tại — chỉ apply PRAGMA, KHÔNG re-apply schema. Cho
+/// workspace hot-swap (xem doc `crate::db::open_existing_db`).
+pub fn open_existing_video_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("không mở được video DB tại {}", path.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;",
+    )
+    .context("không apply được PRAGMA cho video DB khi open existing")?;
+    Ok(conn)
+}
+
+/// Setup hook — init DB trong workspace folder + manage state.
+pub fn setup_in(app: &AppHandle, workspace_root: &Path) -> Result<()> {
+    let path = resolve_video_db_path_in(workspace_root);
     let conn = init_video_db_at(&path)?;
     app.manage(VideoDbState(Mutex::new(conn)));
     Ok(())

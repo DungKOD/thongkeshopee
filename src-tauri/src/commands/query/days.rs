@@ -341,6 +341,7 @@ struct RawFbHier {
     occurrence_idx: i64,
     spend_cents: i64,
     clicks: Option<i64>,
+    impressions: Option<i64>,
     weighted_cpc_sum: f64,
 }
 
@@ -524,6 +525,9 @@ fn process_day_data(
             entry.spend_cents += r.spend_cents;
             if let Some(c) = r.clicks {
                 entry.clicks = Some(entry.clicks.unwrap_or(0) + c);
+            }
+            if let Some(i) = r.impressions {
+                entry.imps = Some(entry.imps.unwrap_or(0) + i);
             }
             if r.weighted_cpc_sum > 0.0 {
                 entry.weighted_cpc_sum =
@@ -739,6 +743,13 @@ fn process_day_data(
     let entries: Vec<(Key, Accumulator)> = map.into_iter().collect();
     let mut rows: Vec<UiRow> = Vec::with_capacity(entries.len());
     let mut day_totals = crate::db::types::UiDayTotals::default();
+    // Accumulate cents qua i64 → tránh tích lũy float lệch (~1 cent/ngày khi
+    // sum nhiều f64 đã chia /100). Chia /100 đúng 1 lần ở cuối loop.
+    let mut day_spend_cents: i64 = 0;
+    let mut day_commission_cents: i64 = 0;
+    let mut day_commission_pending_cents: i64 = 0;
+    let mut day_order_value_cents: i64 = 0;
+    let mut day_mcn_fee_cents: i64 = 0;
     for ((c, account_id), acc) in entries {
         let total_spend = acc.spend_cents.map(|c| c as f64 / 100.0);
         let commission_total = acc.commission_cents as f64 / 100.0;
@@ -754,21 +765,26 @@ fn process_day_data(
         });
 
         day_totals.ads_clicks += acc.ads_clicks.unwrap_or(0);
-        day_totals.total_spend += total_spend.unwrap_or(0.0);
+        day_spend_cents += acc.spend_cents.unwrap_or(0);
         day_totals.impressions += acc.impressions.unwrap_or(0);
         day_totals.shopee_clicks_total += acc.shopee_clicks_total;
         for (referrer, count) in &acc.shopee_clicks_by_referrer {
             *day_totals.shopee_clicks_by_referrer.entry(referrer.clone()).or_insert(0) += count;
         }
         day_totals.orders_count += acc.orders_count;
-        day_totals.commission_total += commission_total;
-        day_totals.commission_pending += commission_pending;
-        day_totals.order_value_total += acc.order_value_cents as f64 / 100.0;
-        day_totals.mcn_fee_total += acc.mcn_fee_cents as f64 / 100.0;
+        day_commission_cents += acc.commission_cents;
+        day_commission_pending_cents += acc.commission_pending_cents;
+        day_order_value_cents += acc.order_value_cents;
+        day_mcn_fee_cents += acc.mcn_fee_cents;
 
+        // Giữ row nếu có spend, commission, HOẶC shopee_clicks. Trước đây drop
+        // khi !spend && !commission → tuple click-only (tracked click không
+        // convert) mất khỏi UI + Overview shopee_only aggregation. Giờ giữ lại
+        // để user thấy "X click không có đơn" và FE source=shopee_only đếm đúng.
         let has_spend = acc.spend_cents.map(|v| v != 0).unwrap_or(false);
         let has_commission = acc.commission_cents != 0;
-        if !has_spend && !has_commission {
+        let has_shopee_clicks_data = acc.shopee_clicks_total > 0;
+        if !has_spend && !has_commission && !has_shopee_clicks_data {
             continue;
         }
 
@@ -803,6 +819,11 @@ fn process_day_data(
             fb_breakdown,
         });
     }
+    day_totals.total_spend = day_spend_cents as f64 / 100.0;
+    day_totals.commission_total = day_commission_cents as f64 / 100.0;
+    day_totals.commission_pending = day_commission_pending_cents as f64 / 100.0;
+    day_totals.order_value_total = day_order_value_cents as f64 / 100.0;
+    day_totals.mcn_fee_total = day_mcn_fee_cents as f64 / 100.0;
 
     rows.sort_by(|a, b| {
         a.display_name
@@ -880,6 +901,7 @@ fn batch_fetch_fb_hier(
                 campaign_name, ad_set_name, ad_name, occurrence_idx,
                 CAST(ROUND(COALESCE(spend, 0) * (1.0 + tax_rate / 100.0) * 100) AS INTEGER),
                 clicks,
+                impressions,
                 CASE WHEN clicks IS NOT NULL AND cpc IS NOT NULL
                      THEN clicks * cpc * (1.0 + tax_rate / 100.0) ELSE 0 END
          FROM raw_fb_ads_hierarchy
@@ -899,7 +921,8 @@ fn batch_fetch_fb_hier(
                 occurrence_idx: r.get(9)?,
                 spend_cents: r.get(10)?,
                 clicks: r.get(11)?,
-                weighted_cpc_sum: r.get(12)?,
+                impressions: r.get(12)?,
+                weighted_cpc_sum: r.get(13)?,
             },
         ))
     })?;

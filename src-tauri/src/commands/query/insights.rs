@@ -348,9 +348,12 @@ pub async fn load_referrer_efficiency(
     }
 
     // Step 1: click count per (day, sub_ids, referrer)
+    // Dùng '(khác)' cho NULL/empty referrer để khớp với label ở `list_days_with_rows`
+    // (raw clicks_by_referrer) và `list_click_referrers` (dropdown settings).
+    // Nếu lệch, user toggle off "(khác)" trong settings không sync được với bảng này.
     let clicks_sql = format!(
         "SELECT day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5,
-                COALESCE(referrer, '') as referrer, COUNT(*) as clicks
+                COALESCE(NULLIF(referrer, ''), '(khác)') as referrer, COUNT(*) as clicks
          FROM raw_shopee_clicks
          {where_clicks}
          GROUP BY day_date, sub_id1, sub_id2, sub_id3, sub_id4, sub_id5, referrer"

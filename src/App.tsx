@@ -39,6 +39,16 @@ const CampaignBatchPage = lazy(() =>
     default: m.CampaignBatchPage,
   })),
 );
+const ShopeeProductPage = lazy(() =>
+  import("./components/ShopeeProductPage").then((m) => ({
+    default: m.ShopeeProductPage,
+  })),
+);
+const ShopeeAffiliatePage = lazy(() =>
+  import("./components/ShopeeAffiliatePage").then((m) => ({
+    default: m.ShopeeAffiliatePage,
+  })),
+);
 const SmartCalculator = lazy(() =>
   import("./components/SmartCalculator").then((m) => ({
     default: m.SmartCalculator,
@@ -47,7 +57,6 @@ const SmartCalculator = lazy(() =>
 import {
   makeFilterKey,
   useDbStats,
-  todayIso,
   type DaysFilter,
 } from "./hooks/useDbStats";
 import {
@@ -75,6 +84,7 @@ import {
   prefetchFontEmbedCSS,
 } from "./lib/screenshot";
 import { UpdatesDropdown } from "./components/UpdatesDropdown";
+import { WorkspaceBadge } from "./components/WorkspaceBadge";
 import { LoginScreen } from "./components/LoginScreen";
 import { SessionKickedDialog } from "./components/SessionKickedDialog";
 import { PremiumLockedScreen } from "./components/PremiumLockedScreen";
@@ -94,7 +104,14 @@ function LazyTabFallback() {
   );
 }
 
-type AppTab = "stats" | "overview" | "download" | "upload" | "bulkcamp";
+type AppTab =
+  | "stats"
+  | "overview"
+  | "download"
+  | "upload"
+  | "bulkcamp"
+  | "shopee"
+  | "smartlink";
 
 function AppInner() {
   const { signOut: authSignOut } = useAuth();
@@ -127,6 +144,8 @@ function AppInner() {
       activeTab === "download" ||
       activeTab === "upload" ||
       activeTab === "bulkcamp" ||
+      activeTab === "shopee" ||
+      activeTab === "smartlink" ||
       activeTab === "overview"
     ) {
       setMountedLazyTabs((prev) => {
@@ -149,6 +168,8 @@ function AppInner() {
       void import("./components/DownloadVideoPage");
       void import("./components/UploadVideoPage");
       void import("./components/CampaignBatchPage");
+      void import("./components/ShopeeProductPage");
+      void import("./components/ShopeeAffiliatePage");
       void import("./components/SmartCalculator");
     });
     return () => {
@@ -327,6 +348,8 @@ function AppInner() {
     registerSources,
     setProfitFee,
     setSubIdMatchMode,
+    setVideoWatermark,
+    setVideoWatermarkAntiTheft,
     hydrated: settingsHydrated,
   } = useSettings();
 
@@ -638,6 +661,7 @@ function AppInner() {
                 <span className="rounded-md bg-white/15 px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums text-white/90">
                   v{__APP_VERSION__}
                 </span>
+                <WorkspaceBadge />
               </div>
               <p className="text-xs text-white/70">
                 Data từ database — manual override luôn ưu tiên raw CSV
@@ -776,9 +800,25 @@ function AppInner() {
             </Suspense>
           </div>
         )}
+        {mountedLazyTabs.has("shopee") && (
+          <div className={activeTab === "shopee" ? "" : "hidden"}>
+            <Suspense fallback={<LazyTabFallback />}>
+              <ShopeeProductPage />
+            </Suspense>
+          </div>
+        )}
+        {mountedLazyTabs.has("smartlink") && (
+          <div className={activeTab === "smartlink" ? "" : "hidden"}>
+            <Suspense fallback={<LazyTabFallback />}>
+              <ShopeeAffiliatePage />
+            </Suspense>
+          </div>
+        )}
         {activeTab === "download" ||
         activeTab === "upload" ||
-        activeTab === "bulkcamp" ? (
+        activeTab === "bulkcamp" ||
+        activeTab === "shopee" ||
+        activeTab === "smartlink" ? (
           // Lazy chunk đang tải lần đầu → fallback nằm trong Suspense ở trên.
           // Block stats/overview rendering hoàn toàn trong khi xem lazy tabs.
           null
@@ -850,20 +890,24 @@ function AppInner() {
             </div>
             <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
               <button
-                onClick={() => setEntryDialog({ date: todayIso() })}
-                className="btn-ripple flex items-center gap-2 rounded-lg bg-shopee-500 px-5 py-2.5 text-sm font-medium text-white shadow-elev-2 hover:bg-shopee-600 hover:shadow-elev-4"
+                onClick={() => setFbHierarchyOpen(true)}
+                className="btn-ripple flex items-center gap-2 rounded-lg border border-violet-500/60 px-5 py-2.5 text-sm font-medium text-violet-300 hover:bg-violet-500/10 active:bg-violet-500/20"
+                title="Import FB Ads — CSV hoặc Excel (.xlsx). Format 3 cấp: chiến dịch → nhóm → quảng cáo."
               >
-                <span className="material-symbols-rounded text-base">add</span>
-                Thêm dòng đầu tiên
+                <span className="material-symbols-rounded text-base">
+                  campaign
+                </span>
+                Import FB
               </button>
               <button
                 onClick={handleImportClick}
-                className="btn-ripple flex items-center gap-2 rounded-lg border border-surface-8 bg-surface-4 px-5 py-2.5 text-sm font-medium text-white/90 hover:bg-surface-6"
+                className="btn-ripple flex items-center gap-2 rounded-lg border border-white/50 px-5 py-2.5 text-sm font-medium text-white hover:bg-white/10 active:bg-white/20"
+                title="Import Shopee — CSV click hoặc hoa hồng"
               >
                 <span className="material-symbols-rounded text-base">
                   upload_file
                 </span>
-                Import CSV
+                Import Shopee
               </button>
             </div>
           </div>
@@ -1118,6 +1162,8 @@ function AppInner() {
           setSubIdMatchMode(mode);
           void refetch();
         }}
+        onSetVideoWatermark={setVideoWatermark}
+        onSetVideoWatermarkAntiTheft={setVideoWatermarkAntiTheft}
         onClose={() => setSettingsOpen(false)}
         onImportReverted={() => {
           void refetch();

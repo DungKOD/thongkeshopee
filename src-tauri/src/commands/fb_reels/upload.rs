@@ -18,13 +18,37 @@ use super::types::UploadProgress;
 const CHUNK_SIZE: usize = 64 * 1024;
 const EMIT_EVERY_BYTES: u64 = 512 * 1024;
 
+/// Map extension → MIME type. FB Reels transcoder cần biết chính xác kind file
+/// đang upload, nếu chỉ gửi `application/octet-stream` thì pipeline xử lý chậm
+/// hoặc reject silently. Default `video/mp4` cho extension không biết — đa số
+/// container Reels là mp4 nên fallback hợp lý.
+fn mime_for_path(file_name: &str) -> &'static str {
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        _ => "video/mp4",
+    }
+}
+
 /// Stream toàn bộ file lên `upload_url` với header FB Reels yêu cầu.
 /// Emit `fb_upload_progress` events trong khi upload.
+///
+/// `file_name` truyền vào `X-Entity-Name` header — FB không dùng tên này để
+/// store nhưng dùng cho debug log + content-disposition. Truyền tên thật của
+/// file local thay vì hardcode "video.mp4" cho debugging dễ hơn.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_upload_file(
     client: &Client,
     upload_url: &str,
     page_token: &str,
     file_path: &str,
+    file_name: &str,
     file_size: u64,
     app: AppHandle,
     post_id: i64,
@@ -83,6 +107,12 @@ pub async fn stream_upload_file(
     // Cách fix: set explicit Content-Length cho stream (reqwest sẽ bỏ
     // chunked encoding khi có Content-Length) + thêm X-Entity-Length cho
     // FB protocol.
+    //
+    // X-Entity-Type/Content-Type dùng MIME thực sự của video (video/mp4,
+    // video/quicktime) thay vì application/octet-stream — FB cần kind file
+    // đúng để route đúng transcoder, octet-stream làm pipeline xử lý chậm
+    // hoặc DRAFT silently.
+    let mime = mime_for_path(file_name);
     let body = reqwest::Body::wrap_stream(stream);
     let resp = client
         .post(upload_url)
@@ -90,9 +120,9 @@ pub async fn stream_upload_file(
         .header("offset", "0")
         .header("file_size", file_size.to_string())
         .header("X-Entity-Length", file_size.to_string())
-        .header("X-Entity-Name", "video.mp4")
-        .header("X-Entity-Type", "application/octet-stream")
-        .header("Content-Type", "application/octet-stream")
+        .header("X-Entity-Name", file_name)
+        .header("X-Entity-Type", mime)
+        .header("Content-Type", mime)
         .header(reqwest::header::CONTENT_LENGTH, file_size)
         .body(body)
         .send()
@@ -101,8 +131,27 @@ pub async fn stream_upload_file(
 
     let status = resp.status();
     let txt = resp.text().await.unwrap_or_default();
+    eprintln!(
+        "[fb_reels] upload binary post={post_id} size={file_size} mime={mime} status={status} body={txt}"
+    );
     if !status.is_success() {
         anyhow::bail!("FB upload trả lỗi {}: {}", status, txt);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mime_detection() {
+        assert_eq!(mime_for_path("clip.mp4"), "video/mp4");
+        assert_eq!(mime_for_path("CLIP.MP4"), "video/mp4");
+        assert_eq!(mime_for_path("clip.mov"), "video/quicktime");
+        assert_eq!(mime_for_path("clip.MOV"), "video/quicktime");
+        assert_eq!(mime_for_path("clip.webm"), "video/webm");
+        assert_eq!(mime_for_path("noext"), "video/mp4");
+        assert_eq!(mime_for_path("weird.xyz"), "video/mp4");
+    }
 }

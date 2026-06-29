@@ -14,7 +14,11 @@
 
 pub mod commands;
 mod graph_api;
+pub mod maintenance;
 mod types;
 mod upload;
 
 pub use commands::*;
+pub use maintenance::{
+    run_startup_recovery, spawn_background_maintenance, UploadLocks,
+};
