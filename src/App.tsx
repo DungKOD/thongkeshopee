@@ -18,6 +18,7 @@ import { OverviewTab, clearOverviewInsightsCache } from "./components/OverviewTa
 import { SubIdTimelineBlock } from "./components/SubIdTimelineBlock";
 import { ManualEntryDialog } from "./components/ManualEntryDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { TokenManagerDialog } from "./components/TokenManagerDialog";
 import { RulesDialog } from "./components/RulesDialog";
 import { PendingChangesBar } from "./components/PendingChangesBar";
 import { ImportPreviewDialog } from "./components/ImportPreviewDialog";
@@ -363,6 +364,7 @@ function AppInner() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [accountMgrOpen, setAccountMgrOpen] = useState(false);
+  const [tokenManagerOpen, setTokenManagerOpen] = useState(false);
   const [calcOpen, setCalcOpen] = useState<boolean>(() => {
     try {
       return JSON.parse(localStorage.getItem("smartcalc:open") ?? "false");
@@ -703,6 +705,14 @@ function AppInner() {
               aria-label="Quản lý TK Shopee"
             >
               <span className="material-symbols-rounded">manage_accounts</span>
+            </button>
+            <button
+              onClick={() => setTokenManagerOpen(true)}
+              className="btn-ripple flex h-10 w-10 items-center justify-center rounded-full text-white hover:bg-white/10 active:bg-white/20"
+              title="Token Manager — quản lý token FB Pages / Ad Accounts / Shopee"
+              aria-label="Token Manager"
+            >
+              <span className="material-symbols-rounded">key</span>
             </button>
             <button
               onClick={() => setSettingsOpen(true)}
@@ -1171,6 +1181,11 @@ function AppInner() {
       />
 
       <RulesDialog isOpen={rulesOpen} onClose={() => setRulesOpen(false)} />
+
+      <TokenManagerDialog
+        isOpen={tokenManagerOpen}
+        onClose={() => setTokenManagerOpen(false)}
+      />
 
       {entryDialog && (
         <ManualEntryDialog

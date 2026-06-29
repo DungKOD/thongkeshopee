@@ -21,6 +21,7 @@ pub mod query;
 pub mod screenshot;
 pub mod shopee_affiliate;
 pub mod shopee_product;
+pub mod token_manager;
 pub mod video;
 pub mod video_watermark;
 pub mod workspace;

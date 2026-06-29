@@ -99,6 +99,8 @@ pub fn run() {
             commands::video::list_video_downloads,
             commands::video_watermark::apply_video_watermark,
             commands::video_watermark::clear_page_logo_cache,
+            commands::token_manager::token_list_fb_user_tokens,
+            commands::token_manager::token_summary,
             commands::app_util::restart_app,
             commands::app_util::get_app_data_paths,
             commands::app_util::clear_app_data,
