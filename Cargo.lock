@@ -4411,7 +4411,7 @@ dependencies = [
 
 [[package]]
 name = "thongkeshopee"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

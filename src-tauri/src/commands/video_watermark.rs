@@ -774,9 +774,19 @@ a='alpha(X,Y)*clip(min(W,H)/2-hypot(X-W/2,Y-H/2)+0.5,0,1)',\
             cmd.arg(*arg);
         }
 
+        // CRF 17 + preset medium = "visually lossless" / transparent
+        //   threshold của H.264. Mắt thường KHÔNG phân biệt được output với
+        //   source. File size ~1.5-2x source, encode time ~2-3x veryfast.
+        // CRF 17 thay vì 18 (giới hạn lý thuyết) để dư biên cho overlay edge
+        //   không tạo block artifact ở vùng tròn alpha.
+        // preset medium thay vì veryfast: cho phép x264 search motion
+        //   vectors kỹ hơn → cùng CRF, file nhỏ hơn ~15% và artifact ít hơn.
+        // -tune film: tối ưu psychovisual cho real-world content (video TikTok
+        //   chủ yếu là footage thật, không phải animation).
         cmd.args(["-c:v", "libx264"])
-            .args(["-preset", "veryfast"])
-            .args(["-crf", "23"])
+            .args(["-preset", "medium"])
+            .args(["-crf", "17"])
+            .args(["-tune", "film"])
             .args(["-pix_fmt", "yuv420p"])
             // -profile:v high -level 4.0: tương thích rộng (Reels/IG/TikTok
             //   đều OK). Tránh main10/high10 cần 10-bit decoder không phổ
