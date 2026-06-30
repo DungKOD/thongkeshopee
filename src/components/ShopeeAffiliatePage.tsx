@@ -5,6 +5,7 @@ import {
   shopeeAffClearCookies,
   shopeeAffCloseLoginWindow,
   shopeeAffConvertLinks,
+  shopeeAffConvertViaWebview,
   shopeeAffGetStatus,
   shopeeAffOpenLoginWindow,
   type LinkResult,
@@ -160,6 +161,38 @@ export function ShopeeAffiliatePage() {
     }
   }, [linksText, subIds, status.hasCookies, showToast]);
 
+  /// LV1 SAFEST: convert qua webview thật. Yêu cầu login window đang mở.
+  /// Auto open nếu chưa mở để tiện UX.
+  const handleConvertViaWebview = useCallback(async () => {
+    const links = parseShopeeUrls(linksText);
+    if (links.length === 0) {
+      showToast({ message: "Chưa có link Shopee nào", duration: 3000 });
+      return;
+    }
+    if (!status.loginWindowOpen) {
+      showToast({
+        message:
+          "Cửa sổ login chưa mở. Bấm 'Đăng nhập' để mở webview, login xong rồi thử lại.",
+        duration: 6000,
+      });
+      return;
+    }
+    setConverting(true);
+    try {
+      const out = await shopeeAffConvertViaWebview(links, subIds);
+      setResults(out);
+      const okCount = out.filter((r) => !!r.shortLink).length;
+      showToast({
+        message: `[WebView LV1] Tạo ${okCount}/${out.length} smart link`,
+        duration: 3000,
+      });
+    } catch (e) {
+      showToast({ message: String(e), duration: 7000 });
+    } finally {
+      setConverting(false);
+    }
+  }, [linksText, subIds, status.loginWindowOpen, showToast]);
+
   const copyToClipboard = useCallback(
     async (text: string, label: string) => {
       if (!text) return;
@@ -218,6 +251,65 @@ export function ShopeeAffiliatePage() {
         </div>
       </section>
 
+      {/* ===== Workflow guide khi WebView2 trắng / treo ===== */}
+      <details className="overflow-hidden rounded-2xl border border-amber-500/40 bg-amber-950/20">
+        <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-amber-200 hover:bg-amber-500/10">
+          <span className="material-symbols-rounded mr-2 align-middle text-base">
+            help
+          </span>
+          Webview Tauri bị trắng/treo? Bấm để xem cách dùng Chrome thật
+        </summary>
+        <div className="space-y-3 border-t border-amber-500/30 px-4 py-3 text-xs text-amber-100/90">
+          <p>
+            WebView2 trên 1 số máy bị Shopee anti-fraud block khiến trang trắng.
+            Workflow thay thế <b>an toàn hơn nữa</b> dùng Chrome thật:
+          </p>
+          <ol className="ml-5 list-decimal space-y-1.5">
+            <li>
+              Bấm nút{" "}
+              <span className="font-mono text-amber-300">
+                "Mở Shopee trong Chrome"
+              </span>{" "}
+              ở dưới → Chrome mặc định mở affiliate dashboard
+            </li>
+            <li>Login Shopee Affiliate trong Chrome bằng tay</li>
+            <li>
+              Cài extension{" "}
+              <span className="font-mono">Cookie-Editor</span> hoặc{" "}
+              <span className="font-mono">EditThisCookie</span> trên Chrome
+            </li>
+            <li>
+              Mở extension trong tab affiliate.shopee.vn → Export → chọn{" "}
+              <b>JSON</b>
+            </li>
+            <li>
+              Quan trọng: trong DevTools (F12) → tab <b>Network</b> → submit
+              convert link 1 cái bằng tay → click request{" "}
+              <span className="font-mono">batchCustomLink</span> → tab Headers →
+              copy giá trị header{" "}
+              <span className="font-mono text-amber-300">
+                af-ac-enc-sz-token
+              </span>
+            </li>
+            <li>
+              Chuyển sang tab <b>Other</b> → chọn tool{" "}
+              <b>"Convert AFF (dán cookies)"</b>
+            </li>
+            <li>
+              Paste cookies JSON + anti-fraud token + link cần convert → Convert
+            </li>
+          </ol>
+          <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-amber-200">
+            <span className="material-symbols-rounded mr-1 align-middle text-sm">
+              shield
+            </span>
+            Cookies + token được capture từ <b>session Chrome thật của bạn</b> →
+            khi convert qua app, Shopee thấy mọi anti-fraud signal match → tỉ lệ
+            pass cao hơn nhiều so với Tauri webview hỏng.
+          </p>
+        </div>
+      </details>
+
       {/* ===== Login / cookies status ===== */}
       <section className="space-y-3 rounded-2xl border border-surface-8 bg-surface-2 p-4 shadow-elev-2">
         <div className="flex flex-wrap items-center gap-2">
@@ -253,17 +345,32 @@ export function ShopeeAffiliatePage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {/* NÚT MỚI — fallback Chrome external khi WebView2 lỗi trắng */}
+          <button
+            type="button"
+            onClick={() =>
+              void openUrl("https://affiliate.shopee.vn/offer/custom_link")
+            }
+            className="btn-ripple flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-600"
+            title="Mở Shopee trong Chrome mặc định — bypass WebView2 nếu bị trắng"
+          >
+            <span className="material-symbols-rounded text-sm">
+              language
+            </span>
+            Mở Shopee trong Chrome
+          </button>
           <button
             type="button"
             onClick={() => void handleOpenLogin()}
             className="btn-ripple flex items-center gap-1.5 rounded-lg bg-purple-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-purple-600"
+            title="Dùng webview Tauri (có thể trắng trên 1 số máy)"
           >
             <span className="material-symbols-rounded text-sm">
               open_in_browser
             </span>
             {status.loginWindowOpen
               ? "Focus cửa sổ login"
-              : "Mở cửa sổ Shopee Affiliate"}
+              : "Mở webview (Tauri)"}
           </button>
           <button
             type="button"
@@ -377,6 +484,28 @@ export function ShopeeAffiliatePage() {
             Xóa
           </button>
           <div className="flex-1" />
+          {/* Nút LV1 — convert qua webview thật (an toàn nhất, yêu cầu login window đang mở) */}
+          <button
+            type="button"
+            onClick={() => void handleConvertViaWebview()}
+            disabled={linkCount === 0 || converting || !status.loginWindowOpen}
+            className="btn-ripple flex items-center gap-2 rounded-xl border border-emerald-500/50 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-200 shadow-elev-1 transition-all hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+            title={
+              !status.loginWindowOpen
+                ? "Bấm 'Đăng nhập' để mở cửa sổ login trước"
+                : "Convert qua webview thật — an toàn nhất, Shopee không phát hiện được"
+            }
+          >
+            <span
+              className={`material-symbols-rounded text-base ${converting ? "animate-spin" : ""}`}
+            >
+              {converting ? "sync" : "shield"}
+            </span>
+            {converting ? "Đang tạo..." : "Tạo qua WebView"}
+            <span className="rounded-full bg-emerald-500/20 px-1.5 py-0 text-[10px] font-bold uppercase tracking-wider">
+              LV1
+            </span>
+          </button>
           <button
             type="button"
             onClick={() => void handleConvert()}
@@ -385,7 +514,7 @@ export function ShopeeAffiliatePage() {
             title={
               !status.hasCookies
                 ? "Đăng nhập + lưu cookies trước"
-                : "Tạo smart link"
+                : "Tạo smart link bằng cookies đã capture (LV2)"
             }
           >
             <span

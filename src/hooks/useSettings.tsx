@@ -42,11 +42,24 @@ export interface VideoWatermarkSettings {
   antiTheft: boolean;
 }
 
+/// AI content settings cho tab Sản phẩm Shopee. Khi bật, mỗi lần fetch SP
+/// thành công sẽ tự động gọi OpenAI để sinh content FB ads. API key lưu
+/// SQLite plaintext (consistent với pattern lưu token hiện có); user nên dùng
+/// key có quyền hạn hẹp + cap chi tiêu trong dashboard OpenAI.
+export interface AiContentSettings {
+  enabled: boolean;
+  apiKey: string;
+  /// Model OpenAI dùng cho chat/completions. Default `gpt-4o-mini`. Hỗ trợ
+  /// model arbitrary (gpt-4o, gpt-4.1, ...) để user tự đổi qua input custom.
+  model: string;
+}
+
 export interface Settings {
   clickSources: Record<string, boolean>;
   profitFees: ProfitFees;
   subIdMatchMode: SubIdMatchMode;
   videoWatermark: VideoWatermarkSettings;
+  aiContent: AiContentSettings;
 }
 
 const DEFAULT_PROFIT_FEES: ProfitFees = {
@@ -60,11 +73,17 @@ const DEFAULT_VIDEO_WATERMARK: VideoWatermarkSettings = {
   // Default ON — bảo vệ video khỏi bị trộm crop logo cố định góc.
   antiTheft: true,
 };
+const DEFAULT_AI_CONTENT: AiContentSettings = {
+  enabled: false,
+  apiKey: "",
+  model: "gpt-4o-mini",
+};
 const DEFAULT_SETTINGS: Settings = {
   clickSources: {},
   profitFees: DEFAULT_PROFIT_FEES,
   subIdMatchMode: "exact",
   videoWatermark: DEFAULT_VIDEO_WATERMARK,
+  aiContent: DEFAULT_AI_CONTENT,
 };
 
 const KEY_PROFIT_FEE_TAX = "profit_fee.tax_and_platform_rate";
@@ -74,6 +93,9 @@ const KEY_WATERMARK_SIZE = "video_watermark.size_pct";
 const KEY_WATERMARK_OPACITY = "video_watermark.opacity";
 const KEY_WATERMARK_PADDING = "video_watermark.padding_pct";
 const KEY_WATERMARK_ANTI_THEFT = "video_watermark.anti_theft";
+const KEY_AI_ENABLED = "ai_content.enabled";
+const KEY_AI_API_KEY = "ai_content.api_key";
+const KEY_AI_MODEL = "ai_content.model";
 const CLICK_SOURCE_PREFIX = "click_source.";
 
 interface SettingEntry {
@@ -87,6 +109,7 @@ function entriesToSettings(entries: SettingEntry[]): Settings {
     profitFees: { ...DEFAULT_PROFIT_FEES },
     subIdMatchMode: "exact",
     videoWatermark: { ...DEFAULT_VIDEO_WATERMARK },
+    aiContent: { ...DEFAULT_AI_CONTENT },
   };
   for (const { key, value } of entries) {
     let parsed: unknown;
@@ -123,6 +146,14 @@ function entriesToSettings(entries: SettingEntry[]): Settings {
       if (typeof parsed === "boolean") {
         s.videoWatermark.antiTheft = parsed;
       }
+    } else if (key === KEY_AI_ENABLED) {
+      if (typeof parsed === "boolean") s.aiContent.enabled = parsed;
+    } else if (key === KEY_AI_API_KEY) {
+      if (typeof parsed === "string") s.aiContent.apiKey = parsed;
+    } else if (key === KEY_AI_MODEL) {
+      if (typeof parsed === "string" && parsed.trim()) {
+        s.aiContent.model = parsed.trim();
+      }
     } else if (key.startsWith(CLICK_SOURCE_PREFIX)) {
       const src = key.slice(CLICK_SOURCE_PREFIX.length);
       if (src && typeof parsed === "boolean") {
@@ -142,6 +173,7 @@ interface SettingsContextValue {
   setSubIdMatchMode: (mode: SubIdMatchMode) => void;
   setVideoWatermark: (key: keyof VideoWatermarkSettings, value: number) => void;
   setVideoWatermarkAntiTheft: (enabled: boolean) => void;
+  setAiContent: (patch: Partial<AiContentSettings>) => void;
   reload: () => Promise<void>;
   hydrated: boolean;
 }
@@ -306,6 +338,27 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [persistKey],
   );
 
+  /// Patch 1 hoặc nhiều field AI cùng lúc. Persist riêng từng key đã đổi
+  /// (không bulk vì các field độc lập và user thường chỉ đổi 1 lúc).
+  const setAiContent = useCallback(
+    (patch: Partial<AiContentSettings>) => {
+      setSettings((prev) => {
+        const next = { ...prev.aiContent, ...patch };
+        if (patch.enabled !== undefined && patch.enabled !== prev.aiContent.enabled) {
+          void persistKey(KEY_AI_ENABLED, next.enabled);
+        }
+        if (patch.apiKey !== undefined && patch.apiKey !== prev.aiContent.apiKey) {
+          void persistKey(KEY_AI_API_KEY, next.apiKey);
+        }
+        if (patch.model !== undefined && patch.model !== prev.aiContent.model) {
+          void persistKey(KEY_AI_MODEL, next.model);
+        }
+        return { ...prev, aiContent: next };
+      });
+    },
+    [persistKey],
+  );
+
   // useMemo: KHÔNG tạo object literal mới mỗi render. Nếu thiếu, mọi
   // consumer useSettings() (hàng trăm VideoRow + DayBlock) sẽ re-render
   // bất cứ khi nào SettingsProvider re-render — kể cả khi data thực không
@@ -320,6 +373,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setSubIdMatchMode,
       setVideoWatermark,
       setVideoWatermarkAntiTheft,
+      setAiContent,
       reload,
       hydrated,
     }),
@@ -332,6 +386,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setSubIdMatchMode,
       setVideoWatermark,
       setVideoWatermarkAntiTheft,
+      setAiContent,
       reload,
       hydrated,
     ],

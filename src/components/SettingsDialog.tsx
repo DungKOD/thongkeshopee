@@ -1,13 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import type {
+  AiContentSettings,
   ProfitFees,
   Settings,
   SubIdMatchMode,
   VideoWatermarkSettings,
 } from "../hooks/useSettings";
+import { validateOpenAiKey } from "../lib/aiContent";
 import { ImportHistorySection } from "./ImportHistorySection";
 import { WorkspaceSection } from "./WorkspaceSection";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -44,6 +46,7 @@ interface SettingsDialogProps {
     value: number,
   ) => void;
   onSetVideoWatermarkAntiTheft: (enabled: boolean) => void;
+  onSetAiContent: (patch: Partial<AiContentSettings>) => void;
   onClose: () => void;
   /** Trigger reload lịch sử import ngoài (bump khi có import/delete). */
   importHistoryReloadKey?: number;
@@ -61,6 +64,7 @@ export function SettingsDialog({
   onSetSubIdMatchMode,
   onSetVideoWatermark,
   onSetVideoWatermarkAntiTheft,
+  onSetAiContent,
   onClose,
   importHistoryReloadKey,
   onImportReverted,
@@ -98,10 +102,12 @@ export function SettingsDialog({
   // (user thường chỉ sửa 1 trong 2). Reset về locked khi dialog đóng.
   const [feesLocked, setFeesLocked] = useState(true);
   const [sourcesLocked, setSourcesLocked] = useState(true);
+  const [aiLocked, setAiLocked] = useState(true);
   useEffect(() => {
     if (!isOpen) {
       setFeesLocked(true);
       setSourcesLocked(true);
+      setAiLocked(true);
     }
   }, [isOpen]);
 
@@ -475,6 +481,13 @@ export function SettingsDialog({
               </div>
             </div>
           </section>
+
+          <AiContentSection
+            value={settings.aiContent}
+            locked={aiLocked}
+            onToggleLock={() => setAiLocked((v) => !v)}
+            onChange={onSetAiContent}
+          />
 
           <section>
             <div className="mb-1 flex items-center justify-between gap-2">
@@ -1015,5 +1028,301 @@ function LockButton({
       </span>
       {locked ? "Đã khoá" : "Đang sửa"}
     </button>
+  );
+}
+
+/// Preset hiển thị trước khi user "Kiểm tra" key (chưa có list từ API).
+/// Sau khi kiểm tra thành công, dropdown chuyển sang dùng toàn bộ model
+/// mà API key thực sự truy cập được.
+const AI_MODEL_PRESETS = [
+  "gpt-4o-mini",
+  "gpt-4o",
+  "gpt-4.1-mini",
+];
+
+/// Gợi ý giá per SP cho các model phổ biến — hiện cạnh model trong dropdown
+/// để user pick informed. Model lạ → không hiện hint (rỗng).
+function modelHint(id: string): string {
+  if (id === "gpt-4o-mini") return "~25đ/SP, nhanh";
+  if (id === "gpt-4o") return "~250đ/SP, chất lượng cao";
+  if (id.startsWith("gpt-4.1-mini")) return "~30đ/SP";
+  if (id.startsWith("gpt-4.1")) return "~150đ/SP";
+  if (id.startsWith("gpt-3.5")) return "rẻ nhất, chất lượng thấp";
+  if (id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4"))
+    return "reasoning model, chậm + đắt";
+  return "";
+}
+
+interface AiContentSectionProps {
+  value: AiContentSettings;
+  locked: boolean;
+  onToggleLock: () => void;
+  onChange: (patch: Partial<AiContentSettings>) => void;
+}
+
+function AiContentSection({
+  value,
+  locked,
+  onToggleLock,
+  onChange,
+}: AiContentSectionProps) {
+  const [showKey, setShowKey] = useState(false);
+  const [testState, setTestState] = useState<"idle" | "testing" | "ok" | "err">(
+    "idle",
+  );
+  const [testMsg, setTestMsg] = useState<string | null>(null);
+  /// Local input state cho API key & custom model — tránh persist mỗi keystroke.
+  /// Commit DB onBlur hoặc khi user bấm "Kiểm tra".
+  const [keyDraft, setKeyDraft] = useState(value.apiKey);
+  /// Danh sách model do API trả về sau khi "Kiểm tra" thành công. Khi
+  /// chưa validate hoặc validate fail → undefined, dropdown fallback presets.
+  const [fetchedModels, setFetchedModels] = useState<string[] | undefined>(
+    undefined,
+  );
+  useEffect(() => {
+    setKeyDraft(value.apiKey);
+  }, [value.apiKey]);
+  /// Reset list models khi user gõ key khác (key cũ không còn valid → list
+  /// vô nghĩa). Re-fetch sau khi bấm Kiểm tra lại.
+  useEffect(() => {
+    if (keyDraft !== value.apiKey) {
+      setFetchedModels(undefined);
+      setTestState("idle");
+      setTestMsg(null);
+    }
+  }, [keyDraft, value.apiKey]);
+
+  /// List hiển thị trong dropdown:
+  ///  - Sau Kiểm tra thành công → fetchedModels (lọc chat từ /v1/models)
+  ///  - Chưa validate → AI_MODEL_PRESETS
+  ///  - Luôn ensure model đang chọn nằm trong list (nếu không thì prepend
+  ///    để user không thấy giá trị mất tích).
+  const modelOptions = useMemo(() => {
+    const base = fetchedModels ?? AI_MODEL_PRESETS;
+    if (value.model && !base.includes(value.model)) {
+      return [value.model, ...base];
+    }
+    return base;
+  }, [fetchedModels, value.model]);
+
+  const commitKey = () => {
+    const trimmed = keyDraft.trim();
+    if (trimmed !== value.apiKey) {
+      onChange({ apiKey: trimmed });
+      setTestState("idle");
+      setTestMsg(null);
+    }
+  };
+
+  const handleTest = async () => {
+    const trimmed = keyDraft.trim();
+    if (!trimmed) {
+      setTestState("err");
+      setTestMsg("Nhập API key trước khi kiểm tra");
+      return;
+    }
+    if (trimmed !== value.apiKey) {
+      onChange({ apiKey: trimmed });
+    }
+    setTestState("testing");
+    setTestMsg(null);
+    try {
+      const res = await validateOpenAiKey(trimmed);
+      if (res.valid) {
+        setTestState("ok");
+        setFetchedModels(res.models);
+        setTestMsg(
+          `Key hợp lệ · ${res.models.length.toLocaleString("vi-VN")} model chat (${res.modelsCount.toLocaleString("vi-VN")} tổng)`,
+        );
+      } else {
+        setTestState("err");
+        setFetchedModels(undefined);
+        setTestMsg(res.errorMsg || "Key không hợp lệ");
+      }
+    } catch (e) {
+      setTestState("err");
+      setFetchedModels(undefined);
+      setTestMsg(String(e));
+    }
+  };
+
+  return (
+    <section>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-white/70">
+          <span className="material-symbols-rounded text-base text-violet-400">
+            auto_awesome
+          </span>
+          AI tạo content FB (Shopee Product)
+        </h3>
+        <LockButton locked={locked} onToggle={onToggleLock} />
+      </div>
+      <p className="mb-3 text-xs text-white/50">
+        Tự sinh content quảng cáo FB ads từ tên SP — AI nhận diện ngành hàng,
+        chọn emoji & giọng văn phù hợp, link Shopee chừa trống cho bạn paste
+        affiliate link.
+      </p>
+
+      <div
+        className={`space-y-3 rounded-xl bg-surface-6 p-4 ${
+          locked ? "pointer-events-none opacity-60" : ""
+        }`}
+      >
+        {/* Toggle Bật/tắt */}
+        <label className="flex cursor-pointer items-start gap-3">
+          <input
+            type="checkbox"
+            checked={value.enabled}
+            onChange={(e) => onChange({ enabled: e.currentTarget.checked })}
+            disabled={locked}
+            className="mt-0.5 h-4 w-4 accent-violet-500"
+          />
+          <div className="min-w-0 flex-1 text-sm">
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-white/90">
+                Bật tự tạo content khi tra cứu SP
+              </span>
+              {value.enabled && (
+                <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300">
+                  ON
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-white/55">
+              Khi bật, mỗi sản phẩm tra cứu thành công sẽ tự gọi OpenAI sinh
+              content. Mỗi SP gọi 1 request riêng — không cache.
+            </p>
+          </div>
+        </label>
+
+        {/* API Key */}
+        <div className="border-t border-surface-8 pt-3">
+          <label className="mb-1.5 flex items-center gap-2 text-xs font-medium text-white/70">
+            <span className="material-symbols-rounded text-sm text-violet-400">
+              key
+            </span>
+            API key OpenAI
+          </label>
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <input
+                type={showKey ? "text" : "password"}
+                value={keyDraft}
+                onChange={(e) => setKeyDraft(e.currentTarget.value)}
+                onBlur={commitKey}
+                disabled={locked}
+                placeholder="sk-..."
+                spellCheck={false}
+                autoComplete="off"
+                className="w-full rounded-md border border-surface-8 bg-surface-1 px-3 py-1.5 pr-9 font-mono text-sm text-white/90 placeholder:text-white/30 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:cursor-not-allowed"
+              />
+              <button
+                type="button"
+                onClick={() => setShowKey((v) => !v)}
+                disabled={locked}
+                title={showKey ? "Ẩn key" : "Hiện key"}
+                className="absolute right-1 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full text-white/55 hover:bg-white/10 hover:text-white disabled:opacity-40"
+              >
+                <span className="material-symbols-rounded text-base">
+                  {showKey ? "visibility_off" : "visibility"}
+                </span>
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleTest()}
+              disabled={locked || testState === "testing" || !keyDraft.trim()}
+              className="btn-ripple flex shrink-0 items-center gap-1.5 rounded-md border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <span
+                className={`material-symbols-rounded text-sm ${
+                  testState === "testing" ? "animate-spin" : ""
+                }`}
+              >
+                {testState === "testing" ? "sync" : "verified"}
+              </span>
+              {testState === "testing" ? "Đang kiểm tra…" : "Kiểm tra"}
+            </button>
+          </div>
+          {testState === "ok" && testMsg && (
+            <p className="mt-1.5 flex items-center gap-1.5 text-xs text-emerald-300">
+              <span className="material-symbols-rounded text-sm">
+                check_circle
+              </span>
+              {testMsg}
+            </p>
+          )}
+          {testState === "err" && testMsg && (
+            <p className="mt-1.5 flex items-start gap-1.5 text-xs text-red-300">
+              <span className="material-symbols-rounded mt-0.5 text-sm">
+                error
+              </span>
+              <span>{testMsg}</span>
+            </p>
+          )}
+        </div>
+
+        {/* Model picker — dynamic list từ API sau khi Kiểm tra. */}
+        <div className="border-t border-surface-8 pt-3">
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <label className="flex items-center gap-2 text-xs font-medium text-white/70">
+              <span className="material-symbols-rounded text-sm text-violet-400">
+                model_training
+              </span>
+              Model AI
+              <span className="rounded-full bg-violet-500/15 px-1.5 py-0 text-[10px] font-semibold text-violet-300">
+                {modelOptions.length}
+              </span>
+            </label>
+            {fetchedModels === undefined && (
+              <span className="text-[10px] text-white/40">
+                Bấm "Kiểm tra" để load toàn bộ model
+              </span>
+            )}
+          </div>
+          <select
+            value={value.model}
+            onChange={(e) => onChange({ model: e.currentTarget.value })}
+            disabled={locked}
+            className="w-full rounded-md border border-surface-8 bg-surface-1 px-3 py-1.5 font-mono text-sm text-white/90 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:cursor-not-allowed"
+          >
+            {modelOptions.map((id) => {
+              const hint = modelHint(id);
+              return (
+                <option key={id} value={id}>
+                  {id}
+                  {hint ? ` — ${hint}` : ""}
+                </option>
+              );
+            })}
+          </select>
+          <p className="mt-1 text-[11px] text-white/40">
+            Đang dùng:{" "}
+            <span className="font-mono text-violet-300">{value.model}</span>
+            {fetchedModels && (
+              <>
+                {" · "}
+                Danh sách đã load từ API key của bạn
+              </>
+            )}
+          </p>
+        </div>
+
+        {/* Cảnh báo bảo mật */}
+        <div className="mt-1 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
+          <span className="material-symbols-rounded mt-0.5 text-sm text-amber-400">
+            shield_lock
+          </span>
+          <div>
+            <div className="font-semibold">Bảo mật API key</div>
+            <div className="mt-0.5 text-amber-200/80">
+              Key lưu local SQLite plaintext (giống cách lưu token FB). Khuyến
+              nghị tạo key riêng cho app, đặt <b>spending cap</b> trong
+              dashboard OpenAI để giới hạn rủi ro.
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }

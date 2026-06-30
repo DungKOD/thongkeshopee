@@ -7,6 +7,7 @@
 //! - `batch`: xóa batch (days, manual_rows) trong 1 transaction.
 
 pub mod accounts;
+pub mod ai_content;
 pub mod app_settings;
 pub mod app_util;
 pub mod batch;
@@ -21,6 +22,7 @@ pub mod query;
 pub mod screenshot;
 pub mod shopee_affiliate;
 pub mod shopee_product;
+pub mod shopee_tools;
 pub mod token_manager;
 pub mod video;
 pub mod video_watermark;

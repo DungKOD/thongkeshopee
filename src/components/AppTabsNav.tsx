@@ -8,7 +8,8 @@ export type AppTab =
   | "upload"
   | "bulkcamp"
   | "shopee"
-  | "smartlink";
+  | "smartlink"
+  | "other";
 
 interface AppTabsNavProps {
   activeTab: AppTab;
@@ -25,6 +26,7 @@ export function AppTabsNav({ activeTab, onChange }: AppTabsNavProps) {
   const onBulkCamp = useCallback(() => onChange("bulkcamp"), [onChange]);
   const onShopee = useCallback(() => onChange("shopee"), [onChange]);
   const onSmartLink = useCallback(() => onChange("smartlink"), [onChange]);
+  const onOther = useCallback(() => onChange("other"), [onChange]);
   return (
     <nav className="flex gap-1 px-6">
       <TabButton
@@ -68,6 +70,12 @@ export function AppTabsNav({ activeTab, onChange }: AppTabsNavProps) {
         onClick={onSmartLink}
         icon="link"
         label="Smart Link"
+      />
+      <TabButton
+        active={activeTab === "other"}
+        onClick={onOther}
+        icon="build"
+        label="Other"
       />
     </nav>
   );

@@ -41,3 +41,18 @@ export function shopeeAffConvertLinks(
 ): Promise<LinkResult[]> {
   return invoke<LinkResult[]>("shopee_aff_convert_links", { links, subIds });
 }
+
+/**
+ * LV1 SAFEST: chạy fetch() trực tiếp trong webview login đang mở.
+ * Yêu cầu: login window đang mở + đã login xong. Shopee không phân biệt được
+ * vì request đi từ chính browser tab của Shopee.
+ */
+export function shopeeAffConvertViaWebview(
+  links: string[],
+  subIds: string[],
+): Promise<LinkResult[]> {
+  return invoke<LinkResult[]>("shopee_aff_convert_via_webview", {
+    links,
+    subIds,
+  });
+}

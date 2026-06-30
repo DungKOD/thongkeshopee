@@ -50,6 +50,11 @@ const ShopeeAffiliatePage = lazy(() =>
     default: m.ShopeeAffiliatePage,
   })),
 );
+const OtherToolsPage = lazy(() =>
+  import("./components/OtherToolsPage").then((m) => ({
+    default: m.OtherToolsPage,
+  })),
+);
 const SmartCalculator = lazy(() =>
   import("./components/SmartCalculator").then((m) => ({
     default: m.SmartCalculator,
@@ -112,7 +117,8 @@ type AppTab =
   | "upload"
   | "bulkcamp"
   | "shopee"
-  | "smartlink";
+  | "smartlink"
+  | "other";
 
 function AppInner() {
   const { signOut: authSignOut } = useAuth();
@@ -147,6 +153,7 @@ function AppInner() {
       activeTab === "bulkcamp" ||
       activeTab === "shopee" ||
       activeTab === "smartlink" ||
+      activeTab === "other" ||
       activeTab === "overview"
     ) {
       setMountedLazyTabs((prev) => {
@@ -171,6 +178,7 @@ function AppInner() {
       void import("./components/CampaignBatchPage");
       void import("./components/ShopeeProductPage");
       void import("./components/ShopeeAffiliatePage");
+      void import("./components/OtherToolsPage");
       void import("./components/SmartCalculator");
     });
     return () => {
@@ -351,6 +359,7 @@ function AppInner() {
     setSubIdMatchMode,
     setVideoWatermark,
     setVideoWatermarkAntiTheft,
+    setAiContent,
     hydrated: settingsHydrated,
   } = useSettings();
 
@@ -824,11 +833,19 @@ function AppInner() {
             </Suspense>
           </div>
         )}
+        {mountedLazyTabs.has("other") && (
+          <div className={activeTab === "other" ? "" : "hidden"}>
+            <Suspense fallback={<LazyTabFallback />}>
+              <OtherToolsPage />
+            </Suspense>
+          </div>
+        )}
         {activeTab === "download" ||
         activeTab === "upload" ||
         activeTab === "bulkcamp" ||
         activeTab === "shopee" ||
-        activeTab === "smartlink" ? (
+        activeTab === "smartlink" ||
+        activeTab === "other" ? (
           // Lazy chunk đang tải lần đầu → fallback nằm trong Suspense ở trên.
           // Block stats/overview rendering hoàn toàn trong khi xem lazy tabs.
           null
@@ -1174,6 +1191,7 @@ function AppInner() {
         }}
         onSetVideoWatermark={setVideoWatermark}
         onSetVideoWatermarkAntiTheft={setVideoWatermarkAntiTheft}
+        onSetAiContent={setAiContent}
         onClose={() => setSettingsOpen(false)}
         onImportReverted={() => {
           void refetch();
