@@ -414,95 +414,130 @@ async fn probe_video(ffmpeg_bin: &Path, video_path: &Path) -> CmdResult<VideoPro
     let video = video_path.to_path_buf();
 
     tokio::task::spawn_blocking(move || -> Result<VideoProbe, String> {
-        let mut cmd = FfmpegCommand::new_with_path(bin);
-        cmd.hide_banner()
-            .arg("-i")
-            .arg(&video)
-            .args(["-t", "0", "-f", "null", "-"]);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn ffmpeg probe: {e}"))?;
-        let mut probe = VideoProbe::default();
-        // Collect raw log lines để fallback regex parse nếu event parser miss.
-        let mut log_lines: Vec<String> = Vec::new();
-        let iter = child
-            .iter()
-            .map_err(|e| format!("ffmpeg iter: {e}"))?;
-        for event in iter {
-            match event {
-                FfmpegEvent::ParsedInputStream(s) => {
-                    if let Some(v) = s.video_data() {
-                        if v.width > 0 && probe.width == 0 {
-                            probe.width = v.width;
-                            probe.height = v.height;
-                            // fps gốc — VFR có thể là average, vẫn dùng được
-                            // làm target CFR.
-                            if v.fps.is_finite() && v.fps > 0.0 {
-                                probe.fps = v.fps;
-                            }
-                        }
-                    } else if s.is_audio() {
-                        probe.has_audio = true;
-                    }
-                }
-                FfmpegEvent::ParsedDuration(d) => {
-                    if d.duration > 0.0 {
-                        probe.duration_s = d.duration as f32;
-                    }
-                }
-                FfmpegEvent::Log(_, msg) | FfmpegEvent::ParsedStreamMapping(msg) => {
-                    log_lines.push(msg);
-                }
-                _ => {}
-            }
-        }
-        let _ = child.wait();
-
-        // Fallback regex parse từ stderr log lines.
+        // Strategy 2 lần thử:
+        // 1. Fast probe: -map 0:v:0? -c copy -frames:v 1 -f null -
+        //    Demux 1 video packet → exit nhanh (~50ms). Hoạt động cho mọi
+        //    codec vì -c copy không cần decoder.
+        // 2. Slow probe (fallback): ffmpeg -i input (no output)
+        //    ffmpeg sẽ in stream info rồi exit với "At least one output
+        //    file must be specified". Universal — luôn in input metadata
+        //    trước khi error. Dùng khi #1 fail (edge case container hỏng).
+        let mut probe = probe_video_attempt(&bin, &video, true)?;
         if probe.width == 0 || probe.height == 0 {
-            for line in &log_lines {
-                parse_stream_line_fallback(line, &mut probe);
-                if probe.width > 0 {
-                    break;
-                }
-            }
-        }
-        if probe.duration_s == 0.0 {
-            for line in &log_lines {
-                if let Some(d) = parse_duration_line_fallback(line) {
-                    probe.duration_s = d;
-                    break;
-                }
-            }
-        }
-        if !probe.has_audio {
-            // "Stream #0:1(und): Audio: aac ..."
-            probe.has_audio = log_lines
-                .iter()
-                .any(|l| l.contains("Stream #") && l.contains(": Audio:"));
-        }
-
-        if probe.width == 0 || probe.height == 0 {
-            // Trả luôn tail log để debug (3 dòng cuối) — tránh "không đọc được
-            // kích thước" mà user không biết vì sao.
-            let tail = log_lines
-                .iter()
-                .rev()
-                .take(3)
-                .rev()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" | ");
-            return Err(format!(
-                "không đọc được kích thước video (ffmpeg log: {})",
-                if tail.is_empty() { "<empty>" } else { &tail }
-            ));
+            // Thử lại bằng probe không có output → ffmpeg buộc phải open
+            // input demuxer đầy đủ trước khi báo "no output specified".
+            probe = probe_video_attempt(&bin, &video, false)?;
         }
         Ok(probe)
     })
     .await
     .map_err(|e| CmdError::msg(format!("probe task panicked: {e}")))?
     .map_err(CmdError::msg)
+}
+
+/// 1 lần probe ffmpeg. `fast=true` dùng `-frames:v 1 -c copy -f null -`.
+/// `fast=false` dùng `-i input` không có output → ffmpeg in stream info
+/// rồi exit non-zero. Trả về Err nếu KHÔNG tìm được width/height.
+fn probe_video_attempt(
+    bin: &Path,
+    video: &Path,
+    fast: bool,
+) -> Result<VideoProbe, String> {
+    let mut cmd = FfmpegCommand::new_with_path(bin.to_path_buf());
+    cmd.hide_banner().arg("-i").arg(video);
+    if fast {
+        // QUAN TRỌNG: ffmpeg 7+ reject `-t 0 -f null -` vì output muxer thấy
+        // 0 stream → exit TRƯỚC khi in input info. Phải có ít nhất 1 stream
+        // được map vào output. `-frames:v 1 -map 0:v:0? -c copy` demux đúng
+        // 1 packet rồi exit — nhanh + không cần decoder cho codec lạ.
+        cmd.args([
+            "-map", "0:v:0?",
+            "-c", "copy",
+            "-frames:v", "1",
+            "-an",
+            "-f", "null", "-",
+        ]);
+    }
+    // Else: không thêm output args. ffmpeg sẽ exit non-zero với "At least
+    // one output file must be specified" nhưng stream info đã được in.
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn ffmpeg probe: {e}"))?;
+    let mut probe = VideoProbe::default();
+    let mut log_lines: Vec<String> = Vec::new();
+    let iter = child
+        .iter()
+        .map_err(|e| format!("ffmpeg iter: {e}"))?;
+    for event in iter {
+        match event {
+            FfmpegEvent::ParsedInputStream(s) => {
+                if let Some(v) = s.video_data() {
+                    if v.width > 0 && probe.width == 0 {
+                        probe.width = v.width;
+                        probe.height = v.height;
+                        if v.fps.is_finite() && v.fps > 0.0 {
+                            probe.fps = v.fps;
+                        }
+                    }
+                } else if s.is_audio() {
+                    probe.has_audio = true;
+                }
+            }
+            FfmpegEvent::ParsedDuration(d) => {
+                if d.duration > 0.0 {
+                    probe.duration_s = d.duration as f32;
+                }
+            }
+            FfmpegEvent::Log(_, msg) | FfmpegEvent::ParsedStreamMapping(msg) => {
+                log_lines.push(msg);
+            }
+            _ => {}
+        }
+    }
+    let _ = child.wait();
+
+    // Fallback regex parse từ stderr log lines.
+    if probe.width == 0 || probe.height == 0 {
+        for line in &log_lines {
+            parse_stream_line_fallback(line, &mut probe);
+            if probe.width > 0 {
+                break;
+            }
+        }
+    }
+    if probe.duration_s == 0.0 {
+        for line in &log_lines {
+            if let Some(d) = parse_duration_line_fallback(line) {
+                probe.duration_s = d;
+                break;
+            }
+        }
+    }
+    if !probe.has_audio {
+        probe.has_audio = log_lines
+            .iter()
+            .any(|l| l.contains("Stream #") && l.contains(": Audio:"));
+    }
+
+    if probe.width == 0 || probe.height == 0 {
+        // Trả luôn 6 dòng log cuối (nhiều hơn trước để debug tốt hơn) — bao
+        // gồm cả Input/Stream lines nếu có. Để user copy báo lỗi nguyên văn.
+        let tail = log_lines
+            .iter()
+            .rev()
+            .take(6)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!(
+            "không đọc được kích thước video [mode={}] (ffmpeg log: {})",
+            if fast { "fast" } else { "noout" },
+            if tail.is_empty() { "<empty>" } else { &tail }
+        ));
+    }
+    Ok(probe)
 }
 
 /// Regex parse 1 dòng log để tìm WxH + fps của video stream.
