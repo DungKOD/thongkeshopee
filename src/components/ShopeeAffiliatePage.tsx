@@ -13,6 +13,7 @@ import {
 } from "../lib/shopeeAffiliate";
 import { fmtTimeAgo } from "../formulas";
 import { useToast } from "./ToastProvider";
+import { emitTokensChanged, useTokensChanged } from "../lib/tokenEvents";
 
 const SHOPEE_URL_RX = /(https?:\/\/[^\s]*(?:shopee\.|shp\.ee|s\.shopee\.)[^\s]*)/gi;
 
@@ -78,6 +79,9 @@ export function ShopeeAffiliatePage() {
     void refreshStatus();
   }, [refreshStatus]);
 
+  // Auto-refresh khi Token Manager (hoặc tab khác) đổi shopee cookie.
+  useTokensChanged(refreshStatus, ["shopee"]);
+
   const handleOpenLogin = useCallback(async () => {
     try {
       await shopeeAffOpenLoginWindow();
@@ -98,6 +102,7 @@ export function ShopeeAffiliatePage() {
     try {
       const s = await shopeeAffCaptureCookies();
       setStatus(s);
+      emitTokensChanged("shopee");
       showToast({
         message: `Đã lưu ${s.cookieCount} cookies.`,
         duration: 3000,
@@ -123,6 +128,7 @@ export function ShopeeAffiliatePage() {
     try {
       await shopeeAffClearCookies();
       setStatus(EMPTY_STATUS);
+      emitTokensChanged("shopee");
       showToast({ message: "Đã xóa cookies đã lưu", duration: 2500 });
       await refreshStatus();
     } catch (e) {

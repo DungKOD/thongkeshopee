@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { fbListPages, type FbPage } from "../lib/fbReels";
+import { useTokensChanged } from "../lib/tokenEvents";
 
 export interface UseFbPagesResult {
   pages: FbPage[];
@@ -7,6 +8,8 @@ export interface UseFbPagesResult {
   error: string | null;
   refresh: () => Promise<void>;
 }
+
+const FILTER = ["fb_page", "fb_user"] as const;
 
 export function useFbPages(): UseFbPagesResult {
   const [pages, setPages] = useState<FbPage[]>([]);
@@ -29,6 +32,11 @@ export function useFbPages(): UseFbPagesResult {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Auto-refresh khi token đổi ở bất cứ component nào khác (Token Manager,
+  // FbPageManagerDialog, v.v.). Listen cả `fb_page` (page save/delete) lẫn
+  // `fb_user` (user token đổi có thể ảnh hưởng tới page list nếu discover lại).
+  useTokensChanged(refresh, FILTER);
 
   return { pages, loading, error, refresh };
 }

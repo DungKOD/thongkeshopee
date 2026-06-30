@@ -14,6 +14,7 @@ import {
   type FbAdAccountWithToken,
   type FbAdsAuthToken,
 } from "../lib/fbAds";
+import { emitTokensChanged } from "../lib/tokenEvents";
 
 interface FbAdAccountManagerDialogProps {
   isOpen: boolean;
@@ -128,6 +129,8 @@ export function FbAdAccountManagerDialog({
       await fbAdsSaveAuthToken(token.trim());
       await fbAdsSaveAccounts(toSave);
       await refreshAuthTokens();
+      emitTokensChanged("fb_ad_account");
+      emitTokensChanged("fb_user");
       onChanged();
       // Giữ dialog mở — reset form để user paste token tiếp.
       setToken("");
@@ -149,6 +152,7 @@ export function FbAdAccountManagerDialog({
       return;
     try {
       await fbAdsDeleteAccount(accountId);
+      emitTokensChanged("fb_ad_account");
       onChanged();
     } catch (e) {
       setError((e as Error).message ?? String(e));
@@ -670,6 +674,7 @@ function SavedAdsAuthTokenRow({ auth, onChanged }: SavedAdsAuthTokenRowProps) {
       return;
     try {
       await fbAdsDeleteAuthToken(auth.id);
+      emitTokensChanged("fb_user");
       onChanged();
     } catch (e) {
       setRowError((e as Error).message ?? String(e));

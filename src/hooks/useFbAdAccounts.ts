@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { fbAdsListAccounts, type FbAdAccount } from "../lib/fbAds";
+import { useTokensChanged } from "../lib/tokenEvents";
 
 export interface UseFbAdAccountsResult {
   accounts: FbAdAccount[];
@@ -7,6 +8,8 @@ export interface UseFbAdAccountsResult {
   error: string | null;
   refresh: () => Promise<void>;
 }
+
+const FILTER = ["fb_ad_account", "fb_user"] as const;
 
 export function useFbAdAccounts(): UseFbAdAccountsResult {
   const [accounts, setAccounts] = useState<FbAdAccount[]>([]);
@@ -28,6 +31,9 @@ export function useFbAdAccounts(): UseFbAdAccountsResult {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Auto-refresh khi ad account hoặc fb_user token đổi ở component khác.
+  useTokensChanged(refresh, FILTER);
 
   return { accounts, loading, error, refresh };
 }

@@ -14,6 +14,7 @@ import {
   type FbPage,
   type FbPageWithToken,
 } from "../lib/fbReels";
+import { emitTokensChanged } from "../lib/tokenEvents";
 
 interface FbPageManagerDialogProps {
   isOpen: boolean;
@@ -109,6 +110,8 @@ export function FbPageManagerDialog({
       await fbSaveAuthToken(token.trim());
       await fbSavePages(toSave);
       await refreshAuthTokens();
+      emitTokensChanged("fb_page");
+      emitTokensChanged("fb_user");
       onChanged();
       // KHÔNG đóng dialog — reset form để user paste token tiếp theo (vd 2
       // account FB Business + Personal). Hiện success message rồi auto-clear.
@@ -134,6 +137,7 @@ export function FbPageManagerDialog({
     if (!confirm("Xóa Page này khỏi app? Lịch sử đăng vẫn được giữ.")) return;
     try {
       await fbDeletePage(pageId);
+      emitTokensChanged("fb_page");
       onChanged();
     } catch (e) {
       setError((e as Error).message ?? String(e));
@@ -753,6 +757,7 @@ function SavedAuthTokenRow({ auth, onChanged }: SavedAuthTokenRowProps) {
       return;
     try {
       await fbDeleteAuthToken(auth.id);
+      emitTokensChanged("fb_user");
       onChanged();
     } catch (e) {
       setRowError((e as Error).message ?? String(e));

@@ -14,6 +14,7 @@ import {
   sumFiltered as sumFilteredPure,
   type ProfitFees as ProfitFeesPure,
 } from "../lib/profitFees";
+import { emitTokensChanged } from "../lib/tokenEvents";
 
 // Re-export để consumers cũ (formulas.ts, components, worker) không phải sửa
 // import path. Source of truth nằm ở `lib/profitFees.ts` — pure module worker-safe.
@@ -344,15 +345,22 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     (patch: Partial<AiContentSettings>) => {
       setSettings((prev) => {
         const next = { ...prev.aiContent, ...patch };
+        let credentialChanged = false;
         if (patch.enabled !== undefined && patch.enabled !== prev.aiContent.enabled) {
           void persistKey(KEY_AI_ENABLED, next.enabled);
         }
         if (patch.apiKey !== undefined && patch.apiKey !== prev.aiContent.apiKey) {
           void persistKey(KEY_AI_API_KEY, next.apiKey);
+          credentialChanged = true;
         }
         if (patch.model !== undefined && patch.model !== prev.aiContent.model) {
           void persistKey(KEY_AI_MODEL, next.model);
+          credentialChanged = true;
         }
+        // Emit token event để Token Manager + ShopeeProductPage (qua context)
+        // auto-update. Chỉ emit khi credential thực sự đổi — bỏ qua toggle
+        // enabled để tránh re-fetch không cần thiết.
+        if (credentialChanged) emitTokensChanged("openai");
         return { ...prev, aiContent: next };
       });
     },
