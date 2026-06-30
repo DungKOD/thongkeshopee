@@ -702,25 +702,28 @@ eval=frame:eof_action=repeat",
         format!("x=W-w-{pad_px}:y={pad_px}:eof_action=repeat")
     };
 
-    // Filter chain MINIMAL — chỉ convert pixel format trên video chính, KHÔNG
-    // đụng PTS hoặc fps. Lý do:
+    // Filter chain MINIMAL — KHÔNG đụng PTS, fps, OR pixel format trên video
+    // chính. Lý do:
     //   - `setpts=PTS-STARTPTS` có thể gây cut output 5s nếu input có PTS
     //     non-monotonic (XHS hay có frame PTS reset)
     //   - `fps=fps=N` filter cũng truncate khi gặp PTS gap lớn
     //   - Để ffmpeg muxer tự handle timing với `-fflags +genpts` (fill missing
     //     PTS) + `-avoid_negative_ts make_zero` (shift về ≥0)
-    //   - Pixel format conversion (yuv420p) là an toàn, không ảnh hưởng duration
+    //   - QUAN TRỌNG: KHÔNG dùng `format=yuv420p` trên video main trong filter.
+    //     Encoder sẽ làm pixel format conversion 1 lần qua `-pix_fmt yuv420p`
+    //     với `-sws_flags lanczos`. Nếu filter cũng convert → conversion 2 lần
+    //     (filter dùng default bicubic = blur nhẹ, rồi encoder lại convert).
+    //     Để overlay nhận video native format, encoder làm conversion cuối.
     //
     // Logo (`[1:v]`) qua mask tròn + scale + opacity như cũ — KHÔNG ảnh hưởng
     // duration vì là static image input.
     let filter = format!(
-        "[0:v]format=yuv420p[v0];\
-         [1:v]format=rgba,setsar=1,\
+        "[1:v]format=rgba,setsar=1,\
          geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':\
 a='alpha(X,Y)*clip(min(W,H)/2-hypot(X-W/2,Y-H/2)+0.5,0,1)',\
          scale={logo_w_px}:{logo_w_px}:flags=lanczos,\
          colorchannelmixer=aa={opacity:.3}[wm];\
-         [v0][wm]overlay={overlay_xy}[vout]"
+         [0:v][wm]overlay={overlay_xy}[vout]"
     );
 
     // Audio: COPY codec gốc, không re-encode. Lý do:
@@ -781,18 +784,29 @@ a='alpha(X,Y)*clip(min(W,H)/2-hypot(X-W/2,Y-H/2)+0.5,0,1)',\
         //   không tạo block artifact ở vùng tròn alpha.
         // preset medium thay vì veryfast: cho phép x264 search motion
         //   vectors kỹ hơn → cùng CRF, file nhỏ hơn ~15% và artifact ít hơn.
-        // -tune film: tối ưu psychovisual cho real-world content (video TikTok
-        //   chủ yếu là footage thật, không phải animation).
+        // KHÔNG dùng -tune (default tuning trung tính):
+        //   - `film` tăng psy-rdo + giảm deblock, tốt cho footage thật nhưng
+        //     có thể thêm noise psychovisual cho content có nhiều mặt phẳng
+        //     đồng màu (animation, screencap). Default tuning an toàn cho
+        //     MỌI loại content.
+        // -sws_flags lanczos+accurate_rnd+full_chroma_int:
+        //   - lanczos: sharper scaler thay vì default bicubic (blur nhẹ).
+        //   - accurate_rnd: round-to-nearest thay vì truncate ở mỗi pixel.
+        //   - full_chroma_int: interpolate chroma đầy đủ thay vì subsample
+        //     trước khi resize. Quan trọng khi source là yuv420p và encoder
+        //     cần re-pack chroma.
         cmd.args(["-c:v", "libx264"])
             .args(["-preset", "medium"])
             .args(["-crf", "17"])
-            .args(["-tune", "film"])
             .args(["-pix_fmt", "yuv420p"])
-            // -profile:v high -level 4.0: tương thích rộng (Reels/IG/TikTok
-            //   đều OK). Tránh main10/high10 cần 10-bit decoder không phổ
-            //   biến trên mobile.
+            .args(["-sws_flags", "lanczos+accurate_rnd+full_chroma_int"])
+            // -profile:v high -level 5.1: support tới 4K@30 hoặc 1080p@60.
+            //   Source >1080p (vd 2K/4K từ DSLR) sẽ KHÔNG bị reject hoặc forced
+            //   rescale như -level 4.0 (cap 1080p30). Mọi device hiện đại hỗ
+            //   trợ level 5.1, FB Reels/IG/TikTok decode OK.
+            //   Tránh main10/high10 (10-bit) — decoder mobile chưa phổ biến.
             .args(["-profile:v", "high"])
-            .args(["-level", "4.0"])
+            .args(["-level", "5.1"])
             .args(["-movflags", "+faststart"])
             // -avoid_negative_ts make_zero: shift PTS về ≥0 → player đọc
             //   duration metadata đúng. Fix "mất thời gian" cho XHS PTS lệch.
