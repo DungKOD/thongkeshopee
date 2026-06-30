@@ -399,6 +399,16 @@ struct VideoProbe {
 }
 
 /// Probe video qua ffmpeg quick scan: width/height/fps/duration/has_audio.
+///
+/// Strategy 2 lớp: ưu tiên `ParsedInputStream`/`ParsedDuration` của
+/// ffmpeg_sidecar (đã decode sẵn struct). Fallback regex parse trực tiếp
+/// stderr Log lines — vì ffmpeg_sidecar 2.x đôi khi MISS stream khi:
+/// - Codec HEVC/AV1 (TikTok hay xuất HEVC từ iPhone)
+/// - Stream line có side-data dài (Dolby Vision, HDR10+)
+/// - Banner format đổi giữa các phiên bản ffmpeg
+///
+/// Khi event parser miss, raw stderr vẫn có `Stream #0:0(...): Video: ...
+/// 720x1280 ...` — regex catch được.
 async fn probe_video(ffmpeg_bin: &Path, video_path: &Path) -> CmdResult<VideoProbe> {
     let bin = ffmpeg_bin.to_path_buf();
     let video = video_path.to_path_buf();
@@ -413,6 +423,8 @@ async fn probe_video(ffmpeg_bin: &Path, video_path: &Path) -> CmdResult<VideoPro
             .spawn()
             .map_err(|e| format!("spawn ffmpeg probe: {e}"))?;
         let mut probe = VideoProbe::default();
+        // Collect raw log lines để fallback regex parse nếu event parser miss.
+        let mut log_lines: Vec<String> = Vec::new();
         let iter = child
             .iter()
             .map_err(|e| format!("ffmpeg iter: {e}"))?;
@@ -438,18 +450,109 @@ async fn probe_video(ffmpeg_bin: &Path, video_path: &Path) -> CmdResult<VideoPro
                         probe.duration_s = d.duration as f32;
                     }
                 }
+                FfmpegEvent::Log(_, msg) | FfmpegEvent::ParsedStreamMapping(msg) => {
+                    log_lines.push(msg);
+                }
                 _ => {}
             }
         }
         let _ = child.wait();
+
+        // Fallback regex parse từ stderr log lines.
         if probe.width == 0 || probe.height == 0 {
-            return Err("không đọc được kích thước video".to_string());
+            for line in &log_lines {
+                parse_stream_line_fallback(line, &mut probe);
+                if probe.width > 0 {
+                    break;
+                }
+            }
+        }
+        if probe.duration_s == 0.0 {
+            for line in &log_lines {
+                if let Some(d) = parse_duration_line_fallback(line) {
+                    probe.duration_s = d;
+                    break;
+                }
+            }
+        }
+        if !probe.has_audio {
+            // "Stream #0:1(und): Audio: aac ..."
+            probe.has_audio = log_lines
+                .iter()
+                .any(|l| l.contains("Stream #") && l.contains(": Audio:"));
+        }
+
+        if probe.width == 0 || probe.height == 0 {
+            // Trả luôn tail log để debug (3 dòng cuối) — tránh "không đọc được
+            // kích thước" mà user không biết vì sao.
+            let tail = log_lines
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return Err(format!(
+                "không đọc được kích thước video (ffmpeg log: {})",
+                if tail.is_empty() { "<empty>" } else { &tail }
+            ));
         }
         Ok(probe)
     })
     .await
     .map_err(|e| CmdError::msg(format!("probe task panicked: {e}")))?
     .map_err(CmdError::msg)
+}
+
+/// Regex parse 1 dòng log để tìm WxH + fps của video stream.
+/// Pattern khớp: `Stream #0:0[0x1](und): Video: h264 (High), yuv420p, 720x1280 [SAR 1:1 DAR 9:16], 1234 kb/s, 30 fps, ...`
+/// hoặc gọn hơn `... Video: hevc ..., 1080x1920, ..., 30 fps`.
+fn parse_stream_line_fallback(line: &str, probe: &mut VideoProbe) {
+    if !line.contains("Stream #") || !line.contains(": Video:") {
+        return;
+    }
+    // WxH: số x số, mỗi vế 2-5 chữ số, không nằm trong identifier (kèm word
+    // boundary để không match `0x12abc`).
+    static DIM_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = DIM_RE.get_or_init(|| regex::Regex::new(r"\b(\d{2,5})x(\d{2,5})\b").unwrap());
+    if let Some(c) = re.captures(line) {
+        let w: u32 = c[1].parse().unwrap_or(0);
+        let h: u32 = c[2].parse().unwrap_or(0);
+        if w > 0 && h > 0 {
+            probe.width = w;
+            probe.height = h;
+        }
+    }
+    // fps: `30 fps` hoặc `29.97 fps`.
+    static FPS_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let fps_re = FPS_RE.get_or_init(|| regex::Regex::new(r"(\d+(?:\.\d+)?)\s*fps").unwrap());
+    if probe.fps == 0.0 {
+        if let Some(c) = fps_re.captures(line) {
+            if let Ok(f) = c[1].parse::<f32>() {
+                if f.is_finite() && f > 0.0 {
+                    probe.fps = f;
+                }
+            }
+        }
+    }
+}
+
+/// Parse `Duration: 00:01:23.45, start: ...` → giây.
+fn parse_duration_line_fallback(line: &str) -> Option<f32> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("Duration:")?.trim_start();
+    let comma = rest.find(',').unwrap_or(rest.len());
+    let ts = rest[..comma].trim();
+    if ts == "N/A" {
+        return None;
+    }
+    let secs = parse_ffmpeg_time(ts);
+    if secs > 0.0 {
+        Some(secs)
+    } else {
+        None
+    }
 }
 
 /// Chạy ffmpeg overlay → emit progress events `watermark-progress`.
