@@ -97,7 +97,6 @@ pub fn run() {
             commands::shopee_affiliate::shopee_aff_clear_cookies,
             commands::shopee_affiliate::shopee_aff_close_login_window,
             commands::shopee_affiliate::shopee_aff_convert_links,
-            commands::shopee_affiliate::shopee_aff_convert_with_paste,
             commands::shopee_affiliate::shopee_aff_convert_via_webview,
             commands::video::get_video_info,
             commands::video::download_video,
