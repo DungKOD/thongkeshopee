@@ -539,8 +539,15 @@ fn parse_stream_line_fallback(line: &str, probe: &mut VideoProbe) {
 }
 
 /// Parse `Duration: 00:01:23.45, start: ...` → giây.
+/// Robust với log prefix `[info]`/`[warning]` mà ffmpeg_sidecar bật bằng
+/// `-loglevel level+info`.
 fn parse_duration_line_fallback(line: &str) -> Option<f32> {
-    let trimmed = line.trim_start();
+    // Skip log level prefix nếu có (e.g. "[info]   Duration: ...").
+    let after_prefix = line
+        .split_once(']')
+        .map(|(_, rest)| rest)
+        .unwrap_or(line);
+    let trimmed = after_prefix.trim_start();
     let rest = trimmed.strip_prefix("Duration:")?.trim_start();
     let comma = rest.find(',').unwrap_or(rest.len());
     let ts = rest[..comma].trim();
@@ -1048,5 +1055,121 @@ mod tests {
         assert!(!is_supported_image(&json));
         assert!(!is_supported_image(b""));
         assert!(!is_supported_image(b"short"));
+    }
+
+    fn probe(line: &str) -> VideoProbe {
+        let mut p = VideoProbe::default();
+        parse_stream_line_fallback(line, &mut p);
+        p
+    }
+
+    #[test]
+    fn fallback_parse_standard_tiktok_h264() {
+        // Format thường gặp nhất từ TikTok export.
+        let line = "[info]   Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 720x1280 [SAR 1:1 DAR 9:16], 1797 kb/s, 30 fps, 30 tbr, 15360 tbn (default)";
+        let p = probe(line);
+        assert_eq!(p.width, 720);
+        assert_eq!(p.height, 1280);
+        assert!((p.fps - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fallback_parse_missing_fps_only_tbr() {
+        // TikTok đôi khi omit `fps` khi == tbr → ffmpeg_sidecar bail trong
+        // try_parse_video_stream vì có `?` sau fps parse. Đây là root cause.
+        // Fallback PHẢI lấy được WxH dù fps không có.
+        let line = "[info]   Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 540x960, 1234 kb/s, 30 tbr, 90k tbn (default)";
+        let p = probe(line);
+        assert_eq!(p.width, 540);
+        assert_eq!(p.height, 960);
+    }
+
+    #[test]
+    fn fallback_parse_hevc_iphone_hdr() {
+        // iPhone xuất HEVC + side data HDR. ffmpeg in stream với 10-bit + bt2020.
+        let line = "[info]   Stream #0:0[0x1](und): Video: hevc (Main 10) (hvc1 / 0x31637668), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 1080x1920 [SAR 1:1 DAR 9:16], 4500 kb/s, 30 fps, 30 tbr, 600 tbn (default)";
+        let p = probe(line);
+        assert_eq!(p.width, 1080);
+        assert_eq!(p.height, 1920);
+        assert!((p.fps - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fallback_parse_av1_fractional_fps() {
+        let line = "[info]   Stream #0:0(eng): Video: av1 (Main) (av01 / 0x31307661), yuv420p, 1920x1080, 29.97 fps, 30 tbr, 12800 tbn";
+        let p = probe(line);
+        assert_eq!(p.width, 1920);
+        assert_eq!(p.height, 1080);
+        assert!((p.fps - 29.97).abs() < 0.01);
+    }
+
+    #[test]
+    fn fallback_parse_vp9_webm() {
+        let line = "[info]   Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv, bt709), 1280x720, SAR 1:1 DAR 16:9, 60 fps, 60 tbr, 1k tbn (default)";
+        let p = probe(line);
+        assert_eq!(p.width, 1280);
+        assert_eq!(p.height, 720);
+        assert!((p.fps - 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fallback_no_match_audio_line() {
+        // Audio line không có "Video:" → KHÔNG được set width/height.
+        let line = "[info]   Stream #0:1(eng): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 128 kb/s (default)";
+        let p = probe(line);
+        assert_eq!(p.width, 0);
+        assert_eq!(p.height, 0);
+    }
+
+    #[test]
+    fn fallback_no_match_subtitle_line() {
+        let line = "[info]   Stream #0:13(dut): Subtitle: hdmv_pgs_subtitle, 1920x1080";
+        let p = probe(line);
+        // Subtitle line có WxH nhưng KHÔNG có ": Video:" → guard reject.
+        assert_eq!(p.width, 0);
+    }
+
+    #[test]
+    fn fallback_codec_tag_not_match() {
+        // Codec tag dạng `0x31637661` không có 'x' giữa 2 cụm digit ≥2 → không
+        // bị match nhầm là WxH.
+        let line = "[info]   Stream #0:0: Video: h264 (avc1 / 0x31637661), yuv420p";
+        let p = probe(line);
+        assert_eq!(p.width, 0);
+    }
+
+    #[test]
+    fn fallback_picks_resolution_not_aspect_ratio() {
+        // DAR có thể là 9x16 (1 digit mỗi vế) — bị min 2 digit của regex loại.
+        // 720x1280 phải được pick, không phải 1x1 (SAR) hay 9x16 (DAR).
+        let line = "[info]   Stream #0:0: Video: h264, yuv420p, 720x1280 [SAR 1:1 DAR 9:16], 30 fps";
+        let p = probe(line);
+        assert_eq!(p.width, 720);
+        assert_eq!(p.height, 1280);
+    }
+
+    #[test]
+    fn fallback_parse_duration_standard() {
+        let line = "[info]   Duration: 00:00:27.00, start: 0.000000, bitrate: 1797 kb/s";
+        assert!((parse_duration_line_fallback(line).unwrap() - 27.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fallback_parse_duration_with_minutes() {
+        let line = "  Duration: 00:01:23.45, start: 0.000000, bitrate: 1234 kb/s";
+        assert!((parse_duration_line_fallback(line).unwrap() - 83.45).abs() < 0.01);
+    }
+
+    #[test]
+    fn fallback_parse_duration_na_returns_none() {
+        // Live stream / corrupt header: ffmpeg in "Duration: N/A".
+        let line = "[info]   Duration: N/A, start: 0.000000, bitrate: N/A";
+        assert!(parse_duration_line_fallback(line).is_none());
+    }
+
+    #[test]
+    fn fallback_parse_duration_ignores_non_duration_lines() {
+        let line = "[info]   Stream #0:0: Video: h264, 720x1280, 30 fps";
+        assert!(parse_duration_line_fallback(line).is_none());
     }
 }
